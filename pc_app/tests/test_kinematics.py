@@ -157,7 +157,8 @@ def test_inverse_kinematics_rejects_unreachable_target():
 
 def test_inverse_kinematics_auto_phi_chooses_reachable_orientation():
     config = load_config()
-    target = {"x_mm": 250.0, "y_mm": 0.0, "z_mm": 120.0}
+    # Target at high z-position where phi=0.0 is unreachable but auto-phi finds a solution
+    target = {"x_mm": 200.0, "y_mm": 0.0, "z_mm": 350.0}
 
     fixed_phi = inverse_kinematics(
         {**target, "phi_deg": 0.0},
@@ -172,7 +173,7 @@ def test_inverse_kinematics_auto_phi_chooses_reachable_orientation():
         config.home_pose,
     )
 
-    assert not fixed_phi["ok"]
+    assert not fixed_phi["ok"], f"Expected fixed_phi to fail but got: {fixed_phi['notes']}"
     assert auto_phi["ok"], auto_phi["notes"]
     assert auto_phi["target"]["phi_auto"] is True
     assert auto_phi["target"]["phi_deg"] == approx(auto_phi["selected"]["fk"]["tool_phi_deg"])
