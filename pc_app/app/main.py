@@ -22,6 +22,8 @@ from .demo_settings import (
     drop_zones,
     encoder_settings,
     geometry_settings,
+    model_validation_warnings,
+    named_position_errors,
     named_positions,
     task_defaults,
     tool_settings,
@@ -85,6 +87,7 @@ path_task_source: str | None = None
 live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
 event_log = EventLog()
+active_motion_run_id: str | None = None
 
 app = FastAPI(title="4DOF Robot Arm Control Dashboard")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -115,7 +118,8 @@ class IkTargetRequest(BaseModel):
     x_mm: float
     y_mm: float
     z_mm: float
-    phi_deg: float
+    phi_deg: float | None = None
+    phi_auto: bool = False
 
 
 class PathSettingsRequest(BaseModel):
@@ -244,6 +248,10 @@ def public_config() -> dict[str, Any]:
         "encoders": encoder_settings(config),
         "calibration": calibration_settings(config),
         "geometry": geometry_settings(config),
+        "validation": {
+            "model_warnings": model_validation_warnings(config),
+            "named_position_errors": named_position_errors(config),
+        },
     }
 
 
@@ -465,6 +473,205 @@ def read_serial_until_any(prefixes: tuple[str, ...], timeout_s: float = 2.0) -> 
     raise SerialClientError(f"timed out waiting for {'/'.join(prefixes)}")
 
 
+def joint_errors_deg(target_deg: list[float], reported_deg: list[float]) -> list[float]:
+    return [
+        float(reported) - float(target)
+        for target, reported in zip(target_deg, reported_deg, strict=True)
+    ]
+
+
+def tcp_sample_from_state() -> dict[str, float]:
+    fk = state.fk or forward_kinematics(state.reported_angles_deg, config.links)
+    return {
+        "x_mm": float(fk.get("x_mm", 0.0)),
+        "y_mm": float(fk.get("y_mm", 0.0)),
+        "z_mm": float(fk.get("z_mm", 0.0)),
+        "ts": time(),
+    }
+
+
+def _tcp_distance_mm(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return (
+        (float(a.get("x_mm", 0.0)) - float(b.get("x_mm", 0.0))) ** 2
+        + (float(a.get("y_mm", 0.0)) - float(b.get("y_mm", 0.0))) ** 2
+        + (float(a.get("z_mm", 0.0)) - float(b.get("z_mm", 0.0))) ** 2
+    ) ** 0.5
+
+
+def _joint_progress_ratio(start_deg: list[float], target_deg: list[float], current_deg: list[float]) -> float:
+    total = sum((target - start) ** 2 for start, target in zip(start_deg, target_deg, strict=True)) ** 0.5
+    if total <= 1e-9:
+        return 1.0
+    remaining = sum((target - current) ** 2 for target, current in zip(target_deg, current_deg, strict=True)) ** 0.5
+    return max(0.0, min(1.0, 1.0 - remaining / total))
+
+
+def _motion_run_matches(run_id: str | None) -> bool:
+    if run_id is None:
+        return True
+    return state.motion_diagnostics.get("run_id") == run_id
+
+
+def axis_modes() -> list[str]:
+    evaluation = evaluate_hardware_config()
+    return list(evaluation.get("axis_states", ["unknown"] * len(config.joints)))
+
+
+def start_motion_diagnostics(
+    *,
+    source: str,
+    mode: str,
+    target_deg: list[float],
+    expected_duration_s: float,
+    waypoint_count: int,
+    step_label: str = "",
+    step_index: int = 0,
+    step_total: int = 0,
+) -> str:
+    global active_motion_run_id
+    run_id = str(uuid4())
+    active_motion_run_id = run_id
+    initial_sample = tcp_sample_from_state()
+    state.motion_execution_state = "queued"
+    state.motion_diagnostics = {
+        "run_id": run_id,
+        "source": source,
+        "mode": mode,
+        "execution_state": "queued",
+        "requested_target_deg": [float(value) for value in target_deg],
+        "start_reported_deg": [float(value) for value in state.reported_angles_deg],
+        "expected_duration_s": float(expected_duration_s),
+        "elapsed_s": 0.0,
+        "waypoint_count": int(waypoint_count),
+        "current_waypoint_index": 0,
+        "current_waypoint_total": int(waypoint_count),
+        "active_step_label": step_label,
+        "active_step_index": int(step_index),
+        "active_step_total": int(step_total),
+        "progress_ratio": 0.0,
+        "axis_modes": axis_modes(),
+        "started_at": time(),
+        "controller_response": "",
+        "last_status_line": state.last_status_line,
+        "final_reported_deg": None,
+        "final_error_deg": None,
+        "actual_tcp_path": [initial_sample],
+        "last_tcp_sample": initial_sample,
+        "actual_duration_s": None,
+        "result": "queued",
+    }
+    return run_id
+
+
+def update_motion_diagnostics(run_id: str | None = None, **updates: Any) -> None:
+    if not _motion_run_matches(run_id):
+        return
+    diagnostics = dict(state.motion_diagnostics or {})
+    diagnostics.update(updates)
+    state.motion_diagnostics = diagnostics
+    if "execution_state" in updates:
+        state.motion_execution_state = str(updates["execution_state"])
+
+
+def record_motion_sample(run_id: str | None = None) -> None:
+    if not state.motion_diagnostics or not _motion_run_matches(run_id):
+        return
+    if state.motion_diagnostics.get("result") not in {"queued", "executing"}:
+        return
+    diagnostics = dict(state.motion_diagnostics)
+    sample = tcp_sample_from_state()
+    path = list(diagnostics.get("actual_tcp_path") or [])
+    last_sample = diagnostics.get("last_tcp_sample") or (path[-1] if path else None)
+    elapsed_since_last = sample["ts"] - float((last_sample or {}).get("ts", 0.0))
+    moved_mm = _tcp_distance_mm(sample, last_sample) if last_sample else 0.0
+    if not path or moved_mm >= 1.0 or elapsed_since_last >= 0.25:
+        path.append(sample)
+        if len(path) > 360:
+            path = path[-360:]
+        diagnostics["actual_tcp_path"] = path
+        diagnostics["last_tcp_sample"] = sample
+
+    start = [float(value) for value in diagnostics.get("start_reported_deg", state.reported_angles_deg)]
+    target = [float(value) for value in diagnostics.get("requested_target_deg", state.target_angles_deg)]
+    diagnostics["elapsed_s"] = max(0.0, time() - float(diagnostics.get("started_at", time())))
+    diagnostics["progress_ratio"] = _joint_progress_ratio(start, target, state.reported_angles_deg)
+    state.motion_diagnostics = diagnostics
+
+
+def maybe_finish_reached_motion() -> None:
+    if not active_motion_run_id or not state.motion_diagnostics:
+        return
+    if state.motion_diagnostics.get("result") not in {"queued", "executing"}:
+        return
+    target = [float(value) for value in state.motion_diagnostics.get("requested_target_deg", state.target_angles_deg)]
+    tolerance = float(calibration_settings(config).get("movement_tolerance_deg", 0.2))
+    if state.motion_state == MotionState.IDLE and all(abs(error) <= tolerance for error in joint_errors_deg(target, state.reported_angles_deg)):
+        finish_motion_diagnostics("reached", run_id=active_motion_run_id)
+
+
+def finish_motion_diagnostics(result: str, error: str | None = None, run_id: str | None = None) -> None:
+    global active_motion_run_id
+    if not _motion_run_matches(run_id):
+        return
+    record_motion_sample(run_id)
+    diagnostics = dict(state.motion_diagnostics or {})
+    started_at = float(diagnostics.get("started_at", time()))
+    target = diagnostics.get("requested_target_deg") or state.target_angles_deg
+    final_error = joint_errors_deg([float(value) for value in target], state.reported_angles_deg)
+    diagnostics.update(
+        {
+            "result": result,
+            "execution_state": result,
+            "progress_ratio": 1.0 if result == "reached" else float(diagnostics.get("progress_ratio", 0.0)),
+            "error": error or "",
+            "final_reported_deg": [float(value) for value in state.reported_angles_deg],
+            "final_error_deg": final_error,
+            "actual_duration_s": max(0.0, time() - started_at),
+            "elapsed_s": max(0.0, time() - started_at),
+            "controller_response": state.last_controller_response,
+            "last_status_line": state.last_status_line,
+        }
+    )
+    state.motion_diagnostics = diagnostics
+    state.motion_execution_state = result
+    if run_id is None or active_motion_run_id == run_id:
+        active_motion_run_id = None
+
+
+def send_movej_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=MOVEJ", "ERR"), timeout_s=1.0)
+    state.last_controller_response = response
+    update_motion_diagnostics(controller_response=response, execution_state="accepted" if response.startswith("OK") else "failed")
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+async def wait_for_hardware_target(
+    target_deg: list[float],
+    timeout_s: float,
+    tolerance_deg: float = 0.15,
+    poll_interval_s: float = 0.08,
+) -> tuple[bool, str]:
+    deadline = monotonic() + max(timeout_s, poll_interval_s)
+    last_error: list[float] = []
+    while monotonic() < deadline:
+        if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+            return False, f"motion stopped while waiting for hardware ({state.motion_state.value})"
+        try:
+            refresh_serial_status()
+        except SerialClientError as exc:
+            return False, str(exc)
+        last_error = joint_errors_deg(target_deg, state.reported_angles_deg)
+        if state.motion_state == MotionState.IDLE and all(abs(error) <= tolerance_deg for error in last_error):
+            return True, "target reached"
+        await asyncio.sleep(poll_interval_s)
+    error_text = ", ".join(f"{value:.2f}" for value in last_error) if last_error else "unknown"
+    return False, f"hardware target timeout after {timeout_s:.2f}s; joint errors deg=[{error_text}]"
+
+
 def sync_hardware_config() -> dict[str, Any]:
     evaluation = apply_hardware_evaluation()
     ready, reason = config_sync_ready()
@@ -545,10 +752,13 @@ def build_preview(
         if not ik_result["ok"] or not ik_result["selected"]:
             return {"ok": False, "error": "IK target has no valid solution", "ik": ik_result}
 
+        resolved_target = dict(ik_result["target"])
         if mode == "linear":
+            movement_target = dict(resolved_target)
+            movement_target["phi_auto"] = False
             trajectory = build_linear_cartesian_trajectory(
                 state.reported_angles_deg,
-                target,
+                movement_target,
                 links,
                 config.joints,
                 settings,
@@ -569,7 +779,7 @@ def build_preview(
                 "ik": ik_result,
                 "trajectory": trajectory,
             }
-        preview_target = target
+        preview_target = resolved_target
         preview_mode = mode
 
     preview_id = str(uuid4())
@@ -629,32 +839,64 @@ def set_targets(
         state.set_error(can_move.reason)
         return {"ok": False, "error": can_move.reason, "state": state.to_dict()}
 
+    start_result = validate_joint_targets(config, state.reported_angles_deg)
+    if not start_result.ok:
+        state.set_error(f"reported pose is outside limits: {start_result.reason}")
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
     result = validate_joint_targets(config, targets)
     if not result.ok:
         state.set_error(result.reason)
         return {"ok": False, "error": result.reason, "state": state.to_dict()}
 
+    speed = speed_deg_s if speed_deg_s and speed_deg_s > 0 else min(joint.max_speed_deg_s for joint in config.joints)
+    accel = accel_deg_s2 if accel_deg_s2 and accel_deg_s2 > 0 else config.motion.acceleration_deg_s2
+    if speed <= 0 or accel <= 0:
+        state.set_error("speed and acceleration must be positive")
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    if state.motion_diagnostics.get("result") not in {"queued", "executing"}:
+        run_id = start_motion_diagnostics(
+            source=command_label,
+            mode="joint_endpoint",
+            target_deg=[float(value) for value in targets],
+            expected_duration_s=0.0,
+            waypoint_count=1,
+        )
+        update_motion_diagnostics(
+            run_id,
+            execution_state="executing",
+            result="executing",
+            current_waypoint_index=1,
+            current_waypoint_total=1,
+            active_target_deg=[float(value) for value in targets],
+        )
+
     state.target_angles_deg = [float(value) for value in targets]
     limiter.current_deg = state.reported_angles_deg.copy()
     limiter.set_target(state.target_angles_deg)
     state.motion_state = MotionState.MOVING
+    state.motion_execution_state = "command_sent"
     state.clear_error()
 
-    speed = speed_deg_s if speed_deg_s and speed_deg_s > 0 else min(joint.max_speed_deg_s for joint in config.joints)
-    accel = accel_deg_s2 if accel_deg_s2 and accel_deg_s2 > 0 else config.motion.acceleration_deg_s2
     command = format_movej(state.target_angles_deg, speed, accel)
     state.last_command = command
     state.updated_at = time()
 
     if not state.simulation and serial_client.is_connected:
         try:
-            serial_client.send_line(command)
+            response = send_movej_and_read_response(command)
             refresh_serial_status()
         except SerialClientError as exc:
             state.set_error(str(exc), fault=True)
+            finish_motion_diagnostics("failed", str(exc))
             return {"ok": False, "error": str(exc), "state": state.to_dict()}
+    else:
+        response = "SIMULATION"
+        state.last_controller_response = response
+        update_motion_diagnostics(controller_response=response, execution_state="accepted")
 
-    return {"ok": True, "command": command_label, "state": state.to_dict()}
+    return {"ok": True, "command": command_label, "command_line": command, "controller_response": response, "state": state.to_dict()}
 
 
 async def start_joint_target_trajectory(
@@ -721,9 +963,86 @@ async def start_joint_target_trajectory(
     state.clear_error()
     state.last_command = f"{command_label.upper()} {preview_id}"
     path_task_source = command_label
-    path_task = asyncio.create_task(execute_waypoint_path(preview))
+    path_task = asyncio.create_task(execute_joint_endpoint_move(preview))
     await broadcast_state()
     return {"ok": True, "command": command_label, "preview_id": preview_id, "preview": preview, "state": state.to_dict()}
+
+
+async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
+    trajectory = preview["trajectory"]
+    waypoints = trajectory.get("waypoints", [])
+    if not waypoints:
+        state.set_error("joint trajectory has no waypoints", fault=True)
+        finish_motion_diagnostics("failed", state.last_error)
+        await broadcast_state()
+        return
+
+    target = [float(value) for value in waypoints[-1]]
+    settings = preview.get("settings", {})
+    speed = settings.get("global_speed_deg_s")
+    accel = settings.get("global_accel_deg_s2")
+    expected_duration = float(trajectory.get("duration_s", 0.0))
+    run_id = start_motion_diagnostics(
+        source=str(preview.get("source", "joint")),
+        mode="joint_endpoint",
+        target_deg=target,
+        expected_duration_s=expected_duration,
+        waypoint_count=1,
+        step_label=str(preview.get("task_step_label", "")),
+        step_index=int(preview.get("task_step_index", 0) or 0),
+        step_total=int(preview.get("task_step_total", 0) or 0),
+    )
+    update_motion_diagnostics(
+        run_id,
+        execution_state="executing",
+        result="executing",
+        current_waypoint_index=1,
+        current_waypoint_total=1,
+        active_target_deg=target,
+    )
+
+    try:
+        response = set_targets(
+            target,
+            f"{preview.get('source', 'joint')}_endpoint",
+            speed_deg_s=speed,
+            accel_deg_s2=accel,
+        )
+        await broadcast_state()
+        if not response["ok"]:
+            finish_motion_diagnostics("failed", response.get("error", "joint endpoint failed"), run_id)
+            return
+
+        if state.simulation:
+            deadline = monotonic() + max(1.0, expected_duration * 4.0 + 0.5)
+            while monotonic() < deadline:
+                if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                    finish_motion_diagnostics("stopped", state.motion_state.value, run_id)
+                    return
+                if has_reached_target(state.reported_angles_deg, target, tolerance_deg=0.08):
+                    state.motion_state = MotionState.IDLE
+                    finish_motion_diagnostics("reached", run_id=run_id)
+                    return
+                await asyncio.sleep(0.03)
+            state.set_error("simulation target timeout", fault=True)
+            finish_motion_diagnostics("failed", state.last_error, run_id)
+            return
+
+        ok, message = await wait_for_hardware_target(
+            target,
+            timeout_s=max(1.0, expected_duration * 2.0 + 1.0),
+            tolerance_deg=float(calibration_settings(config).get("movement_tolerance_deg", 0.2)),
+        )
+        if ok:
+            finish_motion_diagnostics("reached", run_id=run_id)
+        else:
+            state.set_error(message, fault=True)
+            finish_motion_diagnostics("failed", message, run_id)
+    except asyncio.CancelledError:
+        finish_motion_diagnostics("stopped", "cancelled", run_id)
+        raise
+    finally:
+        await broadcast_state()
 
 
 async def execute_waypoint_path(preview: dict[str, Any]) -> None:
@@ -733,19 +1052,43 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
     settings = preview.get("settings", {})
     speed = settings.get("global_speed_deg_s")
     accel = settings.get("global_accel_deg_s2")
+    final_target = [float(value) for value in waypoints[-1]] if waypoints else state.target_angles_deg.copy()
+    run_id = start_motion_diagnostics(
+        source=str(preview.get("source", "path")),
+        mode=str(trajectory.get("mode", preview.get("mode", "path"))),
+        target_deg=final_target,
+        expected_duration_s=float(trajectory.get("duration_s", 0.0)),
+        waypoint_count=len(waypoints),
+        step_label=str(preview.get("task_step_label", "")),
+        step_index=int(preview.get("task_step_index", 0) or 0),
+        step_total=int(preview.get("task_step_total", 0) or 0),
+    )
 
     try:
         for index, waypoint in enumerate(waypoints):
             if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                finish_motion_diagnostics("stopped", state.motion_state.value, run_id)
                 break
+            waypoint_values = [float(value) for value in waypoint]
+            if index == 0 and has_reached_target(state.reported_angles_deg, waypoint_values, tolerance_deg=0.08):
+                continue
+            update_motion_diagnostics(
+                run_id,
+                execution_state="executing",
+                result="executing",
+                current_waypoint_index=index + 1,
+                current_waypoint_total=len(waypoints),
+                active_target_deg=waypoint_values,
+            )
             response = set_targets(
-                [float(value) for value in waypoint],
+                waypoint_values,
                 f"{preview.get('source', 'path')}_waypoint_{index + 1}",
                 speed_deg_s=speed,
                 accel_deg_s2=accel,
             )
             await broadcast_state()
             if not response["ok"]:
+                finish_motion_diagnostics("failed", response.get("error", "waypoint failed"), run_id)
                 break
 
             wait_s = float(segment_durations[index]) if index < len(segment_durations) else 0.05
@@ -764,14 +1107,31 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
                         refresh_serial_status()
                     except SerialClientError as exc:
                         state.set_error(str(exc), fault=True)
+                        finish_motion_diagnostics("failed", str(exc), run_id)
+                        break
+                if index == len(waypoints) - 1:
+                    ok, message = await wait_for_hardware_target(
+                        waypoint_values,
+                        timeout_s=max(1.0, wait_s * 2.0 + 1.0),
+                        tolerance_deg=float(calibration_settings(config).get("movement_tolerance_deg", 0.2)),
+                    )
+                    if not ok:
+                        state.set_error(message, fault=True)
+                        finish_motion_diagnostics("failed", message, run_id)
                         break
     except asyncio.CancelledError:
+        finish_motion_diagnostics("stopped", "cancelled", run_id)
         raise
     finally:
         if state.motion_state == MotionState.MOVING and has_reached_target(
             state.reported_angles_deg, state.target_angles_deg, tolerance_deg=0.08
         ):
             state.motion_state = MotionState.IDLE
+        if state.motion_execution_state not in {"failed", "stopped"}:
+            finish_motion_diagnostics(
+                "reached" if state.motion_state == MotionState.IDLE else state.motion_state.value,
+                run_id=run_id,
+            )
         await broadcast_state()
 
 
@@ -829,7 +1189,8 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
 
 async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, Any], branch: str) -> None:
     try:
-        for step in sequence.get("steps", []):
+        steps = sequence.get("steps", [])
+        for step_index, step in enumerate(steps, start=1):
             if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
                 log_event("task", "task aborted", state=state.motion_state.value)
                 break
@@ -857,7 +1218,15 @@ async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, An
             if not preview_result["ok"]:
                 state.set_error(preview_result.get("error", f"task step {label} preview failed"))
                 break
-            await execute_waypoint_path(preview_result["preview"])
+            preview = preview_result["preview"]
+            preview["task_step_label"] = label
+            preview["task_step_index"] = step_index
+            preview["task_step_total"] = len(steps)
+            trajectory_mode = str(preview.get("trajectory", {}).get("mode", preview.get("mode", ""))).lower()
+            if trajectory_mode == "joint":
+                await execute_joint_endpoint_move(preview)
+            else:
+                await execute_waypoint_path(preview)
     except asyncio.CancelledError:
         log_event("task", "task cancelled")
         raise
@@ -881,7 +1250,15 @@ def reload_runtime_config() -> None:
         apply_hardware_evaluation("simulation", "simulation mode")
 
 
+def log_validation_warnings() -> None:
+    for warning in model_validation_warnings(config):
+        log_event("config", "model validation warning", warning=warning)
+    for name, errors in named_position_errors(config).items():
+        log_event("config", "named position invalid", name=name, errors=errors)
+
+
 def apply_controller_status(status_line: str) -> None:
+    state.last_status_line = status_line
     status = parse_status(status_line)
     state.reported_angles_deg = status.joints_deg
     state.homed = status.homed
@@ -911,6 +1288,8 @@ def apply_controller_status(status_line: str) -> None:
     state.last_error = "" if status.fault == "OK" else status.fault
     update_encoder_verification()
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
+    record_motion_sample(active_motion_run_id)
+    maybe_finish_reached_motion()
     state.updated_at = time()
 
 
@@ -931,6 +1310,7 @@ def refresh_serial_status() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
+    log_validation_warnings()
     asyncio.create_task(simulation_loop())
 
 
@@ -978,6 +1358,11 @@ async def diagnostics(limit: int = 120) -> dict[str, Any]:
         },
         "encoders": encoder_settings(config),
         "kinematics": asdict(config.kinematics),
+        "motion": state.motion_diagnostics,
+        "validation": {
+            "model_warnings": model_validation_warnings(config),
+            "named_position_errors": named_position_errors(config),
+        },
     }
 
 
@@ -1005,6 +1390,7 @@ async def save_named_positions(request: NamedPositionsRequest) -> dict[str, Any]
     try:
         save_calibration_updates(ensure_local_config(), {"named_positions": request.positions})
         reload_runtime_config()
+        log_validation_warnings()
     except Exception as exc:
         state.set_error(f"could not save named positions: {exc}")
         await broadcast_state()
@@ -1037,6 +1423,7 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
     try:
         save_calibration_updates(ensure_local_config(), {"tools": tools})
         reload_runtime_config()
+        log_validation_warnings()
     except Exception as exc:
         state.set_error(f"could not save tool settings: {exc}")
         await broadcast_state()
@@ -1228,6 +1615,7 @@ async def save_dh_table(request: CalibrationRequest) -> dict[str, Any]:
     try:
         save_calibration_updates(ensure_local_config(), {"kinematics": request.kinematics})
         reload_runtime_config()
+        log_validation_warnings()
     except Exception as exc:
         state.set_error(f"could not save DH table: {exc}")
         await broadcast_state()
@@ -1299,7 +1687,11 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
     state.clear_error()
     state.last_command = f"PATH_EXECUTE {request.preview_id}"
     path_task_source = "path_execute"
-    path_task = asyncio.create_task(execute_waypoint_path(preview))
+    trajectory_mode = str(preview.get("trajectory", {}).get("mode", preview.get("mode", ""))).lower()
+    if trajectory_mode == "joint":
+        path_task = asyncio.create_task(execute_joint_endpoint_move(preview))
+    else:
+        path_task = asyncio.create_task(execute_waypoint_path(preview))
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
 
@@ -1482,7 +1874,11 @@ async def live_target(request: LiveTargetRequest) -> dict[str, Any]:
     cancel_task(live_task)
     state.clear_error()
     state.last_command = f"LIVE_TARGET {result['preview_id']}"
-    live_task = asyncio.create_task(execute_waypoint_path(preview))
+    trajectory_mode = str(preview.get("trajectory", {}).get("mode", preview.get("mode", ""))).lower()
+    if trajectory_mode in {"joint", "jog"}:
+        live_task = asyncio.create_task(execute_joint_endpoint_move(preview))
+    else:
+        live_task = asyncio.create_task(execute_waypoint_path(preview))
     await broadcast_state()
     return {**result, "state": state.to_dict()}
 
@@ -1506,6 +1902,7 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
 
         save_calibration_updates(config_path, updates)
         reload_runtime_config()
+        log_validation_warnings()
         if serial_client.is_connected and not state.simulation:
             sync_hardware_config()
     except Exception as exc:
@@ -1637,6 +2034,7 @@ async def stop() -> dict[str, Any]:
     limiter.set_target(state.target_angles_deg)
     state.motion_state = MotionState.STOPPED
     state.last_command = format_stop()
+    finish_motion_diagnostics("stopped", "STOP")
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_stop())
         refresh_serial_status()
@@ -1654,6 +2052,7 @@ async def estop() -> dict[str, Any]:
     state.hardware_armed = False
     state.live_motion_enabled = False
     state.last_command = format_estop()
+    finish_motion_diagnostics("stopped", "ESTOP")
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_estop())
         refresh_serial_status()
@@ -1727,6 +2126,8 @@ async def simulation_loop() -> None:
         if state.simulation:
             apply_simulation_step(state, limiter, dt_s)
         state.fk = forward_kinematics(state.reported_angles_deg, config.links)
+        record_motion_sample(active_motion_run_id)
+        maybe_finish_reached_motion()
         state.updated_at = time()
         await broadcast_state()
         await asyncio.sleep(interval)

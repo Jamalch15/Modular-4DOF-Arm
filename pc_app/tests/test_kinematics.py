@@ -155,6 +155,33 @@ def test_inverse_kinematics_rejects_unreachable_target():
     assert "unreachable" in result["notes"][0]
 
 
+def test_inverse_kinematics_auto_phi_chooses_reachable_orientation():
+    config = load_config()
+    target = {"x_mm": 250.0, "y_mm": 0.0, "z_mm": 120.0}
+
+    fixed_phi = inverse_kinematics(
+        {**target, "phi_deg": 0.0},
+        config.links,
+        config.joints,
+        config.home_pose,
+    )
+    auto_phi = inverse_kinematics(
+        {**target, "phi_auto": True},
+        config.links,
+        config.joints,
+        config.home_pose,
+    )
+
+    assert not fixed_phi["ok"]
+    assert auto_phi["ok"], auto_phi["notes"]
+    assert auto_phi["target"]["phi_auto"] is True
+    assert auto_phi["target"]["phi_deg"] == approx(auto_phi["selected"]["fk"]["tool_phi_deg"])
+    selected_fk = auto_phi["selected"]["fk"]
+    assert selected_fk["x_mm"] == approx(target["x_mm"], abs=1e-6)
+    assert selected_fk["y_mm"] == approx(target["y_mm"], abs=1e-6)
+    assert selected_fk["z_mm"] == approx(target["z_mm"], abs=1e-6)
+
+
 def test_inverse_kinematics_filters_joint_limits():
     config = load_config()
     target_fk = forward_kinematics([180.0, 60.0, -40.0, 10.0], config.links)
@@ -192,6 +219,34 @@ def test_inverse_kinematics_prefers_nearest_valid_solution():
     second = inverse_kinematics(target, config.links, config.joints, expected["angles_deg"], expected["branch"])
 
     assert second["selected_branch"] == expected["branch"]
+
+
+def test_analytic_seed_round_trips_multiple_fk_targets_from_home():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    poses = [
+        [15.0, 35.0, 30.0, -20.0],
+        [-45.0, 50.0, -35.0, 15.0],
+        [70.0, 25.0, 45.0, -60.0],
+    ]
+
+    for pose in poses:
+        target_fk = forward_kinematics(pose, config.links)
+        result = inverse_kinematics(
+            {
+                "x_mm": target_fk["x_mm"],
+                "y_mm": target_fk["y_mm"],
+                "z_mm": target_fk["z_mm"],
+                "phi_deg": target_fk["tool_phi_deg"],
+            },
+            config.links,
+            config.joints,
+            config.home_pose,
+        )
+
+        assert result["ok"], result["notes"]
+        assert "analytic_seed" in result["notes"]
+        assert result["selected"]["position_error_mm"] <= 1.0
+        assert result["selected"]["phi_error_deg"] <= 1.0
 
 
 def test_forward_kinematics_exposes_dh_frames():

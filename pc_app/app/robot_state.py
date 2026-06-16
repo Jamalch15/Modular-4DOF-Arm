@@ -44,6 +44,10 @@ class RobotState:
     tool_type: str = "servo_gripper"
     tool_state: str = "unknown"
     tool_value: float | None = None
+    last_status_line: str = ""
+    last_controller_response: str = ""
+    motion_execution_state: str = "idle"
+    motion_diagnostics: dict[str, Any] = field(default_factory=dict)
     fk: dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time)
 
@@ -77,6 +81,10 @@ class RobotState:
             "tool_type": self.tool_type,
             "tool_state": self.tool_state,
             "tool_value": self.tool_value,
+            "last_status_line": self.last_status_line,
+            "last_controller_response": self.last_controller_response,
+            "motion_execution_state": self.motion_execution_state,
+            "motion_diagnostics": self.motion_diagnostics,
             "fk": self.fk,
             "updated_at": self.updated_at,
         }

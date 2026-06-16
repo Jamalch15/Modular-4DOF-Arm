@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import atan2, cos, degrees, hypot, isfinite, radians, sin
+from math import acos, atan2, cos, degrees, hypot, isfinite, radians, sin, sqrt
 from typing import Any
 
 import numpy as np
@@ -397,35 +397,215 @@ def _solve_from_seed(
     }
 
 
-def _seed_candidates(target: dict[str, float], joints: list[JointConfig], current: list[float]) -> list[tuple[str, list[float]]]:
+def _candidate_from_angles(
+    target: dict[str, float],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    angles_deg: list[float],
+    label: str,
+    position_tolerance_mm: float = 1.0,
+    orientation_tolerance_deg: float = 1.0,
+) -> dict[str, Any]:
+    angles = [float(value) for value in angles_deg]
+    fk = forward_kinematics(angles, links)
+    position_error = hypot(hypot(fk["x_mm"] - target["x_mm"], fk["y_mm"] - target["y_mm"]), fk["z_mm"] - target["z_mm"])
+    phi_error = angle_distance_deg(fk["tool_phi_deg"], target["phi_deg"])
+    reasons = _joint_limit_reasons(joints, angles)
+    if position_error > position_tolerance_mm or phi_error > orientation_tolerance_deg:
+        reasons.append(
+            f"IK did not converge: position error {position_error:.2f} mm, phi error {phi_error:.2f} deg"
+        )
+    return {
+        "branch": label,
+        "angles_deg": angles,
+        "valid": not reasons,
+        "reasons": reasons,
+        "fk": fk,
+        "position_error_mm": position_error,
+        "phi_error_deg": phi_error,
+        "iterations": 0,
+        "singularity_warning": False,
+        "notes": [],
+    }
+
+
+def _joint_angle_from_row_theta(row: DHRowConfig, theta_deg: float) -> float:
+    return (theta_deg - row.zero_offset_deg - row.theta_offset_deg) / row.direction_sign
+
+
+def _analytic_seed_candidates(
+    target: dict[str, float],
+    links: LinkConfig,
+    joints: list[JointConfig],
+) -> tuple[list[tuple[str, list[float]]], list[str]]:
+    rows = _rows(links)
+    notes: list[str] = []
+    if len(rows) != 4:
+        return [], ["analytic seed skipped: DH model does not have four rows"]
+    if abs(rows[0].alpha_deg - 90.0) > 1e-6 or any(abs(row.alpha_deg) > 1e-6 for row in rows[1:]):
+        return [], ["analytic seed skipped: DH rows do not match the planar prototype shape"]
+
+    d1 = float(rows[0].d_mm)
+    lateral_mm = float(links.base_side_offset_mm) - sum(float(row.d_mm) for row in rows[1:])
+    a2 = float(rows[1].a_mm)
+    a3 = float(rows[2].a_mm)
+    tool_offset = _tool_tcp_offset_vector(links)
+    a4 = float(rows[3].a_mm) + float(tool_offset[0])
+    phi = radians(float(target["phi_deg"]))
+
+    dh_x = -float(target["y_mm"])
+    dh_y = float(target["x_mm"])
+    xy_radius = hypot(dh_x, dh_y)
+    if xy_radius < abs(lateral_mm) - 1e-6:
+        return [], [f"target is inside lateral offset radius {abs(lateral_mm):.2f} mm"]
+
+    radial_abs = sqrt(max(0.0, xy_radius * xy_radius - lateral_mm * lateral_mm))
+    radial_signs = [1.0]
+    if radial_abs > 1e-6:
+        radial_signs.append(-1.0)
+
+    seeds: list[tuple[str, list[float]]] = []
+    for radial_sign in radial_signs:
+        radial_mm = radial_abs * radial_sign
+        base_theta = degrees(atan2(dh_y, dh_x) - atan2(lateral_mm, radial_mm))
+        wrist_r = radial_mm - a4 * cos(phi)
+        wrist_z = float(target["z_mm"]) - d1 - a4 * sin(phi)
+        denom = 2.0 * a2 * a3
+        if abs(denom) <= 1e-9:
+            notes.append("analytic seed skipped: upper-arm or forearm length is zero")
+            continue
+        elbow_cos = (wrist_r * wrist_r + wrist_z * wrist_z - a2 * a2 - a3 * a3) / denom
+        if elbow_cos < -1.0 - 1e-6 or elbow_cos > 1.0 + 1e-6:
+            notes.append(
+                f"analytic seed radial {radial_mm:.2f} mm is outside 2-link reach"
+            )
+            continue
+        elbow_cos = max(-1.0, min(1.0, elbow_cos))
+        for elbow_sign, label in [(-1.0, "elbow_down"), (1.0, "elbow_up")]:
+            theta3 = elbow_sign * degrees(acos(elbow_cos))
+            theta3_rad = radians(theta3)
+            theta2 = degrees(
+                atan2(wrist_z, wrist_r)
+                - atan2(a3 * sin(theta3_rad), a2 + a3 * cos(theta3_rad))
+            )
+            theta4 = float(target["phi_deg"]) - theta2 - theta3
+            angles = [
+                _normalize_deg(_joint_angle_from_row_theta(rows[0], base_theta)),
+                _normalize_deg(_joint_angle_from_row_theta(rows[1], theta2)),
+                _normalize_deg(_joint_angle_from_row_theta(rows[2], theta3)),
+                _normalize_deg(_joint_angle_from_row_theta(rows[3], theta4)),
+            ]
+            limit_reasons = _joint_limit_reasons(joints, angles)
+            if limit_reasons:
+                notes.append(f"analytic {label} seed outside joint limits: {limit_reasons[0]}")
+            seeds.append((label, angles))
+
+    unique: list[tuple[str, list[float]]] = []
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+    for label, angles in seeds:
+        key = (label, tuple(round(angle * 1000) for angle in angles))
+        if key not in seen:
+            unique.append((label, angles))
+            seen.add(key)
+    if unique:
+        notes.insert(0, "analytic_seed")
+    return unique, notes
+
+
+def _seed_candidates(
+    target: dict[str, float],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    current: list[float],
+) -> tuple[list[tuple[str, list[float]]], list[str]]:
+    analytic, notes = _analytic_seed_candidates(target, links, joints)
     base_guess = degrees(atan2(-target["x_mm"], target["y_mm"])) if hypot(target["x_mm"], target["y_mm"]) > 1e-6 else current[0]
     home = [joint.home_deg for joint in joints]
-    return [
+    fallback = [
         ("current_seed", current),
         ("elbow_up", [base_guess, min(60.0, joints[1].max_deg), 35.0, -20.0]),
         ("elbow_down", [base_guess, 30.0, -55.0, 55.0]),
         ("home_seed", home),
     ]
+    candidates: list[tuple[str, list[float]]] = [("current_seed", current)]
+    candidates.extend(analytic)
+    candidates.append(("home_seed", home))
+    if not analytic:
+        candidates = fallback
+    return candidates, notes
 
 
-def inverse_kinematics(
-    target: dict[str, float],
-    links: LinkConfig,
-    joints: list[JointConfig],
-    current_joints_deg: list[float] | None = None,
-    branch: str = "auto",
-    tolerance: float = 1e-6,
-) -> dict[str, Any]:
-    del tolerance
-    if len(joints) != 4:
-        raise ValueError("inverse_kinematics expects four joint configs")
-
-    pose = {
+def _fixed_phi_pose(target: dict[str, Any]) -> dict[str, float]:
+    return {
         "x_mm": float(target.get("x_mm", 0.0)),
         "y_mm": float(target.get("y_mm", 0.0)),
         "z_mm": float(target.get("z_mm", 0.0)),
         "phi_deg": float(target.get("phi_deg", target.get("tool_phi_deg", 0.0))),
     }
+
+
+def _target_requests_auto_phi(target: dict[str, Any]) -> bool:
+    if bool(target.get("phi_auto", False)):
+        return True
+    return target.get("phi_deg") is None and target.get("tool_phi_deg") is None
+
+
+def _auto_phi_values(current_phi_deg: float) -> list[float]:
+    values: list[float] = []
+    seen: set[int] = set()
+
+    def add(value: float) -> None:
+        normalized = _normalize_deg(value)
+        key = round(normalized * 1000)
+        if key not in seen:
+            values.append(normalized)
+            seen.add(key)
+
+    for delta in [0, -10, 10, -20, 20, -30, 30, -45, 45, -60, 60, -90, 90, -120, 120, -150, 150, 180]:
+        add(current_phi_deg + delta)
+    for value in range(-180, 181, 15):
+        add(float(value))
+    return values
+
+
+def _candidate_continuity_error(candidate: dict[str, Any], current: list[float]) -> float:
+    return sum(
+        angle_distance_deg(angle, current[index])
+        for index, angle in enumerate(candidate["angles_deg"])
+    )
+
+
+def _select_candidate(
+    valid_candidates: list[dict[str, Any]],
+    current: list[float],
+    requested_branch: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    notes: list[str] = []
+    candidates = valid_candidates
+    if requested_branch != "auto":
+        candidates = [candidate for candidate in candidates if candidate["branch"] == requested_branch]
+        if not candidates:
+            notes.append(f"requested branch {requested_branch} is not valid")
+    if not candidates:
+        return None, notes
+    return min(
+        candidates,
+        key=lambda candidate: (
+            candidate["position_error_mm"],
+            candidate.get("phi_error_deg", 0.0),
+            0 if candidate["branch"] == "elbow_down" else 1,
+            _candidate_continuity_error(candidate, current),
+        ),
+    ), notes
+
+
+def _inverse_kinematics_fixed_phi(
+    pose: dict[str, float],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    current_joints_deg: list[float] | None = None,
+    branch: str = "auto",
+) -> dict[str, Any]:
     if not all(isfinite(value) for value in pose.values()):
         return {
             "ok": False,
@@ -437,29 +617,16 @@ def inverse_kinematics(
         }
 
     current = current_joints_deg or [joint.home_deg for joint in joints]
-    seeds = _seed_candidates(pose, joints, [float(value) for value in current])
+    seeds, seed_notes = _seed_candidates(pose, links, joints, [float(value) for value in current])
     requested_branch = branch if branch in {"elbow_up", "elbow_down", "current_seed", "home_seed"} else "auto"
     candidates = [
         _solve_from_seed(pose, links, joints, seed, label)
         for label, seed in seeds
     ]
     valid_candidates = [candidate for candidate in candidates if candidate["valid"]]
-    selected: dict[str, Any] | None = None
-    notes: list[str] = []
-
-    if requested_branch != "auto":
-        selected = next((candidate for candidate in valid_candidates if candidate["branch"] == requested_branch), None)
-        if selected is None:
-            notes.append(f"requested branch {requested_branch} is not valid")
-    if selected is None and valid_candidates:
-        selected = min(
-            valid_candidates,
-            key=lambda candidate: (
-                candidate["position_error_mm"],
-                candidate["phi_error_deg"],
-                sum(angle_distance_deg(angle, current[index]) for index, angle in enumerate(candidate["angles_deg"])),
-            ),
-        )
+    notes: list[str] = seed_notes.copy()
+    selected, selection_notes = _select_candidate(valid_candidates, [float(value) for value in current], requested_branch)
+    notes.extend(selection_notes)
 
     if selected is None:
         notes.insert(0, "target is unreachable or did not converge in DH/Jacobian solver")
@@ -472,3 +639,135 @@ def inverse_kinematics(
         "selected_branch": selected["branch"] if selected else None,
         "notes": notes,
     }
+
+
+def _auto_phi_candidate_score(candidate: dict[str, Any], current: list[float], current_phi_deg: float) -> tuple[float, ...]:
+    phi_delta = angle_distance_deg(candidate["fk"]["tool_phi_deg"], current_phi_deg)
+    return (
+        candidate["position_error_mm"],
+        _candidate_continuity_error(candidate, current),
+        phi_delta,
+        0 if candidate["branch"] == "elbow_down" else 1,
+    )
+
+
+def _inverse_kinematics_auto_phi(
+    target: dict[str, Any],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    current_joints_deg: list[float] | None = None,
+    branch: str = "auto",
+) -> dict[str, Any]:
+    base_pose = {
+        "x_mm": float(target.get("x_mm", 0.0)),
+        "y_mm": float(target.get("y_mm", 0.0)),
+        "z_mm": float(target.get("z_mm", 0.0)),
+        "phi_auto": True,
+    }
+    if not all(isfinite(value) for value in [base_pose["x_mm"], base_pose["y_mm"], base_pose["z_mm"]]):
+        return {
+            "ok": False,
+            "target": base_pose,
+            "candidates": [],
+            "selected": None,
+            "selected_branch": None,
+            "notes": ["target contains a non-finite value"],
+        }
+
+    current = [float(value) for value in (current_joints_deg or [joint.home_deg for joint in joints])]
+    current_phi = float(forward_kinematics(current, links)["tool_phi_deg"])
+    requested_branch = branch if branch in {"elbow_up", "elbow_down", "current_seed", "home_seed"} else "auto"
+    phi_values = _auto_phi_values(current_phi)
+    valid_candidates: list[dict[str, Any]] = []
+    invalid_samples: list[dict[str, Any]] = []
+    notes: list[str] = ["auto_phi", f"searched {len(phi_values)} phi values"]
+    seed_notes: list[str] = []
+
+    for phi in phi_values:
+        pose = {
+            "x_mm": base_pose["x_mm"],
+            "y_mm": base_pose["y_mm"],
+            "z_mm": base_pose["z_mm"],
+            "phi_deg": phi,
+        }
+        analytic_seeds, analytic_notes = _analytic_seed_candidates(pose, links, joints)
+        for note in analytic_notes:
+            if len(seed_notes) < 5 and note not in seed_notes:
+                seed_notes.append(note)
+        seeds = analytic_seeds
+        if not seeds and abs(angle_distance_deg(phi, current_phi)) <= 1e-9:
+            seeds = [("current_seed", current)]
+        for label, seed in seeds:
+            if label in {"elbow_up", "elbow_down"}:
+                candidate = _candidate_from_angles(pose, links, joints, seed, label)
+            else:
+                candidate = _solve_from_seed(
+                    pose,
+                    links,
+                    joints,
+                    seed,
+                    label,
+                    max_iterations=40,
+                )
+            candidate["target_phi_deg"] = phi
+            candidate["auto_phi"] = True
+            if candidate["valid"]:
+                valid_candidates.append(candidate)
+            elif len(invalid_samples) < 10:
+                invalid_samples.append(candidate)
+
+    selection_pool = valid_candidates
+    if requested_branch != "auto":
+        selection_pool = [candidate for candidate in valid_candidates if candidate["branch"] == requested_branch]
+        if not selection_pool:
+            notes.append(f"requested branch {requested_branch} is not valid")
+
+    selected = min(
+        selection_pool,
+        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi),
+        default=None,
+    )
+    if selected is None:
+        notes.insert(0, "target is unreachable or did not converge in auto-phi search")
+        notes.extend(seed_notes)
+
+    visible_candidates = sorted(
+        valid_candidates,
+        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi),
+    )[:12]
+    if selected and all(candidate is not selected for candidate in visible_candidates):
+        visible_candidates.insert(0, selected)
+    if not visible_candidates:
+        visible_candidates = invalid_samples
+
+    resolved_target = base_pose.copy()
+    if selected:
+        resolved_target["phi_deg"] = float(selected["fk"]["tool_phi_deg"])
+        resolved_target["selected_phi_deg"] = float(selected["fk"]["tool_phi_deg"])
+    else:
+        resolved_target["phi_deg"] = current_phi
+
+    return {
+        "ok": selected is not None,
+        "target": resolved_target,
+        "candidates": visible_candidates,
+        "selected": selected,
+        "selected_branch": selected["branch"] if selected else None,
+        "notes": notes,
+    }
+
+
+def inverse_kinematics(
+    target: dict[str, Any],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    current_joints_deg: list[float] | None = None,
+    branch: str = "auto",
+    tolerance: float = 1e-6,
+) -> dict[str, Any]:
+    del tolerance
+    if len(joints) != 4:
+        raise ValueError("inverse_kinematics expects four joint configs")
+    if _target_requests_auto_phi(target):
+        return _inverse_kinematics_auto_phi(target, links, joints, current_joints_deg, branch)
+    return _inverse_kinematics_fixed_phi(_fixed_phi_pose(target), links, joints, current_joints_deg, branch)

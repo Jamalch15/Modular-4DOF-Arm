@@ -238,7 +238,7 @@ def build_joint_trajectory(
         "duration_s": duration_s,
         "waypoint_count": len(waypoints),
         "waypoints": waypoints,
-        "segment_durations_s": [segment_duration for _ in waypoints],
+        "segment_durations_s": [0.0] + [segment_duration for _ in waypoints[1:]],
         "speed_limits_deg_s": speed_limits,
         "accel_limits_deg_s2": accel_limits,
         "errors": [],
@@ -247,7 +247,7 @@ def build_joint_trajectory(
 
 def build_linear_cartesian_trajectory(
     start_deg: list[float],
-    target: dict[str, float],
+    target: dict[str, Any],
     links: LinkConfig,
     joints: list[JointConfig],
     settings: dict[str, Any] | None = None,
@@ -255,11 +255,45 @@ def build_linear_cartesian_trajectory(
 ) -> dict[str, Any]:
     settings = settings or {}
     start_fk = forward_kinematics(start_deg, links)
+    raw_phi = target.get("phi_deg", target.get("tool_phi_deg"))
+    auto_phi = bool(target.get("phi_auto", False)) or raw_phi is None
+    if auto_phi:
+        final_ik = inverse_kinematics(
+            {
+                "x_mm": float(target.get("x_mm", start_fk["x_mm"])),
+                "y_mm": float(target.get("y_mm", start_fk["y_mm"])),
+                "z_mm": float(target.get("z_mm", start_fk["z_mm"])),
+                "phi_auto": True,
+            },
+            links,
+            joints,
+            start_deg,
+            branch,
+        )
+        if not final_ik["ok"] or not final_ik["selected"]:
+            return {
+                "ok": False,
+                "mode": "linear",
+                "waypoints": [],
+                "cartesian_waypoints": [],
+                "ik_results": [
+                    {
+                        "index": "end",
+                        "ok": False,
+                        "selected_branch": final_ik.get("selected_branch"),
+                        "notes": final_ik.get("notes", []),
+                    }
+                ],
+                "errors": ["linear target has no reachable auto-phi solution"],
+            }
+        end_phi_deg = float(final_ik["selected"]["fk"]["tool_phi_deg"])
+    else:
+        end_phi_deg = float(raw_phi)
     end_pose = {
         "x_mm": float(target.get("x_mm", start_fk["x_mm"])),
         "y_mm": float(target.get("y_mm", start_fk["y_mm"])),
         "z_mm": float(target.get("z_mm", start_fk["z_mm"])),
-        "phi_deg": float(target.get("phi_deg", start_fk["tool_phi_deg"])),
+        "phi_deg": end_phi_deg,
     }
     start_pose = {
         "x_mm": start_fk["x_mm"],
@@ -429,12 +463,16 @@ def build_program_trajectory(
             segment = build_joint_trajectory(current, [float(value) for value in target_angles], joints, waypoint_settings)
         else:
             raw_target = waypoint.get("target") if isinstance(waypoint.get("target"), dict) else waypoint
+            raw_phi = raw_target.get("phi_deg", raw_target.get("phi"))
             target = {
                 "x_mm": float(raw_target.get("x_mm", raw_target.get("x", 0.0))),
                 "y_mm": float(raw_target.get("y_mm", raw_target.get("y", 0.0))),
                 "z_mm": float(raw_target.get("z_mm", raw_target.get("z", 0.0))),
-                "phi_deg": float(raw_target.get("phi_deg", raw_target.get("phi", 0.0))),
             }
+            if bool(raw_target.get("phi_auto", False)) or raw_phi is None:
+                target["phi_auto"] = True
+            else:
+                target["phi_deg"] = float(raw_phi)
             if mode == "linear":
                 segment = build_linear_cartesian_trajectory(
                     current,

@@ -40,6 +40,11 @@ Still missing or not production-ready:
 - The current kinematics implementation should be reconciled with the MATLAB prototype.
 - The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
 - Calibration is not yet a guided workflow.
+- AprilTag-based camera/world calibration is not implemented yet.
+- The viewport does not yet show the camera pose, tag boards, camera frustum, or camera image projected into robot space.
+- Planned, estimated, and actual executed TCP paths are not clearly separated in the viewport.
+- Cartesian waypoint execution does not yet guarantee blended continuous motion through waypoints.
+- End-effector speed/acceleration limits in `mm/s` and `mm/s^2` are not first-class motion settings yet.
 - Settings should show encoders only for base and shoulder. Elbow and wrist are servos for now.
 - AS5048A encoder configuration is not truly PC-app driven yet.
 - Vision and task workflows are placeholders, not operator-ready workflows.
@@ -214,12 +219,12 @@ This order keeps useful operator fixes first, then builds the kinematics and mov
 1. `SHELL-01` through `SHELL-04`: fix the operator shell, preview stability, camera popup, HUD/fader, and serial modal polish.
 2. `TOOL-01` through `TOOL-04`: finish end-effector selection, settings, active TCP, and firmware IO behavior.
 3. `KIN-01` through `KIN-06`: reconcile the app with the MATLAB DH/IK model.
-4. `MOVE-01` through `MOVE-05`: build movement preview, constraints, progress, abort, and diagnostics.
+4. `MOVE-01` through `MOVE-08`: build movement preview, constraints, continuous Cartesian control, progress, abort, and diagnostics.
 5. `CAL-01` through `CAL-04`: add guided arm/tool calibration and validation.
 6. `ENC-01` through `ENC-05`: implement AS5048A readback, known pose, verification, and bounded correction.
-7. `VISION-01` through `VISION-04`: build the camera popup, detections, profiles, and camera-to-robot calibration.
+7. `VISION-01` through `VISION-07`: build the camera popup, detections, profiles, AprilTag calibration, camera pose, and projected camera plane.
 8. `TASK-01` through `TASK-04`: rebuild task workflows around preview-first operation.
-9. `VIEW-01` through `VIEW-03`: polish 3D visualization, object markers, and DH segment overlays.
+9. `VIEW-01` through `VIEW-05`: polish 3D visualization, object markers, DH segment overlays, camera pose, and projected camera image layers.
 10. `DIAG-01`, `TEST-01`, `TEST-02`, and `TEST-03`: harden diagnostics and regression tests.
 
 ## Workpiece: Operator Shell And Control UI
@@ -535,7 +540,12 @@ Acceptance:
 
 ### MOVE-01: Motion State And Preview Reliability
 
-Status: partial.
+Status: implemented as a first pass after audit.
+
+Reality note: draft, commanded, reported, and preview state are separated well
+enough for the current UI. Preview, target, object, planned path, and actual
+path now use separate view layers. This should still be verified during real
+hardware jogging.
 
 Work:
 
@@ -550,7 +560,12 @@ Acceptance:
 
 ### MOVE-02: MATLAB-Style Cartesian Velocity Preview
 
-Status: missing.
+Status: partially covered by current trajectory preview.
+
+Reality note: the app now has joint, linear Cartesian, and program trajectory
+preview paths with duration estimates. This is enough for MOVE-04/MOVE-06.
+The exact MATLAB-style damped-least-squares velocity loop remains a future
+preview refinement and is still not a hardware execution controller.
 
 Work:
 
@@ -572,7 +587,13 @@ Acceptance:
 
 ### MOVE-03: Real Joint Limits, Velocity Limits, And Acceleration Limits
 
-Status: missing.
+Status: implemented as a first pass for joint-space previews and execution.
+
+Reality note: joint targets are checked against limits, per-joint speed and
+acceleration limits feed the generated waypoint profile, and direct joint
+execution uses configured speed/acceleration. Cartesian previews still depend
+on generated IK waypoints and should not be treated as firmware-level blended
+Cartesian control.
 
 Work:
 
@@ -589,7 +610,14 @@ Acceptance:
 
 ### MOVE-04: Execution Progress And Abort Behavior
 
-Status: partial.
+Status: implemented as a first pass.
+
+Reality note: motion diagnostics now track a run id, execution state, current
+waypoint, total waypoints, progress ratio, active task step label, expected
+duration, actual duration, final joint error, controller response, and stop or
+failure result. Stop cancels path, live, and task motions through the same
+diagnostic finish path. Stale cancelled motion runs cannot overwrite a newer
+active run.
 
 Work:
 
@@ -626,6 +654,121 @@ Work:
 Acceptance:
 
 - Movement behavior can be debugged after a bad move without cluttering normal operation.
+
+### MOVE-06: Planned, Estimated, And Actual Path Layers
+
+Status: implemented as a first pass.
+
+Reality note: the viewport now separates the planned/estimated preview TCP path
+from the actual reported TCP trail. Actual TCP points are sampled from
+`reported_angles_deg` plus FK during simulation and serial status updates. The
+path summary labels joint moves as joint-space TCP estimates instead of
+guaranteed Cartesian paths.
+
+Problem: the current blue path is the preview waypoint TCP trace. In joint mode, execution may send only the final joint endpoint, so the blue path is not necessarily the path the physical arm will take. This is confusing and should be fixed before trusting Cartesian workflows.
+
+Work:
+
+- Split path visualization into separate layers:
+  - planned TCP path,
+  - estimated execution TCP path,
+  - actual reported TCP trail.
+- Record actual reported TCP points during every motion from `reported_angles_deg` plus FK.
+- Display actual trail with a different color/style from the planned path.
+- Label the preview path type:
+  - joint-space TCP trace,
+  - linear Cartesian waypoint path,
+  - live Cartesian jog path,
+  - recorded actual path.
+- Keep old preview behavior available but make it explicit when it is only an estimate.
+- Add diagnostics comparing:
+  - planned endpoint,
+  - reported endpoint,
+  - max path deviation,
+  - final TCP error,
+  - expected vs actual duration.
+
+Acceptance:
+
+- The user can tell whether a line is planned, estimated, or actually executed.
+- Joint-mode preview no longer implies that hardware will trace a guaranteed Cartesian path.
+- Actual path recording works in simulation and hardware mode.
+
+### MOVE-07: End-Effector Speed And Acceleration Limits
+
+Status: missing.
+
+Working assumption: this starts with Cartesian preview and software-generated waypoint streaming. Firmware remains a target follower until a proper trajectory queue/blending mode exists.
+
+Work:
+
+- Add motion settings for Cartesian/TCP moves:
+  - max TCP speed `mm/s`,
+  - max TCP acceleration `mm/s^2`,
+  - control/update period,
+  - Cartesian tolerance,
+  - orientation/phi behavior.
+- Generate time-parameterized Cartesian profiles:
+  - trapezoid or S-curve scalar progress along a Cartesian segment,
+  - bounded TCP velocity,
+  - bounded TCP acceleration.
+- Convert each time step to joint targets through IK/Jacobian.
+- Check and report joint velocity/acceleration limit violations.
+- Slow the Cartesian profile down when joint limits would be exceeded.
+- Show TCP speed/acceleration estimates in diagnostics.
+- Keep joint-space speed/accel controls separate from TCP speed/accel controls.
+
+Acceptance:
+
+- A linear Cartesian move can be requested as "max 100 mm/s, max N mm/s^2".
+- The preview reports whether the requested TCP speed is feasible under joint limits.
+- Generated paths do not silently exceed configured joint limits.
+
+### MOVE-08: Continuous Cartesian Live Jog And Plane Drawing
+
+Status: new idea, missing.
+
+Goal: dragging X/Y/Z controls should make the TCP move smoothly along straight Cartesian directions, and later allow drawing constrained paths in planes.
+
+Work:
+
+- Add a live Cartesian jog mode separate from joint live jog.
+- Treat X/Y/Z sliders or faders as Cartesian target/velocity commands, not as one-off IK endpoint commands.
+- Maintain a live Cartesian goal state:
+  - current TCP,
+  - desired TCP,
+  - selected constraint plane or free XYZ,
+  - phi fixed or auto,
+  - TCP speed/accel limits.
+- Run a continuous PC-side control loop:
+  - sample UI target at a fixed rate,
+  - generate a bounded Cartesian step,
+  - solve IK from the previous joint pose,
+  - stream joint targets at a safe fixed rate,
+  - stop cleanly when input stops or target is reached.
+- Add optional plane constraints:
+  - XY plane at fixed Z,
+  - XZ plane at fixed Y,
+  - YZ plane at fixed X,
+  - custom work plane later.
+- Add drawing mode:
+  - record the commanded TCP path,
+  - record the actual reported TCP path,
+  - preview replay before execution,
+  - optionally simplify/smooth recorded points.
+- Add safety:
+  - workspace bounds,
+  - joint limits,
+  - singularity warnings,
+  - deadman/live-enable requirement for real hardware,
+  - stop on stale UI input or communication dropout.
+
+Acceptance:
+
+- Moving an X/Y/Z control produces smooth TCP motion in the intended Cartesian direction.
+- The viewport shows the estimated path and the actual executed TCP trail.
+- Plane drawing can constrain motion to a selected plane and record the result.
+- Stopping input stops motion without leaving stale targets streaming.
 
 ## Workpiece: Arm And Tool Calibration
 
@@ -883,6 +1026,7 @@ Work:
 - User enters corresponding robot XY points.
 - Save transform to `robot.local.yaml`.
 - Show transformed robot coordinates for detections.
+- Treat this as the simple fallback path if AprilTag pose calibration is not ready.
 
 Acceptance:
 
@@ -908,6 +1052,86 @@ Work:
 Acceptance:
 
 - Task code consumes detections without depending on OpenCV internals.
+
+### VISION-05: AprilTag World Anchors
+
+Status: new idea, missing.
+
+Working assumption: AprilTags will be mounted at known positions relative to the robot base or workspace plane. The exact tag family, tag size, and mounting pattern are not yet decided.
+
+Work:
+
+- Add an AprilTag calibration model:
+  - tag id,
+  - tag size mm,
+  - tag pose in robot/world frame,
+  - optional tag board/group id,
+  - confidence/quality threshold.
+- Detect AprilTags in the camera image.
+- Estimate camera pose from one or more known tags.
+- Save tag definitions and calibration settings to `robot.local.yaml`.
+- Validate pose quality:
+  - reprojection error,
+  - number of visible tags,
+  - tag viewing angle,
+  - timestamp/freshness.
+- Keep AprilTag calibration separate from color/object detection logic.
+
+Acceptance:
+
+- The system can report camera pose in robot/world coordinates from visible AprilTags.
+- Bad or ambiguous tag pose estimates are rejected or clearly marked stale.
+- The calibration state says which tags were used and how good the estimate was.
+
+### VISION-06: Camera-Space To Robot-Space Object Mapping
+
+Status: new idea, missing.
+
+Work:
+
+- Use the estimated camera pose plus camera intrinsics to map image detections into robot/world coordinates.
+- For objects on the table/workspace plane, intersect camera rays with the calibrated plane.
+- Store detections with both image-space and world-space fields:
+  - pixel center,
+  - projected robot x/y/z,
+  - source camera pose id/timestamp,
+  - projection quality.
+- Keep the old homography/simple planar transform as a fallback.
+- Add diagnostics for projection failures:
+  - no valid camera pose,
+  - no workspace plane,
+  - ray does not intersect expected plane,
+  - projection outside workspace bounds.
+
+Acceptance:
+
+- Detected objects appear in the robot frame at positions consistent with the camera pose.
+- The UI can explain why an object has image coordinates but no trusted robot coordinates.
+
+### VISION-07: Projected Camera Image In Robot View
+
+Status: new idea, missing.
+
+This is the "camera view lies flat in the viewport" idea. It should be treated as a visualization/calibration aid first, not as a control authority.
+
+Work:
+
+- Use camera intrinsics, camera pose, and workspace plane to texture-map the live camera image into the 3D robot viewport.
+- Render the camera image as a plane/mesh in robot/world coordinates, aligned with the real table/workspace.
+- Add controls to show/hide:
+  - raw camera popup,
+  - projected camera plane,
+  - detected objects,
+  - AprilTags,
+  - camera frustum.
+- Handle stale frames by fading or labeling the projected plane.
+- Keep projection optional so normal robot control stays uncluttered.
+
+Acceptance:
+
+- The projected camera image visually lines up with AprilTag markers and detected objects in the 3D viewport.
+- Stale or uncalibrated projection is clearly indicated.
+- Turning the projection on/off does not affect task logic or robot motion.
 
 ## Workpiece: Task Workflow
 
@@ -1024,6 +1248,10 @@ Work:
 - Use colored markers and labels.
 - Keep object markers independent from preview/path clearing.
 - Add a visibility toggle.
+- When camera pose is available, show whether marker position came from:
+  - simple planar homography,
+  - AprilTag camera-pose projection,
+  - manual/test input.
 
 Acceptance:
 
@@ -1047,6 +1275,56 @@ Work:
 Acceptance:
 
 - Updating one visual layer does not accidentally erase unrelated information.
+
+### VIEW-04: AprilTag And Camera Pose Overlay
+
+Status: new idea, missing.
+
+Work:
+
+- Render configured AprilTags in the 3D robot/world view at their known poses.
+- Render detected AprilTags with quality/status indication:
+  - matched known tag,
+  - unknown tag,
+  - stale tag,
+  - rejected low-quality estimate.
+- Render the estimated camera body and camera frustum in the viewport.
+- Show camera pose metadata in diagnostics:
+  - position,
+  - orientation,
+  - tags used,
+  - reprojection error,
+  - age/staleness.
+- Keep this as a calibration/debug layer by default, not always-on operator clutter.
+
+Acceptance:
+
+- The 3D viewport can show where the camera is relative to the robot.
+- The user can visually confirm that AprilTags, camera pose, and robot frame agree.
+- Pose quality problems are visible without reading logs.
+
+### VIEW-05: Projected Camera Plane Layer
+
+Status: new idea, missing.
+
+Work:
+
+- Add a viewport layer that displays the live camera frame projected onto the workspace plane.
+- Align the projection using camera intrinsics, estimated camera pose, and workspace plane definition.
+- Render detected objects on top of the projected image in the same robot/world coordinate frame.
+- Add opacity and visibility controls.
+- Clearly label states:
+  - uncalibrated,
+  - stale camera pose,
+  - stale image frame,
+  - projection valid.
+- Keep the projected image visually subordinate to the robot/path layers so it does not hide motion preview.
+
+Acceptance:
+
+- The camera image appears flat in the 3D scene where the real workspace is.
+- Detected object markers line up with the projected objects.
+- The operator can use the view to understand where the camera sees objects relative to the robot.
 
 ## Workpiece: Firmware And Protocol
 
@@ -1109,6 +1387,38 @@ Acceptance:
 
 - Stop behavior is understandable and consistent.
 - Safety internals remain available even if the UI is simpler.
+
+### FW-04: Queued And Blended Trajectory Following
+
+Status: missing.
+
+Problem: sending many independent `MOVEJ` commands can create stop-start behavior if the controller treats each waypoint as its own target. Smooth Cartesian motion needs either a blended waypoint queue or a higher-rate target-following mode with clear timing.
+
+Work:
+
+- Add a trajectory/streaming protocol that supports one of:
+  - queued waypoints with timestamps,
+  - queued waypoints with segment durations,
+  - fixed-rate target streaming with watchdog timeout.
+- Add controller-side blending so the arm does not fully decelerate at every intermediate waypoint unless commanded.
+- Support synchronized joint arrival across axes.
+- Apply speed and acceleration limits consistently for steppers and servos.
+- Add stream lifecycle commands:
+  - begin trajectory,
+  - append waypoint,
+  - end/commit,
+  - abort/clear queue,
+  - report queue progress.
+- Add stale-stream safety:
+  - timeout if PC stops sending,
+  - controlled stop,
+  - fault or stopped state if queue underruns unexpectedly.
+
+Acceptance:
+
+- A multi-waypoint path can execute smoothly without visible stop-start at every point.
+- The controller reports active waypoint/progress.
+- Stop/abort clears the queued trajectory safely.
 
 ## Workpiece: Diagnostics And Tests
 
@@ -1208,8 +1518,18 @@ These should be answered before implementing hardware-heavy packages.
 - What SPI pins and CS pins are actually wired?
 - Are encoder zero positions mechanically repeatable?
 - What camera source index, resolution, and mount height will be used?
+- Which AprilTag family should be used?
+- What AprilTag physical size will be printed or mounted?
+- Where will AprilTags be mounted relative to the robot base and workspace plane?
+- Is the camera fixed to the frame/table, mounted on the robot, or movable?
+- Do we need full camera intrinsics calibration, or is a simple approximate focal model enough for the first demo?
+- What is the exact workspace plane height relative to the robot base?
 - What are the first demo object colors and drop zones?
 - What speed and acceleration values are safe for the physical arm?
+- What TCP speed and TCP acceleration should be considered safe for first Cartesian live jog tests?
+- Should live Cartesian jogging be allowed on hardware immediately, or simulation-only until queued/blended firmware support exists?
+- What fixed update rate is realistic for PC-to-controller target streaming over the chosen serial/Bluetooth link?
+- Which plane drawing mode matters first: XY table plane, vertical XZ/YZ plane, or arbitrary custom plane?
 
 ## Suggested Next Implementation Requests
 
@@ -1233,6 +1553,18 @@ Implement KIN-04 and KIN-05 using the MATLAB analytic seed and Jacobian ideas.
 
 ```text
 Implement MOVE-02 as preview-only. Do not use it for hardware execution yet.
+```
+
+```text
+Implement MOVE-06 first so planned and actual TCP paths are drawn separately.
+```
+
+```text
+Implement MOVE-07 in simulation only: TCP speed/accel-limited Cartesian preview.
+```
+
+```text
+Implement MOVE-08 in simulation only: live Cartesian drag with X/Y/Z controls.
 ```
 
 Avoid broad requests like:

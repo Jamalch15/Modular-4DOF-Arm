@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 from app.config import load_config
-from app.demo_settings import color_profiles, named_positions, validate_named_position
+from app.demo_settings import color_profiles, model_validation_warnings, named_positions, validate_named_position
 from app.tasks import build_pick_and_place_sequence, build_sorting_sequence
 from app.vision import apply_planar_transform, detect_configured_colors, planar_transform_from_points
 
@@ -13,6 +13,38 @@ def test_named_positions_are_valid_or_report_reasons():
 
     assert "safe" in positions
     assert isinstance(validate_named_position(config, "home", positions["home"]), list)
+
+
+def test_named_position_validation_reports_unreachable_cartesian_target():
+    config = load_config()
+
+    errors = validate_named_position(
+        config,
+        "too_far",
+        {"type": "cartesian", "target": {"x_mm": 5000.0, "y_mm": 0.0, "z_mm": 5000.0, "phi_deg": 0.0}},
+    )
+
+    assert errors == ["too_far has no valid IK solution"]
+
+
+def test_named_position_validation_accepts_auto_phi_cartesian_target():
+    config = load_config()
+
+    errors = validate_named_position(
+        config,
+        "auto_phi_target",
+        {"type": "cartesian", "target": {"x_mm": 250.0, "y_mm": 0.0, "z_mm": 120.0, "phi_auto": True}},
+    )
+
+    assert errors == []
+
+
+def test_model_validation_returns_warning_list():
+    config = load_config()
+
+    warnings = model_validation_warnings(config)
+
+    assert isinstance(warnings, list)
 
 
 def test_pick_and_place_sequence_contains_tool_actions():

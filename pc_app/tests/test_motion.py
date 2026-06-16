@@ -79,7 +79,8 @@ def test_joint_trajectory_uses_requested_profile():
     assert trajectory["profile"] == "trapezoid"
     assert trajectory["waypoints"][0] == start
     assert trajectory["waypoints"][-1] == target
-    assert trajectory["segment_durations_s"][0] > 0
+    assert trajectory["segment_durations_s"][0] == 0.0
+    assert trajectory["segment_durations_s"][1] > 0
 
 
 def test_joint_trajectory_rejects_limit_violation():

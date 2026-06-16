@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .config import DEFAULT_GEOMETRY_CONFIG, RobotConfig
+from .config import DEFAULT_GEOMETRY_CONFIG, RobotConfig, matlab_geometry_to_dh_rows
 from .kinematics import forward_kinematics, inverse_kinematics
 from .safety import validate_joint_targets
 
@@ -258,13 +258,70 @@ def validate_named_position(config: RobotConfig, name: str, position: dict[str, 
     target = position.get("target") if isinstance(position.get("target"), dict) else position
     if not isinstance(target, dict):
         return [f"{name} is missing target"]
+    raw_phi = target.get("phi_deg", target.get("phi"))
     pose = {
         "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
         "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
         "z_mm": float(target.get("z_mm", target.get("z", 0.0))),
-        "phi_deg": float(target.get("phi_deg", target.get("phi", 0.0))),
     }
+    if bool(target.get("phi_auto", False)) or raw_phi is None:
+        pose["phi_auto"] = True
+    else:
+        pose["phi_deg"] = float(raw_phi)
     ik = inverse_kinematics(pose, config.links, config.joints, config.home_pose)
     if not ik["ok"]:
         errors.append(f"{name} has no valid IK solution")
     return errors
+
+
+def model_validation_warnings(config: RobotConfig, tolerance_mm: float = 0.05, tolerance_deg: float = 0.05) -> list[str]:
+    warnings: list[str] = []
+    geometry = geometry_settings(config)
+    active_name = str(geometry.get("active_preset", ""))
+    preset = geometry.get("presets", {}).get(active_name)
+    if not isinstance(preset, dict):
+        return [f"active geometry preset {active_name or '-'} is missing"]
+
+    try:
+        expected_rows = matlab_geometry_to_dh_rows(preset)
+    except Exception as exc:
+        return [f"active geometry preset cannot derive DH rows: {exc}"]
+
+    actual_rows = config.kinematics.dh_rows
+    if len(actual_rows) != len(expected_rows):
+        warnings.append(f"DH row count {len(actual_rows)} does not match geometry preset row count {len(expected_rows)}")
+        return warnings
+
+    for index, (actual, expected) in enumerate(zip(actual_rows, expected_rows, strict=True), start=1):
+        if actual.joint_index != expected.joint_index:
+            warnings.append(f"DH row {index} joint index differs from active geometry preset")
+        for field, tolerance, unit in [
+            ("theta_offset_deg", tolerance_deg, "deg"),
+            ("d_mm", tolerance_mm, "mm"),
+            ("a_mm", tolerance_mm, "mm"),
+            ("alpha_deg", tolerance_deg, "deg"),
+        ]:
+            actual_value = float(getattr(actual, field))
+            expected_value = float(getattr(expected, field))
+            if abs(actual_value - expected_value) > tolerance:
+                warnings.append(
+                    f"DH row {index} {field}={actual_value:.2f} differs from geometry-derived {expected_value:.2f} {unit}"
+                )
+
+    dimensions = preset.get("dimensions_mm", {}) if isinstance(preset.get("dimensions_mm"), dict) else {}
+    if "L_2" in dimensions:
+        expected_side = float(dimensions["L_2"])
+        actual_side = float(config.links.base_side_offset_mm)
+        if abs(actual_side - expected_side) > tolerance_mm:
+            warnings.append(
+                f"base_side_offset={actual_side:.2f} differs from geometry L_2={expected_side:.2f} mm"
+            )
+    return warnings
+
+
+def named_position_errors(config: RobotConfig) -> dict[str, list[str]]:
+    return {
+        name: messages
+        for name, position in named_positions(config).items()
+        if (messages := validate_named_position(config, name, position))
+    }

@@ -169,6 +169,10 @@
                         <option value="elbow_down">Elbow down</option>
                       </select>
                     </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="ikAutoPhiToggle" type="checkbox" />
+                      <span class="toggle-text">Auto phi</span>
+                    </label>
                   </div>
                   <div class="button-row action-row">
                     <button id="previewIkBtn" type="button" class="primary">Preview</button>
@@ -331,8 +335,10 @@
               </div>
               <div class="hud-section">
                 <div class="hud-title">Target</div>
-                <div class="hud-row"><span>Preview</span><strong id="targetHud">none</strong></div>
+                <div class="hud-row"><span>Target</span><strong id="targetHud">none</strong></div>
                 <div class="hud-row"><span>Path</span><strong id="pathHud">0 pts</strong></div>
+                <div class="hud-row"><span>Motion</span><strong id="motionHud">idle</strong></div>
+                <div class="hud-row"><span>Progress</span><strong id="progressHud">-</strong></div>
               </div>
             </div>
           </section>

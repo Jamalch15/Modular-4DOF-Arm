@@ -83,6 +83,8 @@ const elements = {
   eeCompact: $("#eeCompact"),
   targetHud: $("#targetHud"),
   pathHud: $("#pathHud"),
+  motionHud: $("#motionHud"),
+  progressHud: $("#progressHud"),
   statusPill: $("#statusPill"),
   fkX: $("#fkX"),
   fkY: $("#fkY"),
@@ -135,6 +137,7 @@ const elements = {
   sliderRangeControls: $("#sliderRangeControls"),
   ikModeSelect: $("#ikModeSelect"),
   ikBranchSelect: $("#ikBranchSelect"),
+  ikAutoPhiToggle: $("#ikAutoPhiToggle"),
   previewIkBtn: $("#previewIkBtn"),
   executeIkBtn: $("#executeIkBtn"),
   ikStopBtn: $("#ikStopBtn"),
@@ -203,8 +206,23 @@ async function postJson(url, body = {}) {
     body: JSON.stringify(body),
   });
   const payload = await response.json();
+  if (!response.ok && !payload.error) {
+    payload.ok = false;
+    payload.error = formatApiError(payload, response.status);
+  }
   if (!payload.ok && payload.error) showLocalError(payload.error);
   return payload;
+}
+
+function formatApiError(payload, status) {
+  const details = Array.isArray(payload.detail) ? payload.detail : [];
+  if (!details.length) return `Request failed (${status})`;
+  return details
+    .map((item) => {
+      const path = Array.isArray(item.loc) ? item.loc.filter((part) => part !== "body").join(".") : "";
+      return `${path ? `${path}: ` : ""}${item.msg || "invalid value"}`;
+    })
+    .join("; ");
 }
 
 function showLocalError(message) {
@@ -690,7 +708,7 @@ function renderOperatorPanels() {
       const label =
         kind === "joint"
           ? (position.angles_deg || []).map((value) => format(value, 1)).join(", ")
-          : `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, phi ${format(target.phi_deg)}`;
+          : formatCartesianTarget(target);
       item.innerHTML = `
         <div class="program-title"><span>${name}</span><span>${kind}</span></div>
         <code>${label}</code>
@@ -1094,13 +1112,70 @@ function setIkTargetFromFk(fk) {
   Object.entries(values).forEach(([key, value]) => setIkTargetValue(key, value, false));
 }
 
+function ikAutoPhiEnabled() {
+  return Boolean(elements.ikAutoPhiToggle?.checked);
+}
+
+function updatePhiControlState() {
+  const autoPhi = ikAutoPhiEnabled();
+  ["#ik-phi-slider", "#ik-phi-input"].forEach((selector) => {
+    const input = $(selector);
+    if (input) input.disabled = autoPhi;
+  });
+  document.querySelectorAll('[data-fader-key="phi"]').forEach((fader) => {
+    fader.classList.toggle("disabled", autoPhi);
+    fader.setAttribute("aria-disabled", autoPhi ? "true" : "false");
+  });
+}
+
 function ikTargetPayload() {
-  return Object.fromEntries(
-    targetDefs.map(([key, , apiKey]) => {
-      const input = $(`#ik-${key}-input`);
-      return [apiKey, readNumber(input, 0)];
-    }),
-  );
+  const autoPhi = ikAutoPhiEnabled();
+  const payload = {};
+  targetDefs.forEach(([key, , apiKey]) => {
+    if (key === "phi" && autoPhi) return;
+    const input = $(`#ik-${key}-input`);
+    payload[apiKey] = readNumber(input, 0);
+  });
+  payload.phi_auto = autoPhi;
+  return payload;
+}
+
+function formatCartesianTarget(target = {}) {
+  const phiText = target.phi_auto
+    ? `phi auto${target.phi_deg !== undefined && target.phi_deg !== null ? ` (${format(target.phi_deg, 1)} deg)` : ""}`
+    : `phi ${format(target.phi_deg)}`;
+  return `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, ${phiText}`;
+}
+
+function clearIkSolutionPreview() {
+  state.previewId = null;
+  state.latestPreview = null;
+  if (state.view) {
+    state.view.setPreviewAngles(null);
+    state.view.setPathWaypoints([]);
+  }
+  if (elements.ikCandidateList) elements.ikCandidateList.innerHTML = "";
+  if (elements.ikPathSummary) {
+    elements.ikPathSummary.innerHTML = `
+      <h3>Path</h3>
+      <div class="log-line"><span>Status</span><code>No preview</code></div>
+    `;
+  }
+  elements.pathHud.textContent = "0 pts";
+  elements.executeIkBtn.disabled = true;
+  elements.executeProgramBtn.disabled = true;
+}
+
+function updateIkTargetMarker(options = {}) {
+  if (!state.view) return null;
+  const target = ikTargetPayload();
+  if (options.clearSolution !== false) clearIkSolutionPreview();
+  state.viewPreviewSource = "ik-target";
+  state.view.setTargetPoint(target);
+  elements.targetHud.textContent = `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}`;
+  if (options.status !== false) elements.previewStatus.textContent = "Target set";
+  updateDisabledState();
+  return target;
 }
 
 function pathSettings() {
@@ -1161,6 +1236,34 @@ function anglesAlmostEqual(a, b, tolerance = 0.01) {
 function setBadge(el, text, type) {
   el.textContent = text;
   el.className = `badge ${type || ""}`.trim();
+}
+
+function renderMotionExecution(robotState) {
+  const diagnostics = robotState.motion_diagnostics || {};
+  const executionState = robotState.motion_execution_state || diagnostics.execution_state || robotState.motion_state || "idle";
+  const progress = clamp(Number(diagnostics.progress_ratio ?? 0), 0, 1);
+  const waypointTotal = Number(diagnostics.current_waypoint_total || diagnostics.waypoint_count || 0);
+  const waypointIndex = Number(diagnostics.current_waypoint_index || 0);
+  const stepTotal = Number(diagnostics.active_step_total || 0);
+  const stepIndex = Number(diagnostics.active_step_index || 0);
+  const stepLabel = diagnostics.active_step_label || "";
+  const plannedCount = state.latestPreview?.trajectory?.waypoint_count || Number(state.view?.container?.dataset.pathWaypointCount || 0);
+  const actualPath = Array.isArray(diagnostics.actual_tcp_path) ? diagnostics.actual_tcp_path : [];
+  const actualCount = actualPath.length;
+  const waypointText = waypointTotal ? `wp ${waypointIndex}/${waypointTotal}` : "-";
+  const stepText = stepTotal ? `step ${stepIndex}/${stepTotal}${stepLabel ? ` ${stepLabel}` : ""}` : "";
+  const progressText = `${format(progress * 100, 0)}%${waypointTotal ? ` - ${waypointText}` : ""}${stepText ? ` - ${stepText}` : ""}`;
+
+  if (state.view) state.view.setActualTcpPath(actualPath);
+  if (elements.motionHud) elements.motionHud.textContent = executionState;
+  if (elements.progressHud) elements.progressHud.textContent = progressText;
+  if (elements.pathHud) {
+    elements.pathHud.textContent = actualCount
+      ? `${plannedCount || 0} plan / ${actualCount} actual`
+      : `${plannedCount || 0} pts`;
+  }
+  const progressLine = $("#motionProgressLine");
+  if (progressLine) progressLine.textContent = `${executionState} - ${progressText}`;
 }
 
 function liveRealEnabled() {
@@ -1252,6 +1355,7 @@ function renderState(robotState) {
   renderHardwareStatus(robotState);
   const hardwareSuffix = robotState.simulation ? "" : ` - ${robotState.hardware_mode}/${robotState.config_sync_status}`;
   elements.statusPill.textContent = robotState.last_error || `${robotState.motion_state}${robotState.live_motion_enabled ? " - live real" : ""}${hardwareSuffix}`;
+  renderMotionExecution(robotState);
   setIkTargetFromFk(fk);
   updateDisabledState();
 }
@@ -1277,6 +1381,10 @@ function renderPreview(preview) {
   candidates.forEach((candidate) => {
     const item = document.createElement("div");
     item.className = `candidate ${candidate.valid ? "" : "invalid"} ${candidate.branch === ik.selected_branch ? "selected" : ""}`;
+    const candidatePhi = candidate.target_phi_deg ?? candidate.fk?.tool_phi_deg;
+    const phiDetail = candidate.auto_phi
+      ? `chosen phi ${format(candidatePhi, 2)} deg`
+      : `phi ${format(candidate.phi_error_deg, 3)} deg`;
     item.innerHTML = `
       <div class="candidate-title">
         <span>${candidate.branch.replace("_", " ")}</span>
@@ -1285,7 +1393,7 @@ function renderPreview(preview) {
       <div class="angle-list">
         ${candidate.angles_deg.map((angle, index) => `<div><span>J${index + 1}</span><strong>${format(angle, 2)} deg</strong></div>`).join("")}
       </div>
-      <div class="small">FK error ${format(candidate.position_error_mm, 3)} mm, phi ${format(candidate.phi_error_deg, 3)} deg</div>
+      <div class="small">FK error ${format(candidate.position_error_mm, 3)} mm, ${phiDetail}</div>
       <div class="small">${candidate.reasons?.join("; ") || ""}</div>
     `;
     elements.ikCandidateList.appendChild(item);
@@ -1297,9 +1405,12 @@ function renderPreview(preview) {
     <h3>Path</h3>
     <div class="log-line"><span>Mode</span><code>${trajectory.mode || preview.mode || "-"}</code></div>
     <div class="log-line"><span>Profile</span><code>${trajectory.profile || "-"}</code></div>
+    <div class="log-line"><span>Path type</span><code>${pathLayerDescription(preview, trajectory)}</code></div>
     <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
     <div class="log-line"><span>Waypoints</span><code>${trajectory.waypoint_count || 0}</code></div>
     <div class="log-line"><span>Branch</span><code>${ik.selected_branch || "-"}</code></div>
+    <div class="log-line"><span>Target phi</span><code>${preview.target?.phi_auto ? `auto -> ${format(preview.target.phi_deg, 2)} deg` : `${format(preview.target?.phi_deg, 2)} deg`}</code></div>
+    <div class="log-line"><span>Execute</span><code id="motionProgressLine">idle - 0%</code></div>
     <div class="log-line"><span>Segments</span><code>${segmentText}</code></div>
   `;
 
@@ -1321,7 +1432,12 @@ function renderPreview(preview) {
 function renderPreviewFailure(payload) {
   state.previewId = null;
   state.latestPreview = null;
-  clearViewPreview();
+  if (state.activeTab === "ik") {
+    clearIkSolutionPreview();
+    updateIkTargetMarker({ clearSolution: false, status: false });
+  } else {
+    clearViewPreview();
+  }
   elements.executeIkBtn.disabled = true;
   elements.executeProgramBtn.disabled = true;
   elements.previewStatus.textContent = payload.error || "Preview failed";
@@ -1333,7 +1449,21 @@ function renderPreviewFailure(payload) {
     item.textContent = `${candidate.branch}: ${candidate.reasons?.join("; ") || "not selected"}`;
     elements.ikCandidateList.appendChild(item);
   });
+  if (!elements.ikCandidateList.children.length) {
+    const item = document.createElement("div");
+    item.className = "candidate invalid";
+    item.textContent = payload.error || "Preview failed before IK candidates were generated.";
+    elements.ikCandidateList.appendChild(item);
+  }
   elements.ikPathSummary.innerHTML = `<h3>Path</h3><div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
+}
+
+function pathLayerDescription(preview, trajectory) {
+  const mode = String(trajectory.mode || preview.mode || "path").toLowerCase();
+  if (mode === "linear") return "planned linear TCP path";
+  if (mode === "joint" || mode === "jog") return "joint-space TCP estimate";
+  if (mode === "program") return "program TCP estimate";
+  return `${mode} TCP estimate`;
 }
 
 async function previewIkPath() {
@@ -1369,17 +1499,11 @@ async function previewIkPath() {
   }
 }
 
-function scheduleIkPreview(delayMs = 35) {
+function scheduleIkPreview(delayMs = 0) {
   if (!state.config || !state.robotState) return;
   state.ikPreviewWantedSeq += 1;
-  if (state.ikPreviewInFlight) {
-    state.ikPreviewQueued = true;
-    return;
-  }
   window.clearTimeout(state.ikPreviewTimer);
-  const elapsedMs = performance.now() - state.lastIkPreviewMs;
-  const waitMs = Math.max(0, delayMs - elapsedMs);
-  state.ikPreviewTimer = window.setTimeout(() => previewIkPath(), waitMs);
+  state.ikPreviewTimer = window.setTimeout(() => updateIkTargetMarker(), Math.max(0, delayMs));
 }
 
 function scheduleLiveTarget(payload, delayMs = 90) {
@@ -1428,7 +1552,7 @@ function renderProgramList() {
     const label =
       waypoint.type === "joint"
         ? waypoint.angles_deg.map((value) => format(value, 1)).join(", ")
-        : `x ${format(waypoint.target.x_mm)}, y ${format(waypoint.target.y_mm)}, z ${format(waypoint.target.z_mm)}, phi ${format(waypoint.target.phi_deg)}`;
+        : formatCartesianTarget(waypoint.target);
     item.innerHTML = `
       <div class="program-title">
         <span>${index + 1}. ${waypoint.type} / ${waypoint.mode}</span>
@@ -1588,6 +1712,7 @@ function applyConfig(config) {
   renderOperatorPanels();
   buildIkTargetControls();
   buildSliderRanges();
+  updatePhiControlState();
   renderProgramList();
   state.view.setConfig(state.config);
 }
@@ -1692,11 +1817,11 @@ function bindFaders() {
   document.querySelectorAll(".target-fader").forEach((fader) => {
     bindFader(fader, (delta) => {
       const key = fader.dataset.faderKey;
+      if (key === "phi" && ikAutoPhiEnabled()) return;
       const input = $(`#ik-${key}-input`);
       if (!input) return;
       setIkTargetValue(key, readNumber(input, 0) + delta);
       scheduleIkPreview();
-      scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
     });
   });
 }
@@ -1885,7 +2010,6 @@ function bindActions() {
     state.ikUserEdited = true;
     applySliderRanges();
     scheduleIkPreview();
-    scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
   });
   elements.ikTargetControls.addEventListener("input", (event) => {
     const input = event.target;
@@ -1895,10 +2019,14 @@ function bindActions() {
     const pair = input.type === "range" ? $(`#ik-${key}-input`) : $(`#ik-${key}-slider`);
     if (pair) pair.value = input.value;
     scheduleIkPreview();
-    scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
   });
   elements.ikModeSelect.addEventListener("change", () => scheduleIkPreview());
   elements.ikBranchSelect.addEventListener("change", () => scheduleIkPreview());
+  elements.ikAutoPhiToggle.addEventListener("change", () => {
+    state.ikUserEdited = true;
+    updatePhiControlState();
+    scheduleIkPreview();
+  });
   elements.previewIkBtn.addEventListener("click", () => {
     state.ikPreviewWantedSeq += 1;
     previewIkPath();

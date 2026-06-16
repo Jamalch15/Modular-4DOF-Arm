@@ -430,6 +430,11 @@ label {
   text-transform: uppercase;
 }
 
+.target-fader.disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .range-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -808,7 +813,7 @@ label {
 
 .hud-row {
   display: grid;
-  grid-template-columns: 48px 1fr;
+  grid-template-columns: 62px 1fr;
   gap: 8px;
   color: var(--muted);
   font-size: 0.7rem;

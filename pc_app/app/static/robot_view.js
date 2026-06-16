@@ -581,6 +581,12 @@ export class RobotView {
       }),
     };
     this.pathMaterial = new THREE.LineBasicMaterial({ color: 0x6aa7ff, linewidth: 2 });
+    this.actualPathMaterial = new THREE.LineDashedMaterial({
+      color: 0x53d18e,
+      linewidth: 2,
+      dashSize: 14,
+      gapSize: 8,
+    });
     this.targetMaterial = new THREE.MeshStandardMaterial({
       color: 0xffd24a,
       emissive: 0x332300,
@@ -665,6 +671,7 @@ export class RobotView {
 
   setPathWaypoints(waypoints) {
     removeChildrenByKind(this.overlayGroup, "path");
+    removeChildrenByKind(this.overlayGroup, "plannedPath");
     if (!waypoints || waypoints.length < 2) {
       delete this.container.dataset.pathWaypointCount;
       this.render();
@@ -677,7 +684,32 @@ export class RobotView {
     });
     const geometry = new THREE.BufferGeometry().setFromPoints(pathPoints);
     const line = new THREE.Line(geometry, this.pathMaterial);
-    line.userData.kind = "path";
+    line.userData.kind = "plannedPath";
+    line.visible = this.pathVisible;
+    this.overlayGroup.add(line);
+    this.render();
+  }
+
+  setActualTcpPath(points) {
+    removeChildrenByKind(this.overlayGroup, "actualPath");
+    if (!points || points.length < 2) {
+      delete this.container.dataset.actualPathPointCount;
+      this.render();
+      return;
+    }
+
+    this.container.dataset.actualPathPointCount = String(points.length);
+    const pathPoints = points.map((point) => {
+      return robotToScene({
+        x: Number(point.x_mm ?? point.x ?? 0),
+        y: Number(point.y_mm ?? point.y ?? 0),
+        z: Number(point.z_mm ?? point.z ?? 0),
+      });
+    });
+    const geometry = new THREE.BufferGeometry().setFromPoints(pathPoints);
+    const line = new THREE.Line(geometry, this.actualPathMaterial);
+    line.computeLineDistances();
+    line.userData.kind = "actualPath";
     line.visible = this.pathVisible;
     this.overlayGroup.add(line);
     this.render();
@@ -722,7 +754,7 @@ export class RobotView {
   setPathVisible(visible) {
     this.pathVisible = Boolean(visible);
     this.overlayGroup.children
-      .filter((child) => child.userData.kind === "path")
+      .filter((child) => ["path", "plannedPath", "actualPath"].includes(child.userData.kind))
       .forEach((child) => {
         child.visible = this.pathVisible;
       });
@@ -744,6 +776,7 @@ export class RobotView {
     delete this.container.dataset.previewAngles;
     delete this.container.dataset.targetPoint;
     delete this.container.dataset.pathWaypointCount;
+    delete this.container.dataset.actualPathPointCount;
     this.render();
   }
 
