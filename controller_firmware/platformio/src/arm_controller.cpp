@@ -78,6 +78,12 @@ enum class AxisState {
   Invalid,
 };
 
+enum class ToolType {
+  Generic,
+  ServoGripper,
+  Electromagnet,
+};
+
 struct StepperConfig {
   int stepPin = -1;
   int dirPin = -1;
@@ -115,6 +121,20 @@ struct JointConfig {
   AxisState axisState = AxisState::Simulated;
 };
 
+struct ToolConfig {
+  char name[20] = "generic";
+  ToolType type = ToolType::Generic;
+  bool received = false;
+  int pwmPin = -1;
+  int pulseMinUs = 500;
+  int pulseMaxUs = 2500;
+  int pwmFrequencyHz = 50;
+  float openValue = 0.0f;
+  float closedValue = 1.0f;
+  int gpioPin = -1;
+  bool activeHigh = true;
+};
+
 struct StepperRuntime {
   long currentSteps = 0;
   long targetSteps = 0;
@@ -129,11 +149,22 @@ struct ServoRuntime {
   unsigned long lastUpdateUs = 0;
 };
 
+struct ToolRuntime {
+  int channel = 6;
+  bool attached = false;
+  int attachedPwmPin = -1;
+  int gpioPin = -1;
+  bool gpioActiveHigh = true;
+};
+
 ControllerState controllerState = ControllerState::Idle;
 JointConfig joints[kJointCount];
 JointConfig draftJoints[kJointCount];
+ToolConfig activeTool;
+ToolConfig draftTool;
 StepperRuntime stepperRuntime[kJointCount];
 ServoRuntime servoRuntime[kJointCount];
+ToolRuntime toolRuntime;
 float currentJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
 float targetJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
 float lastSpeedDegS = 25.0f;
@@ -180,6 +211,28 @@ const char* actuatorName(ActuatorType actuator) {
   return "unknown";
 }
 
+ToolType parseToolType(const String& value) {
+  if (value.equalsIgnoreCase("servo_gripper")) {
+    return ToolType::ServoGripper;
+  }
+  if (value.equalsIgnoreCase("electromagnet")) {
+    return ToolType::Electromagnet;
+  }
+  return ToolType::Generic;
+}
+
+const char* toolTypeName(ToolType type) {
+  switch (type) {
+    case ToolType::ServoGripper:
+      return "servo_gripper";
+    case ToolType::Electromagnet:
+      return "electromagnet";
+    case ToolType::Generic:
+      return "generic";
+  }
+  return "generic";
+}
+
 const char* stateName() {
   switch (controllerState) {
     case ControllerState::Idle:
@@ -213,10 +266,19 @@ JointConfig defaultJoint(int index) {
   return joint;
 }
 
+ToolConfig defaultTool() {
+  ToolConfig tool;
+  snprintf(tool.name, sizeof(tool.name), "generic");
+  tool.type = ToolType::Generic;
+  tool.received = false;
+  return tool;
+}
+
 void resetDraftConfig() {
   for (int i = 0; i < kJointCount; i++) {
     draftJoints[i] = defaultJoint(i);
   }
+  draftTool = defaultTool();
 }
 
 void clearFaultText() {
@@ -300,6 +362,34 @@ String validationErrorForJoint(const JointConfig& joint, int index) {
     return "";
   }
   return "joint_" + String(index + 1) + "_unsupported_actuator";
+}
+
+String validationErrorForTool(const ToolConfig& tool) {
+  if (tool.type == ToolType::Generic) {
+    return "";
+  }
+  if (tool.type == ToolType::ServoGripper) {
+    if (tool.pwmPin < 0 || !validPinOrUnused(tool.pwmPin)) {
+      return "active_tool_missing_pwm_pin";
+    }
+    if (tool.pulseMinUs <= 0 || tool.pulseMaxUs <= tool.pulseMinUs) {
+      return "active_tool_invalid_pulse_range";
+    }
+    if (tool.pwmFrequencyHz <= 0) {
+      return "active_tool_invalid_pwm_frequency";
+    }
+    if (tool.openValue < 0.0f || tool.openValue > 1.0f || tool.closedValue < 0.0f || tool.closedValue > 1.0f) {
+      return "active_tool_open_close_values_out_of_range";
+    }
+    return "";
+  }
+  if (tool.type == ToolType::Electromagnet) {
+    if (tool.gpioPin < 0 || !validPinOrUnused(tool.gpioPin)) {
+      return "active_tool_missing_gpio_pin";
+    }
+    return "";
+  }
+  return "";
 }
 
 String classifyConfig(JointConfig config[kJointCount]) {
@@ -435,6 +525,75 @@ void writeStepperEnable(int index, bool enabled) {
   digitalWrite(stepper.enablePin, enabled ? activeLevel : !activeLevel);
 }
 
+int toolPulseForValue(float value) {
+  const float clamped = clampFloat(value, 0.0f, 1.0f);
+  return static_cast<int>(roundf(static_cast<float>(activeTool.pulseMinUs) +
+                                 clamped * static_cast<float>(activeTool.pulseMaxUs - activeTool.pulseMinUs)));
+}
+
+uint32_t toolDutyForPulse(int pulseUs) {
+  const uint32_t frequency = static_cast<uint32_t>(max(1, activeTool.pwmFrequencyHz));
+  const float periodUs = 1000000.0f / static_cast<float>(frequency);
+  const float duty = clampFloat(static_cast<float>(pulseUs) / periodUs, 0.0f, 1.0f);
+  return static_cast<uint32_t>(roundf(duty * static_cast<float>(kServoPwmMaxDuty)));
+}
+
+void writeToolOutput() {
+  if (activeTool.type == ToolType::ServoGripper && toolRuntime.attached) {
+    ledcWrite(toolRuntime.channel, toolDutyForPulse(toolPulseForValue(toolValue)));
+  } else if (activeTool.type == ToolType::Electromagnet && activeTool.gpioPin >= 0) {
+    const bool on = toolValue >= 0.5f;
+    const int activeLevel = activeTool.activeHigh ? HIGH : LOW;
+    digitalWrite(activeTool.gpioPin, on ? activeLevel : !activeLevel);
+  }
+}
+
+void setToolSafe() {
+  if (activeTool.type == ToolType::ServoGripper) {
+    toolValue = clampFloat(activeTool.openValue, 0.0f, 1.0f);
+    strlcpy(toolState, "open", sizeof(toolState));
+    writeToolOutput();
+  } else if (activeTool.type == ToolType::Electromagnet) {
+    toolValue = 0.0f;
+    strlcpy(toolState, "off", sizeof(toolState));
+    writeToolOutput();
+  } else {
+    toolValue = 0.0f;
+    strlcpy(toolState, "unknown", sizeof(toolState));
+  }
+}
+
+void releaseToolOutputs() {
+  if (toolRuntime.attached && toolRuntime.attachedPwmPin >= 0) {
+    ledcWrite(toolRuntime.channel, 0);
+    ledcDetachPin(toolRuntime.attachedPwmPin);
+  }
+  if (toolRuntime.gpioPin >= 0) {
+    const int activeLevel = toolRuntime.gpioActiveHigh ? HIGH : LOW;
+    digitalWrite(toolRuntime.gpioPin, !activeLevel);
+  }
+  toolRuntime.attached = false;
+  toolRuntime.attachedPwmPin = -1;
+  toolRuntime.gpioPin = -1;
+  toolRuntime.gpioActiveHigh = true;
+}
+
+void configureToolPins() {
+  releaseToolOutputs();
+  if (activeTool.type == ToolType::ServoGripper && activeTool.pwmPin >= 0) {
+    toolRuntime.channel = kServoPwmChannelBase + kJointCount + 1;
+    ledcSetup(toolRuntime.channel, activeTool.pwmFrequencyHz, kServoPwmResolutionBits);
+    ledcAttachPin(activeTool.pwmPin, toolRuntime.channel);
+    toolRuntime.attached = true;
+    toolRuntime.attachedPwmPin = activeTool.pwmPin;
+  } else if (activeTool.type == ToolType::Electromagnet && activeTool.gpioPin >= 0) {
+    pinMode(activeTool.gpioPin, OUTPUT);
+    toolRuntime.gpioPin = activeTool.gpioPin;
+    toolRuntime.gpioActiveHigh = activeTool.activeHigh;
+  }
+  setToolSafe();
+}
+
 void disableHardwareOutputs() {
   for (int i = 0; i < kJointCount; i++) {
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
@@ -445,6 +604,7 @@ void disableHardwareOutputs() {
       writeServoPwm(i, false);
     }
   }
+  setToolSafe();
 }
 
 void configurePins() {
@@ -599,11 +759,11 @@ void printStatus() {
   const bool knownPose = homed || encoderAvailable[0] || encoderAvailable[1];
   ARM_SERIAL.printf(
       "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
-      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=%s tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
+      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=%s tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
       stateName(), homed ? 1 : 0, knownPose ? 1 : 0, poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(),
       enabledBits().c_str(), encoderBits().c_str(), encoderAnglesDeg[0], encoderAnglesDeg[1], currentJointsDeg[0],
-      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), toolState, toolValue,
-      faultText);
+      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), toolTypeName(activeTool.type),
+      toolState, toolValue, faultText);
 }
 
 void printError(const char* code, const String& message) {
@@ -670,6 +830,32 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
     return;
   }
 
+  if (upperCommand.startsWith("CONFIG TOOL")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    const bool active = tokenInt(rawCommand, "active", 0) != 0;
+    if (!active) {
+      return;
+    }
+    ToolConfig tool = defaultTool();
+    const String name = tokenString(rawCommand, "name", "tool");
+    snprintf(tool.name, sizeof(tool.name), "%s", name.c_str());
+    tool.type = parseToolType(tokenString(rawCommand, "type", "generic"));
+    tool.pwmPin = tokenInt(rawCommand, "pwm", -1);
+    tool.pulseMinUs = tokenInt(rawCommand, "min_us", 500);
+    tool.pulseMaxUs = tokenInt(rawCommand, "max_us", 2500);
+    tool.pwmFrequencyHz = tokenInt(rawCommand, "freq", 50);
+    tool.openValue = clampFloat(tokenFloat(rawCommand, "open", 0.0f), 0.0f, 1.0f);
+    tool.closedValue = clampFloat(tokenFloat(rawCommand, "close", 1.0f), 0.0f, 1.0f);
+    tool.gpioPin = tokenInt(rawCommand, "pin", -1);
+    tool.activeHigh = tokenInt(rawCommand, "active_high", 1) != 0;
+    tool.received = true;
+    draftTool = tool;
+    return;
+  }
+
   if (upperCommand.startsWith("CONFIG END")) {
     if (!configInProgress) {
       printError("CONFIG", "begin_required");
@@ -695,11 +881,18 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       printError("CONFIG", error);
       return;
     }
+    const String toolError = validationErrorForTool(draftTool);
+    if (toolError.length() > 0) {
+      printError("CONFIG", toolError);
+      return;
+    }
     disableHardwareOutputs();
     for (int i = 0; i < kJointCount; i++) {
       joints[i] = draftJoints[i];
     }
+    activeTool = draftTool;
     configurePins();
+    configureToolPins();
     syncRuntimeFromCurrentPose();
     if (armed) {
       for (int i = 0; i < kJointCount; i++) {
@@ -865,6 +1058,7 @@ void handleStop() {
     controllerState = ControllerState::Stopped;
     clearFaultText();
   }
+  setToolSafe();
   ARM_SERIAL.println("OK command=STOP");
   printStatus();
 }
@@ -897,25 +1091,26 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
     printError("ARM", "not_armed");
     return;
   }
-  if (upperCommand.startsWith("TOOL OPEN")) {
+  if (activeTool.type == ToolType::ServoGripper && upperCommand.startsWith("TOOL OPEN")) {
     strlcpy(toolState, "open", sizeof(toolState));
-    toolValue = 0.0f;
-  } else if (upperCommand.startsWith("TOOL CLOSE")) {
+    toolValue = clampFloat(activeTool.openValue, 0.0f, 1.0f);
+  } else if (activeTool.type == ToolType::ServoGripper && upperCommand.startsWith("TOOL CLOSE")) {
     strlcpy(toolState, "closed", sizeof(toolState));
-    toolValue = 1.0f;
-  } else if (upperCommand.startsWith("TOOL SET")) {
+    toolValue = clampFloat(activeTool.closedValue, 0.0f, 1.0f);
+  } else if (activeTool.type == ToolType::ServoGripper && upperCommand.startsWith("TOOL SET")) {
     toolValue = clampFloat(tokenFloat(rawCommand, "value", toolValue), 0.0f, 1.0f);
     strlcpy(toolState, "set", sizeof(toolState));
-  } else if (upperCommand.startsWith("TOOL ON")) {
+  } else if (activeTool.type == ToolType::Electromagnet && upperCommand.startsWith("TOOL ON")) {
     strlcpy(toolState, "on", sizeof(toolState));
     toolValue = 1.0f;
-  } else if (upperCommand.startsWith("TOOL OFF")) {
+  } else if (activeTool.type == ToolType::Electromagnet && upperCommand.startsWith("TOOL OFF")) {
     strlcpy(toolState, "off", sizeof(toolState));
     toolValue = 0.0f;
   } else {
-    printError("USAGE", "TOOL_requires_OPEN_CLOSE_ON_OFF_or_SET_value");
+    printError("USAGE", "tool_command_not_supported_by_active_tool");
     return;
   }
+  writeToolOutput();
   ARM_SERIAL.printf("OK command=TOOL state=%s value=%.3f\r\n", toolState, toolValue);
   printStatus();
 }
@@ -1103,6 +1298,7 @@ void setup() {
     currentJointsDeg[i] = kDefaultHome[i];
     targetJointsDeg[i] = kDefaultHome[i];
   }
+  activeTool = defaultTool();
   resetDraftConfig();
   classifyConfig(joints);
   syncRuntimeFromCurrentPose();

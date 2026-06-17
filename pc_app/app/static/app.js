@@ -567,6 +567,127 @@ function applyGeometryPresetToDhDraft() {
   if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry model draft is previewed. Save to persist.";
 }
 
+function toolTypeLabel(type) {
+  if (type === "electromagnet") return "Magnet";
+  if (type === "servo_gripper") return "Gripper";
+  return "Generic";
+}
+
+function toolPresetIsMagnet(name, preset = null) {
+  const activePreset = preset || state.config?.tools?.presets?.[name] || {};
+  return name === "magnet" || activePreset.type === "electromagnet";
+}
+
+function renderToolSelectOptions(activeOverride = null) {
+  if (!elements.toolSelect) return;
+  const tools = state.config?.tools || { active: "gripper", presets: {} };
+  const presets = tools.presets || {};
+  const active = activeOverride || tools.active || Object.keys(presets)[0] || elements.toolSelect.value || "gripper";
+  elements.toolSelect.innerHTML = "";
+  const entries = Object.keys(presets).length
+    ? Object.entries(presets)
+    : [
+        ["gripper", { type: "servo_gripper" }],
+        ["magnet", { type: "electromagnet" }],
+      ];
+  entries.forEach(([name, preset]) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = preset.label || toolTypeLabel(preset.type) || name;
+    elements.toolSelect.appendChild(option);
+  });
+  if (!entries.some(([name]) => name === active)) {
+    const option = document.createElement("option");
+    option.value = active;
+    option.textContent = active;
+    elements.toolSelect.appendChild(option);
+  }
+  elements.toolSelect.value = active;
+}
+
+function renderToolEditor() {
+  if (!elements.toolCalibration || !state.config) return;
+  const tools = state.config.tools || { active: "gripper", presets: {} };
+  const active = tools.active || "gripper";
+  const presets = tools.presets || {};
+  elements.toolCalibration.classList.add("tool-editor");
+  elements.toolCalibration.innerHTML = Object.entries(presets)
+    .map(([name, preset]) => {
+      const tcp = preset.tcp_offset_mm || {};
+      const io = preset.io || {};
+      const type = preset.type || "generic";
+      const isMagnet = type === "electromagnet";
+      const specificFields = isMagnet
+        ? `
+          <label>Magnet GPIO <input data-tool-preset="${name}" data-tool-io-field="pin" type="number" step="1" value="${io.pin ?? -1}" /></label>
+          <label class="toggle-label compact-toggle">
+            <input data-tool-preset="${name}" data-tool-io-field="active_high" type="checkbox" ${io.active_high !== false ? "checked" : ""} />
+            <span>Active high</span>
+          </label>
+        `
+        : `
+          <label>Open value <input data-tool-preset="${name}" data-tool-field="open_value" type="number" min="0" max="1" step="0.01" value="${format(preset.open_value ?? 0, 2)}" /></label>
+          <label>Closed value <input data-tool-preset="${name}" data-tool-field="closed_value" type="number" min="0" max="1" step="0.01" value="${format(preset.closed_value ?? 1, 2)}" /></label>
+          <label>PWM GPIO <input data-tool-preset="${name}" data-tool-io-field="pwm_pin" type="number" step="1" value="${io.pwm_pin ?? -1}" /></label>
+          <label>Min us <input data-tool-preset="${name}" data-tool-io-field="pulse_min_us" type="number" min="100" step="10" value="${io.pulse_min_us ?? 500}" /></label>
+          <label>Max us <input data-tool-preset="${name}" data-tool-io-field="pulse_max_us" type="number" min="100" step="10" value="${io.pulse_max_us ?? 2500}" /></label>
+          <label>Frequency <input data-tool-preset="${name}" data-tool-io-field="pwm_frequency_hz" type="number" min="1" step="1" value="${io.pwm_frequency_hz ?? 50}" /></label>
+        `;
+      return `
+        <div class="tool-card ${name === active ? "active" : ""}" data-tool-card="${name}">
+          <div class="hardware-title">
+            <strong>${preset.label || name}</strong>
+            <span class="badge">${name === active ? "active" : type}</span>
+          </div>
+          <div class="tool-grid">
+            <label>Name <input data-tool-preset="${name}" data-tool-field="label" type="text" value="${preset.label || name}" /></label>
+            <label>Type
+              <select data-tool-preset="${name}" data-tool-field="type">
+                <option value="servo_gripper" ${type === "servo_gripper" ? "selected" : ""}>Gripper</option>
+                <option value="electromagnet" ${type === "electromagnet" ? "selected" : ""}>Magnet</option>
+                <option value="generic" ${type === "generic" ? "selected" : ""}>Generic</option>
+              </select>
+            </label>
+            <label>TCP X mm <input data-tool-preset="${name}" data-tool-tcp-field="x" type="number" step="0.1" value="${format(tcp.x ?? 0, 1)}" /></label>
+            <label>TCP Y mm <input data-tool-preset="${name}" data-tool-tcp-field="y" type="number" step="0.1" value="${format(tcp.y ?? 0, 1)}" /></label>
+            <label>TCP Z mm <input data-tool-preset="${name}" data-tool-tcp-field="z" type="number" step="0.1" value="${format(tcp.z ?? 0, 1)}" /></label>
+            ${specificFields}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function readToolsPayload() {
+  const current = clonePlain(state.config?.tools || { active: "gripper", presets: {} });
+  current.presets = current.presets || {};
+  current.active = elements.toolSelect?.value || current.active || "gripper";
+  elements.toolCalibration?.querySelectorAll("[data-tool-card]").forEach((card) => {
+    const name = card.dataset.toolCard;
+    const preset = clonePlain(current.presets[name] || {});
+    preset.tcp_offset_mm = preset.tcp_offset_mm || {};
+    preset.io = preset.io || {};
+    card.querySelectorAll("[data-tool-field]").forEach((input) => {
+      const field = input.dataset.toolField;
+      if (field === "label" || field === "type") {
+        preset[field] = input.value;
+      } else {
+        preset[field] = readNumber(input, preset[field] ?? 0);
+      }
+    });
+    card.querySelectorAll("[data-tool-tcp-field]").forEach((input) => {
+      preset.tcp_offset_mm[input.dataset.toolTcpField] = readNumber(input, 0);
+    });
+    card.querySelectorAll("[data-tool-io-field]").forEach((input) => {
+      const field = input.dataset.toolIoField;
+      preset.io[field] = input.type === "checkbox" ? input.checked : readNumber(input, 0);
+    });
+    current.presets[name] = preset;
+  });
+  return current;
+}
+
 function buildCalibrationEditors() {
   buildGeometryPresetEditor();
   refreshDerivedModelDraft();
@@ -591,17 +712,7 @@ function buildCalibrationEditors() {
     elements.jointCalibration.appendChild(row);
   });
 
-  if (elements.toolCalibration) {
-    const tools = state.config.tools || {};
-    const active = tools.active || "gripper";
-    const presets = tools.presets || {};
-    elements.toolCalibration.innerHTML = Object.entries(presets)
-      .map(([name, preset]) => {
-        const tcp = preset.tcp_offset_mm || {};
-        return `<div class="log-line"><span>${name}${name === active ? " active" : ""}</span><code>type ${preset.type || "-"}, tcp z ${format(tcp.z, 1)} mm</code></div>`;
-      })
-      .join("");
-  }
+  renderToolEditor();
 
   if (elements.encoderCalibration) {
     const encoders = state.config.encoders || {};
@@ -750,25 +861,42 @@ function renderOperatorPanels() {
   renderToolControls();
 }
 
-function renderToolControls() {
-  if (!elements.toolSelect || !state.config) return;
-  const tools = state.config.tools || {};
-  const active = state.robotState?.active_tool || tools.active || "gripper";
+function renderToolControls(activeOverride = null) {
+  if (!elements.toolSelect) return;
+  const tools = state.config?.tools || {};
+  renderToolSelectOptions(activeOverride);
+  const active = activeOverride || tools.active || state.robotState?.active_tool || elements.toolSelect.value || "gripper";
   elements.toolSelect.value = active;
-  const isMagnet = active === "magnet" || tools.presets?.[active]?.type === "electromagnet";
+  const preset = tools.presets?.[active] || {};
+  const isMagnet = toolPresetIsMagnet(active, preset);
   if (elements.gripperControls) elements.gripperControls.hidden = isMagnet;
   if (elements.gripperSliderLabel) elements.gripperSliderLabel.hidden = isMagnet;
   if (elements.magnetControls) elements.magnetControls.hidden = !isMagnet;
   if (elements.toolValueSlider && state.robotState?.tool_value != null) {
     elements.toolValueSlider.value = String(state.robotState.tool_value);
   }
+  const connected = Boolean(state.robotState?.simulation || state.robotState?.connected);
+  const realHardwareReady = Boolean(state.robotState?.simulation || state.robotState?.hardware_armed);
+  const notFaulted = !["estop", "fault"].includes(state.robotState?.motion_state);
+  const canCommand = connected && realHardwareReady && notFaulted;
+  [elements.toolOpenBtn, elements.toolCloseBtn, elements.toolSetBtn].forEach((button) => {
+    if (button) button.disabled = isMagnet || !canCommand;
+  });
+  [elements.toolOnBtn, elements.toolOffBtn].forEach((button) => {
+    if (button) button.disabled = !isMagnet || !canCommand;
+  });
 }
 
 async function saveActiveTool(active) {
+  if (!state.config?.tools) {
+    renderToolControls(active);
+    return;
+  }
   if (state.config?.tools) state.config.tools.active = active;
   if (state.robotState) state.robotState.active_tool = active;
-  renderToolControls();
+  renderToolControls(active);
   const tools = state.config?.tools || { active, presets: {} };
+  tools.active = active;
   const payload = await postJson("/api/tools", { active, presets: tools.presets || {} });
   if (payload.ok && payload.config) applyConfig(payload.config);
   if (payload.state) renderState(payload.state);
@@ -1034,6 +1162,18 @@ function markHardwareDraftDirty() {
   renderHardwareDraftBadges();
   if (elements.calibrationStatus) {
     elements.calibrationStatus.textContent = "Hardware IO has unsaved draft changes. Press Save or Sync ESP.";
+  }
+}
+
+function markJointCalibrationDraftDirty() {
+  if (elements.calibrationStatus) {
+    elements.calibrationStatus.textContent = "Joint calibration draft updated. Press Save to persist.";
+  }
+}
+
+function markToolDraftDirty() {
+  if (elements.calibrationStatus) {
+    elements.calibrationStatus.textContent = "Tool draft updated. Press Save to persist.";
   }
 }
 
@@ -1657,6 +1797,7 @@ function readCalibrationPayload() {
       dh_rows: dhValidation.rows,
     },
     geometry: readGeometryPayload(),
+    tools: readToolsPayload(),
     joints,
     motion: {
       command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
@@ -1708,6 +1849,7 @@ function applyConfig(config) {
   buildPerJointTuning();
   buildCalibrationEditors();
   buildHardwareIoEditors();
+  renderToolSelectOptions();
   if (state.robotState) renderHardwareStatus(state.robotState);
   renderOperatorPanels();
   buildIkTargetControls();
@@ -1946,7 +2088,10 @@ function bindActions() {
   });
   elements.connectSelectedSerialBtn.addEventListener("click", connectSelectedSerial);
   elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
-  elements.homeBtn.addEventListener("click", () => postJson("/api/home"));
+  elements.homeBtn.addEventListener("click", async () => {
+    const payload = await postJson("/api/home");
+    if (payload.state) renderState(payload.state);
+  });
   elements.setPoseBtn.addEventListener("click", setCurrentPoseKnown);
   elements.stopBtn.addEventListener("click", () => postJson("/api/stop"));
   elements.diagnosticsBtn.addEventListener("click", async () => {
@@ -1959,6 +2104,16 @@ function bindActions() {
   elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
   elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
   elements.hardwareIo.addEventListener("change", markHardwareDraftDirty);
+  elements.jointCalibration.addEventListener("input", markJointCalibrationDraftDirty);
+  elements.jointCalibration.addEventListener("change", markJointCalibrationDraftDirty);
+  elements.toolCalibration.addEventListener("input", markToolDraftDirty);
+  elements.toolCalibration.addEventListener("change", (event) => {
+    markToolDraftDirty();
+    if (event.target?.dataset?.toolField === "type") {
+      state.config.tools = readToolsPayload();
+      renderToolEditor();
+    }
+  });
   elements.geometryPresetEditor?.addEventListener("input", () => {
     refreshDerivedModelDraft();
     if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry draft updated. Save to persist.";

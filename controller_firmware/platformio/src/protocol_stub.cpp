@@ -235,6 +235,12 @@ void handleConfig(const String& upperCommand) {
     }
     return;
   }
+  if (upperCommand.startsWith("CONFIG TOOL")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+    }
+    return;
+  }
   if (upperCommand.startsWith("CONFIG END")) {
     if (!configInProgress) {
       printError("CONFIG", "begin_required");

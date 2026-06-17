@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from fastapi.testclient import TestClient
 
 import app.main as main
@@ -106,3 +108,26 @@ def test_default_path_settings_follow_saved_joint_limits():
     assert settings["waypoint_rate_hz"] == main.config.motion.command_rate_limit_hz
     assert settings["per_joint_speed_deg_s"] == [joint.max_speed_deg_s for joint in main.config.joints]
     assert settings["per_joint_accel_deg_s2"] == [joint.max_accel_deg_s2 for joint in main.config.joints]
+
+
+def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):
+    original_config = main.config
+    raw = {
+        **original_config.raw,
+        "tools": {
+            **original_config.raw.get("tools", {}),
+            "active": "magnet",
+        },
+    }
+    try:
+        monkeypatch.setattr(main, "config", replace(original_config, raw=raw))
+        reset_runtime_state()
+        client = TestClient(main.app)
+
+        response = client.post("/api/tool", json={"action": "open", "tool": "magnet"})
+
+        payload = response.json()
+        assert not payload["ok"]
+        assert "does not support" in payload["error"]
+    finally:
+        monkeypatch.setattr(main, "config", original_config)

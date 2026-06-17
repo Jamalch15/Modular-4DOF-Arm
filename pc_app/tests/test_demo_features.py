@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import cv2
 import numpy as np
 
@@ -13,6 +15,20 @@ def test_named_positions_are_valid_or_report_reasons():
 
     assert "safe" in positions
     assert isinstance(validate_named_position(config, "home", positions["home"]), list)
+
+
+def test_named_home_uses_joint_home_pose_even_when_raw_config_is_stale():
+    config = load_config()
+    raw = {
+        **config.raw,
+        "named_positions": {
+            **config.raw.get("named_positions", {}),
+            "home": {"type": "joint", "angles_deg": [10_000.0, 10_000.0, 10_000.0, 10_000.0]},
+        },
+    }
+    patched = replace(config, raw=raw)
+
+    assert named_positions(patched)["home"]["angles_deg"] == config.home_pose
 
 
 def test_named_position_validation_reports_unreachable_cartesian_target():
@@ -58,6 +74,27 @@ def test_pick_and_place_sequence_contains_tool_actions():
     assert sequence["ok"]
     assert [step["kind"] for step in sequence["steps"]].count("tool") == 3
     assert len(sequence["waypoints"]) >= 5
+
+
+def test_pick_and_place_sequence_uses_active_magnet_actions():
+    config = load_config()
+    raw = {
+        **config.raw,
+        "tools": {
+            **config.raw.get("tools", {}),
+            "active": "magnet",
+        },
+    }
+    patched = replace(config, raw=raw)
+
+    sequence = build_pick_and_place_sequence(
+        patched,
+        {"x_mm": 0.0, "y_mm": 180.0, "z_mm": 30.0, "phi_deg": 0.0},
+        "dropoff_a",
+    )
+
+    assert sequence["ok"]
+    assert [step["action"] for step in sequence["steps"] if step["kind"] == "tool"] == ["off", "on", "off"]
 
 
 def test_sorting_sequence_uses_color_drop_zone():

@@ -38,6 +38,8 @@ STATUS
 CONFIG BEGIN axes=4
 CONFIG JOINT index=1 name=base actuator=stepper enabled=0 step=-1 dir=-1 enable=-1 enable_low=1 driver=TB6600 full_steps=200 microsteps=16 gear=1.000 zero=0.000 sign=1 min=-160.000 max=160.000 home=0.000 max_speed=45.000 max_accel=120.000
 CONFIG JOINT index=3 name=elbow actuator=servo enabled=0 pwm=-1 min_us=500 max_us=2500 freq=50 servo_range=270.000 neutral=135.000 gear=1.000 zero=0.000 sign=1 min=-120.000 max=120.000 home=20.000 max_speed=60.000 max_accel=180.000
+CONFIG TOOL name=gripper active=1 type=servo_gripper tcp_x=0.000 tcp_y=0.000 tcp_z=30.000 open=0.000 close=1.000 pwm=9 min_us=500 max_us=2500 freq=50
+CONFIG TOOL name=magnet active=0 type=electromagnet tcp_x=0.000 tcp_y=0.000 tcp_z=18.000 pin=-1 active_high=1
 CONFIG END
 ARM 0
 ARM 1
@@ -121,6 +123,10 @@ fault
 - Enabled stepper axes require at least STEP and DIR pins, positive full steps/rev, positive microsteps, and positive gear ratio.
 - TB6600 microstep pins are physical DIP switches, so the protocol keeps only the `microsteps` value for step math.
 - Enabled servo axes require PWM pin, valid pulse range, positive PWM frequency, positive servo range, and positive gear ratio.
+- The active tool is configured with `CONFIG TOOL active=1`.
+- An active `servo_gripper` requires a PWM pin and valid pulse range.
+- An active `electromagnet` requires a GPIO pin and active polarity.
+- Inactive tool presets may keep unknown pins as `-1`.
 - `hw=hardware` means all axes are valid physical axes.
 - `hw=mixed` means at least one physical axis and at least one simulated axis.
 - `hw=simulated` means no physical axes are enabled.

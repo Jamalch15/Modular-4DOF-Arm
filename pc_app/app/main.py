@@ -309,7 +309,10 @@ def evaluate_hardware_config() -> dict[str, Any]:
         axis_states.append(state_name)
         enabled_bits.append("1" if enabled and state_name == "hardware" else "0")
 
+    errors.extend(active_tool_hardware_errors())
     if any(axis == "invalid" for axis in axis_states):
+        mode = "invalid"
+    elif errors:
         mode = "invalid"
     elif all(axis == "hardware" for axis in axis_states):
         mode = "hardware"
@@ -346,6 +349,80 @@ def hardware_ready_for_motion() -> tuple[bool, str]:
     if state.config_sync_status != "synced":
         return False, f"hardware config is not synced ({state.config_sync_status})"
     return True, ""
+
+
+def _tool_pin(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be an integer GPIO or -1 for unknown")
+    pin = int(value)
+    if pin < -1 or pin > 48:
+        raise ValueError(f"{name} must be between -1 and 48")
+    return pin
+
+
+def validate_tools_payload(tools: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    active = str(tools.get("active", "gripper"))
+    presets = tools.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return ["tools.presets must define at least one tool"]
+    if active not in presets:
+        errors.append(f"active tool {active} is missing from presets")
+
+    for name, preset in presets.items():
+        if not isinstance(preset, dict):
+            errors.append(f"tool {name} must be a mapping")
+            continue
+        tool_type = str(preset.get("type", "generic"))
+        if tool_type not in {"servo_gripper", "electromagnet", "generic"}:
+            errors.append(f"tool {name} has unsupported type {tool_type}")
+        tcp = preset.get("tcp_offset_mm")
+        if not isinstance(tcp, dict):
+            errors.append(f"tool {name} must define tcp_offset_mm")
+            tcp = {}
+        for axis in ["x", "y", "z"]:
+            try:
+                float(tcp.get(axis, 0.0))
+            except (TypeError, ValueError):
+                errors.append(f"tool {name} tcp_offset_mm.{axis} must be numeric")
+
+        io = preset.get("io") if isinstance(preset.get("io"), dict) else {}
+        try:
+            if tool_type == "servo_gripper":
+                open_value = float(preset.get("open_value", 0.0))
+                closed_value = float(preset.get("closed_value", 1.0))
+                if not 0.0 <= open_value <= 1.0 or not 0.0 <= closed_value <= 1.0:
+                    errors.append(f"tool {name} open_value and closed_value must be in 0.0..1.0")
+                _tool_pin(io.get("pwm_pin", -1), f"tool {name} pwm_pin")
+                pulse_min = int(io.get("pulse_min_us", 500))
+                pulse_max = int(io.get("pulse_max_us", 2500))
+                frequency = int(io.get("pwm_frequency_hz", 50))
+                if pulse_min <= 0 or pulse_max <= pulse_min:
+                    errors.append(f"tool {name} pulse_min_us must be positive and below pulse_max_us")
+                if frequency <= 0:
+                    errors.append(f"tool {name} pwm_frequency_hz must be positive")
+            elif tool_type == "electromagnet":
+                _tool_pin(io.get("pin", -1), f"tool {name} pin")
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
+    return errors
+
+
+def active_tool_hardware_errors() -> list[str]:
+    tools = tools_settings(config)
+    errors = validate_tools_payload(tools)
+    active = str(tools.get("active", "gripper"))
+    preset = tools.get("presets", {}).get(active, {})
+    tool_type = str(preset.get("type", "generic")) if isinstance(preset, dict) else "generic"
+    io = preset.get("io") if isinstance(preset.get("io"), dict) else {}
+    try:
+        if tool_type == "servo_gripper" and _tool_pin(io.get("pwm_pin", -1), f"tool {active} pwm_pin") < 0:
+            errors.append(f"active tool {active} is missing gripper PWM pin")
+        if tool_type == "electromagnet" and _tool_pin(io.get("pin", -1), f"tool {active} pin") < 0:
+            errors.append(f"active tool {active} is missing magnet GPIO pin")
+    except ValueError as exc:
+        errors.append(str(exc))
+    return errors
 
 
 def config_sync_ready() -> tuple[bool, str]:
@@ -690,7 +767,7 @@ def sync_hardware_config() -> dict[str, Any]:
 
     try:
         serial_client.clear_input()
-        for line in format_config_lines(config.joints):
+        for line in format_config_lines(config.joints, tools_settings(config)):
             serial_client.send_line(line)
         response = read_serial_until_any(("OK command=CONFIG", "ERR"), timeout_s=2.0)
     except SerialClientError as exc:
@@ -1137,13 +1214,36 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
 
 async def apply_tool_action(action: str, value: float | None = None, tool: str | None = None) -> dict[str, Any]:
     normalized = action.strip().lower()
-    active_tool = tool or str(tools_settings(config).get("active", "gripper"))
+    tools = tools_settings(config)
+    configured_active = str(tools.get("active", "gripper"))
+    active_tool = tool or configured_active
+    presets = tools.get("presets", {})
+    preset = presets.get(active_tool, {}) if isinstance(presets, dict) else {}
+    if active_tool != configured_active:
+        state.set_error(f"select {active_tool} before sending tool commands")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not isinstance(preset, dict) or not preset:
+        state.set_error(f"tool preset {active_tool} is missing")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    tool_type = str(preset.get("type", "generic"))
     state.active_tool = active_tool
-    state.tool_type = str((tools_settings(config).get("presets", {}).get(active_tool, {}) or {}).get("type", "unknown"))
+    state.tool_type = tool_type
+
+    if tool_type == "servo_gripper" and normalized not in {"open", "close", "set"}:
+        state.set_error(f"{active_tool} does not support TOOL {normalized.upper()}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if tool_type == "electromagnet" and normalized not in {"on", "off"}:
+        state.set_error(f"{active_tool} does not support TOOL {normalized.upper()}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
     if normalized in {"open", "close"}:
         command = format_tool(normalized)
         state.tool_state = "open" if normalized == "open" else "closed"
-        state.tool_value = tool_settings(config).get("open_value" if normalized == "open" else "closed_value")
+        state.tool_value = preset.get("open_value" if normalized == "open" else "closed_value")
     elif normalized in {"on", "off"}:
         command = format_tool(normalized)
         state.tool_state = normalized
@@ -1166,6 +1266,11 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if not state.hardware_armed:
         state.set_error("tool commands require the Armed toggle")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    tool_errors = active_tool_hardware_errors()
+    if tool_errors:
+        state.set_error("; ".join(tool_errors))
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
 
@@ -1420,8 +1525,15 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
             merged = presets.get(name, {})
             merged.update(preset)
             presets[name] = merged
+    errors = validate_tools_payload(tools)
+    if errors:
+        state.set_error("; ".join(errors))
+        await broadcast_state()
+        return {"ok": False, "errors": errors, "error": state.last_error, "state": state.to_dict()}
     try:
-        save_calibration_updates(ensure_local_config(), {"tools": tools})
+        calibration = calibration_settings(config)
+        calibration["tool_dimensions_validated"] = False
+        save_calibration_updates(ensure_local_config(), {"tools": tools, "calibration": calibration})
         reload_runtime_config()
         log_validation_warnings()
     except Exception as exc:
@@ -1887,6 +1999,15 @@ async def live_target(request: LiveTargetRequest) -> dict[str, Any]:
 async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
     config_path = ensure_local_config()
     updates = request.__dict__
+    if isinstance(updates.get("tools"), dict):
+        tool_errors = validate_tools_payload(updates["tools"])
+        if tool_errors:
+            state.set_error("; ".join(tool_errors))
+            await broadcast_state()
+            return {"ok": False, "errors": tool_errors, "error": state.last_error, "state": state.to_dict()}
+        calibration = calibration_settings(config)
+        calibration["tool_dimensions_validated"] = False
+        updates["calibration"] = calibration
     if serial_client.is_connected and not state.simulation:
         ready, reason = config_sync_ready()
         if not ready:
@@ -1977,6 +2098,11 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
 @app.post("/api/disconnect")
 async def disconnect() -> dict[str, Any]:
     cancel_motion_tasks()
+    if serial_client.is_connected and not state.simulation:
+        try:
+            serial_client.send_line(format_stop())
+        except Exception as exc:
+            log_event("connection", "could not send stop before disconnect", error=str(exc))
     serial_client.disconnect()
     state.connected = False
     state.simulation = False

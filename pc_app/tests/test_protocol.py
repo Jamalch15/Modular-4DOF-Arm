@@ -1,4 +1,5 @@
 from app.config import load_config
+from app.demo_settings import tools_settings
 from app.protocol import format_arm, format_config_lines, format_movej, format_setpose, format_tool, parse_status
 
 
@@ -39,7 +40,7 @@ def test_parse_extended_status_line():
 
 def test_format_hardware_config_lines_from_config():
     config = load_config()
-    lines = format_config_lines(config.joints)
+    lines = format_config_lines(config.joints, tools_settings(config))
     base_stepper = config.joints[0].hardware.stepper
     elbow_servo = config.joints[2].hardware.servo
 
@@ -58,6 +59,8 @@ def test_format_hardware_config_lines_from_config():
     assert f"servo_range={elbow_servo.servo_range_deg:.3f}" in lines[3]
     assert f"min_us={elbow_servo.pulse_min_us}" in lines[3]
     assert f"max_us={elbow_servo.pulse_max_us}" in lines[3]
+    assert any(line.startswith("CONFIG TOOL name=gripper active=") for line in lines)
+    assert any("type=electromagnet" in line for line in lines)
 
 
 def test_format_arm_and_setpose():

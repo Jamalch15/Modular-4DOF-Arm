@@ -20,24 +20,34 @@ Currently present at a rough level:
 
 - Main tabs have been renamed to `Control`, `Tasks`, `Kinematics`, `Program`, and `Settings`.
 - The old permanent COM text box has been replaced with a serial modal.
-- The Control tab has a gripper/magnet tool selector.
-- The backend has generic `TOOL` commands and a `tools` config section.
+- The Control tab has a gripper/magnet tool selector and shows only the matching control group for the selected tool.
+- The backend has tool-type-aware `TOOL` commands, a `tools` config section, and active tool validation.
 - The backend has a Standard DH data model and Jacobian IK plumbing.
 - The app has an editable MATLAB prototype geometry preset with `L_1..L_9`, `s4`, `s6`, and `s8`.
+- The Settings view has a derived DH table, but it is currently read-only.
 - The 3D view has DH-based rendering and object marker plumbing.
 - The backend has basic color/blob vision helpers and task sequence builders.
 - Firmware/backend protocol parsing includes some newer status fields.
 - Encoder readback fields exist in software, but are not a real hardware workflow yet.
+- Analytic IK seed generation exists as a backend first pass and has regression tests.
+- Backend unit tests currently pass, and the protocol stub plus full-arm controller firmware targets build.
+
+Recent verification from the 2026-06-17 audit:
+
+- `python -m pytest -q` in `pc_app`: 65 passed, with two FastAPI `on_event` deprecation warnings.
+- `pio run -e esp32-s3-arm-protocol-stub -e esp32-s3-arm-controller`: both firmware targets built successfully.
+- Headless Chrome rendered UI check through DevTools Protocol: selecting `Gripper` shows only gripper controls and the slider; selecting `Magnet` shows only magnet controls; no browser console errors were reported.
+- No real hardware movement or real tool IO was verified during this audit.
 
 Still missing or not production-ready:
 
 - Control preview/live jog behavior needs to be proven stable.
-- Tool controls are still shallow and should show only the selected tool controls.
-- Tool dimensions do not fully drive the active TCP model.
-- Tool and encoder pins cannot be properly edited from Settings.
+- Tool controls switch by selected tool, and unsupported tool commands are rejected in software; real unsafe/hardware states still need physical validation.
+- Tool TCP offsets drive the backend active TCP model as a first pass; visible 3D tool geometry and physical calibration still need work.
+- Tool pins can be edited from Settings. Encoder pins cannot be properly edited from Settings yet.
 - Camera preview should move out of the side panel into a movable popup.
-- DH editing needs to become a proper table, not generic input blocks.
-- The current kinematics implementation should be reconciled with the MATLAB prototype.
+- DH editing needs an editable table workflow; the current table is derived/read-only.
+- FK and analytic seeding have been partially reconciled with the MATLAB prototype, but the Jacobian implementation still needs to be reconciled with the DH-frame cross-product model.
 - The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
 - Calibration is not yet a guided workflow.
 - AprilTag-based camera/world calibration is not implemented yet.
@@ -231,7 +241,9 @@ This order keeps useful operator fixes first, then builds the kinematics and mov
 
 ### SHELL-01: Control Preview And Live Jog Stability
 
-Status: needs verification and likely refinement.
+Status: implemented as a source-level first pass; needs browser and hardware verification.
+
+Reality note: frontend state now separates draft, commanded, pending, and reported angles well enough on source review. This still needs rendered UI testing during live jog and real hardware feedback.
 
 Work:
 
@@ -255,6 +267,8 @@ Acceptance:
 
 Status: missing.
 
+Reality note: source review still shows the camera frame rendered inline in the Tasks side panel.
+
 Work:
 
 - Remove the large inline camera preview from the Tasks side panel.
@@ -271,7 +285,9 @@ Acceptance:
 
 ### SHELL-03: HUD And Fader Chrome Polish
 
-Status: missing.
+Status: partial; placement and arrows still need UI polish.
+
+Reality note: HUD and fader widgets have collapse buttons and CSS rotation, but the placement and arrow direction have not been browser-verified and still match the user-reported problem area.
 
 Work:
 
@@ -288,7 +304,9 @@ Acceptance:
 
 ### SHELL-04: Serial Modal Polish
 
-Status: partial.
+Status: implemented as a first pass; stale-port behavior still needs hardware verification.
+
+Reality note: serial connection is modal, lists detected ports with descriptions/HWID, supports baud selection, and saves the last selected port after a successful connection.
 
 Work:
 
@@ -307,7 +325,9 @@ Acceptance:
 
 ### TOOL-01: Selected Tool Controls Only
 
-Status: partial.
+Status: implemented as a first pass; needs real hardware validation.
+
+Reality note: the Control tab now hides gripper controls for magnet and hides magnet controls for gripper, including the CSS `[hidden]` override fix that caused both groups to appear at once. Frontend command buttons are gated by connection/armed/fault state, and backend tool actions reject commands unsupported by the active tool type. A headless Chrome rendered check verified the gripper and magnet selection behavior; real hardware behavior still needs validation.
 
 Work:
 
@@ -330,7 +350,9 @@ Acceptance:
 
 ### TOOL-02: End-Effector Settings And IO Editor
 
-Status: missing.
+Status: implemented as a first pass; needs hardware values and operator review.
+
+Reality note: Settings now has editable tool preset cards for type, display label, TCP offset, gripper servo IO/range/open-close values, and magnet GPIO/polarity. Saves go through `robot.local.yaml` calibration updates with validation before persistence. The real pin numbers, pulse ranges, and TCP offsets still need to be confirmed on the physical build.
 
 Work:
 
@@ -354,7 +376,9 @@ Acceptance:
 
 ### TOOL-03: Active Tool TCP Integration
 
-Status: partial or missing.
+Status: implemented as a backend first pass; 3D geometry and physical calibration still incomplete.
+
+Reality note: the backend loads the active tool TCP offset and applies it through the active link/tool model. The UI editor can update the offsets, active tool geometry changes mark tool calibration stale, and pick/place task tool steps now follow the active tool type. The 3D view does not yet visibly change the rendered tool geometry, and the physical TCP offsets are still unvalidated.
 
 Work:
 
@@ -372,7 +396,9 @@ Acceptance:
 
 ### TOOL-04: Real Firmware Tool IO
 
-Status: protocol exists, real IO likely incomplete.
+Status: implemented as a firmware first pass; real IO untested.
+
+Reality note: the PC config sync now emits active `CONFIG TOOL` lines, the protocol stub accepts them, and `arm_controller.cpp` parses the active tool config. The controller drives a configured gripper PWM output for `OPEN`, `CLOSE`, and `SET`, drives a configured magnet GPIO for `ON` and `OFF`, rejects unsupported commands for the active tool type, and sets the tool safe on boot/stop/fault/disable. This has compiled for the ESP32-S3 targets, but it has not been tested against the real servo, transistor, magnet, or power wiring.
 
 Work:
 
@@ -412,9 +438,9 @@ Acceptance:
 
 ### KIN-02: Professional DH Table Editor
 
-Status: implemented as a first pass.
+Status: partial.
 
-Reality note: the table editor now validates and previews DH drafts, but it is not yet a guided calibration workflow.
+Reality note: the Settings UI now renders the derived DH rows as a table and validates the derived draft, but the table is read-only. Direct DH-row editing in a proper table is still missing.
 
 Work:
 
@@ -474,7 +500,9 @@ Acceptance:
 
 ### KIN-04: Analytic Seed Before Jacobian IK
 
-Status: missing or incomplete.
+Status: implemented as a backend first pass.
+
+Reality note: analytic seed candidate generation exists, runs before the numerical solver for the measured-prototype DH shape, and is covered by regression tests. It still needs hardware validation and clearer UI diagnostics for rejected seeds and selected branches.
 
 Work:
 
@@ -500,6 +528,8 @@ Acceptance:
 ### KIN-05: DH-Based Jacobian IK Diagnostics
 
 Status: partial.
+
+Reality note: IK reports candidates, selected branch, convergence errors, iterations, notes, and singularity warnings. The current solver still uses a finite-difference numeric Jacobian, not the DH-frame axis cross-product Jacobian from the MATLAB prototype.
 
 Work:
 
@@ -638,7 +668,9 @@ Acceptance:
 
 ### MOVE-05: Motion Diagnostics
 
-Status: missing.
+Status: partial.
+
+Reality note: backend motion diagnostics track run id, execution state, waypoint progress, expected/actual duration, final error, controller response, and actual TCP samples. The UI diagnostics are still not organized into the full motion/IK plots and failure-mode views described below.
 
 Work:
 
@@ -833,7 +865,9 @@ Acceptance:
 
 ### CAL-04: Named Positions
 
-Status: partial or missing.
+Status: partial.
+
+Reality note: default named positions and backend validation exist, and the UI can preview/move them. Editable named-position management and save/delete workflows are still missing.
 
 Work:
 
@@ -858,6 +892,8 @@ Acceptance:
 
 Status: missing.
 
+Reality note: Settings currently shows encoder summary rows for every configured axis, including disabled elbow/wrist entries. Normal operator settings should expose only base/shoulder encoder setup for the current hardware plan.
+
 Work:
 
 - Show only base and shoulder encoder setup in normal Settings.
@@ -878,6 +914,8 @@ Acceptance:
 ### ENC-02: Config-Driven AS5048A Readback
 
 Status: partial.
+
+Reality note: `arm_controller.cpp` has optional compile-time AS5048A readback for base/shoulder using fixed build-time CS pins. It is not yet driven from PC-app encoder settings, and zero offset/direction handling is not yet applied in firmware status.
 
 Work:
 
@@ -923,7 +961,9 @@ Acceptance:
 
 ### ENC-04: Encoder Verification And Fault Detection
 
-Status: missing.
+Status: partial backend plumbing.
+
+Reality note: the backend can compare reported encoder angles to commanded targets and set an encoder fault, but this is not yet a guided workflow and has not been proven with real AS5048A hardware.
 
 Work:
 
@@ -981,6 +1021,8 @@ Future work:
 ### VISION-01: Live Annotated Camera Popup
 
 Status: missing.
+
+Reality note: detection refresh and annotated frame plumbing exist, but the UI still renders the camera inline in the Tasks side panel.
 
 Work:
 
@@ -1138,6 +1180,8 @@ Acceptance:
 ### TASK-01: Dedicated Task Panel
 
 Status: placeholder-level.
+
+Reality note: task sequence builders and preview/execute endpoints exist, but the operator workflow still mixes task settings, inline camera, detection summaries, and execution controls in a prototype layout.
 
 Work:
 
@@ -1332,6 +1376,8 @@ Acceptance:
 
 Status: partial.
 
+Reality note: the UI/protocol no longer exposes software microstep pins, and sync is guarded while motion/live/task execution is active. Physical TB6600 timing, wiring, and config-sync behavior still need hardware validation.
+
 Work:
 
 - Remove software microstep pin fields from the UI.
@@ -1351,7 +1397,9 @@ Acceptance:
 
 ### FW-02: Protocol Status Extensions
 
-Status: partial.
+Status: implemented as a first pass.
+
+Reality note: backend parsing and firmware status output include known pose, pose source, encoder availability, encoder angles, closed-loop mode, tool state, and tool value fields while keeping older status lines parseable.
 
 Work:
 
@@ -1375,6 +1423,8 @@ Acceptance:
 ### FW-03: Safe Stop And Fault Semantics
 
 Status: partial.
+
+Reality note: PC and firmware have Stop/ESTOP paths and motion cancellation. Tool-output fail-safe behavior cannot be complete until real tool IO exists.
 
 Work:
 
@@ -1445,7 +1495,9 @@ Acceptance:
 
 ### TEST-01: Backend Unit Tests
 
-Status: partial.
+Status: partial but currently green.
+
+Reality note: the 2026-06-17 audit ran `python -m pytest -q`: 65 tests passed. Coverage is still backend-heavy and does not replace real hardware tests.
 
 Work:
 
@@ -1484,6 +1536,8 @@ Acceptance:
 ### TEST-03: Firmware Build And Protocol Tests
 
 Status: partial.
+
+Reality note: the 2026-06-17 audit built `esp32-s3-arm-protocol-stub` and `esp32-s3-arm-controller` successfully with PlatformIO. There are still no automated firmware protocol tests running against the compiled binaries or hardware.
 
 Work:
 
@@ -1548,7 +1602,7 @@ Implement KIN-01 through KIN-03 and add tests against the MATLAB geometry.
 ```
 
 ```text
-Implement KIN-04 and KIN-05 using the MATLAB analytic seed and Jacobian ideas.
+Finish KIN-05 by replacing the numeric Jacobian with the DH-frame cross-product Jacobian and surfacing IK diagnostics in the UI.
 ```
 
 ```text

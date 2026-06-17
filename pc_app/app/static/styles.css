@@ -24,6 +24,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -487,6 +491,33 @@ label {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.tool-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.tool-card {
+  border: 1px solid #222c3b;
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(15, 21, 31, 0.92);
+}
+
+.tool-card.active {
+  border-color: rgba(94, 230, 197, 0.42);
+  background: rgba(94, 230, 197, 0.06);
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tool-grid label {
+  min-width: 0;
 }
 
 .hardware-grid label {
@@ -1208,7 +1239,8 @@ label {
   .geometry-header,
   .geometry-grid,
   .geometry-sign-grid,
-  .hardware-grid {
+  .hardware-grid,
+  .tool-grid {
     grid-template-columns: 1fr;
   }
 
