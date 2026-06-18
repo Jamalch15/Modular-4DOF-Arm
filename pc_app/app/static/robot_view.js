@@ -1,6 +1,14 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
+const WORK_PLATE = Object.freeze({
+  widthXMm: 478,
+  depthYMm: 315,
+  centerYMm: 244,
+  thicknessMm: 6,
+  color: 0x8e9291, // RAL 7042 Traffic grey A, approximate screen color.
+});
+
 function armPose(anglesDeg, links, geometryPreset = {}) {
   const rows = Array.isArray(links.dh_rows) && links.dh_rows.length
     ? links.dh_rows
@@ -203,6 +211,187 @@ function makeCylinderBetween(start, end, radius, material) {
   mesh.position.copy(midpoint);
   mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
   return mesh;
+}
+
+function makeWorkPlate() {
+  const group = new THREE.Group();
+  const geometry = new THREE.BoxGeometry(
+    WORK_PLATE.widthXMm,
+    WORK_PLATE.thicknessMm,
+    WORK_PLATE.depthYMm
+  );
+  const material = new THREE.MeshStandardMaterial({
+    color: WORK_PLATE.color,
+    roughness: 0.78,
+    metalness: 0.04,
+  });
+  const plate = new THREE.Mesh(geometry, material);
+  plate.position.copy(
+    robotToScene({
+      x: 0,
+      y: WORK_PLATE.centerYMm,
+      z: -WORK_PLATE.thicknessMm / 2,
+    })
+  );
+  plate.userData.kind = "workPlate";
+  group.add(plate);
+
+  const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x626866 });
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry), edgeMaterial);
+  edges.position.copy(plate.position);
+  edges.userData.kind = "workPlateEdges";
+  group.add(edges);
+  return group;
+}
+
+function makeRobotAxes(length = 180) {
+  const group = new THREE.Group();
+  const origin = new THREE.Vector3(0, 0, 0);
+  [
+    { label: "X", robotDirection: { x: 1, y: 0, z: 0 }, color: 0xff4d5f },
+    { label: "Y", robotDirection: { x: 0, y: 1, z: 0 }, color: 0x43a0ff },
+    { label: "Z", robotDirection: { x: 0, y: 0, z: 1 }, color: 0x53d18e },
+  ].forEach((axis) => {
+    const direction = robotToScene(axis.robotDirection).normalize();
+    const arrow = new THREE.ArrowHelper(direction, origin, length, axis.color, 14, 7);
+    group.add(arrow);
+
+    const label = makeTextSprite(axis.label, `#${axis.color.toString(16).padStart(6, "0")}`);
+    label.position.copy(direction).multiplyScalar(length + 18);
+    label.scale.multiplyScalar(0.72);
+    group.add(label);
+  });
+  return group;
+}
+
+function calibrationMaterial(color, options = {}) {
+  const materialOptions = {
+    color,
+    roughness: options.roughness ?? 0.55,
+    transparent: Boolean(options.transparent),
+    opacity: options.opacity ?? 1,
+    depthWrite: options.depthWrite ?? true,
+  };
+  if (options.side !== undefined) materialOptions.side = options.side;
+  const material = new THREE.MeshStandardMaterial(materialOptions);
+  material.userData.disposeWithObject = true;
+  return material;
+}
+
+function makeAprilTagMarker(tagId, tag, defaultSizeMm) {
+  const group = new THREE.Group();
+  const size = Number(tag?.size_mm || defaultSizeMm || 40);
+  const yaw = (Number(tag?.yaw_deg || 0) * Math.PI) / 180;
+  let center = Array.isArray(tag?.center_mm) ? tag.center_mm.map(Number) : null;
+  if (!center && Array.isArray(tag?.workspace_corner_mm)) {
+    const anchor = tag.workspace_corner_mm.map(Number);
+    const localCorners = {
+      top_left: [-1, 1],
+      top_right: [1, 1],
+      bottom_right: [1, -1],
+      bottom_left: [-1, -1],
+    };
+    const local = localCorners[String(tag?.aligned_tag_corner || "").toLowerCase()];
+    if (local) {
+      const dx = local[0] * size / 2;
+      const dy = local[1] * size / 2;
+      center = [
+        anchor[0] - (Math.cos(yaw) * dx - Math.sin(yaw) * dy),
+        anchor[1] - (Math.sin(yaw) * dx + Math.cos(yaw) * dy),
+        anchor[2],
+      ];
+    }
+  }
+  center ||= [0, 0, 0];
+  const marker = new THREE.Mesh(
+    new THREE.BoxGeometry(size, 1.2, size),
+    calibrationMaterial(0xd9dde1, { roughness: 0.78 })
+  );
+  marker.position.copy(robotToScene({ x: center[0], y: center[1], z: center[2] + 0.6 }));
+  marker.rotation.y = yaw;
+  group.add(marker);
+
+  const inset = new THREE.Mesh(
+    new THREE.BoxGeometry(size * 0.7, 1.5, size * 0.7),
+    calibrationMaterial(0x161a20, { roughness: 0.8 })
+  );
+  inset.position.copy(marker.position);
+  inset.position.y += 0.2;
+  inset.rotation.y = yaw;
+  group.add(inset);
+
+  const label = makeTextSprite(String(tagId), "#ffffff");
+  label.position.copy(marker.position);
+  label.position.y += 7;
+  label.scale.multiplyScalar(0.58);
+  group.add(label);
+  return group;
+}
+
+function cameraPointToRobot(point, position, rotation) {
+  return {
+    x: position[0] + rotation[0][0] * point[0] + rotation[0][1] * point[1] + rotation[0][2] * point[2],
+    y: position[1] + rotation[1][0] * point[0] + rotation[1][1] * point[1] + rotation[1][2] * point[2],
+    z: position[2] + rotation[2][0] * point[0] + rotation[2][1] * point[1] + rotation[2][2] * point[2],
+  };
+}
+
+function makeCameraPoseOverlay(result) {
+  const group = new THREE.Group();
+  const pose = result?.camera_to_robot || {};
+  const position = Array.isArray(pose.position_mm) ? pose.position_mm.map(Number) : null;
+  const rotation = Array.isArray(pose.rotation_matrix) ? pose.rotation_matrix : null;
+  const cameraMatrix = result?.camera_matrix;
+  if (!position || position.length !== 3 || !rotation || rotation.length !== 3 || !cameraMatrix) return group;
+
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(46, 24, 32),
+    calibrationMaterial(result.accepted ? 0x53d18e : 0xff6374, { roughness: 0.52 })
+  );
+  body.position.copy(robotToScene({ x: position[0], y: position[1], z: position[2] }));
+  const sceneRotation = new THREE.Matrix4().set(
+    rotation[0][0], rotation[0][1], rotation[0][2], 0,
+    rotation[2][0], rotation[2][1], rotation[2][2], 0,
+    -rotation[1][0], -rotation[1][1], -rotation[1][2], 0,
+    0, 0, 0, 1
+  );
+  body.setRotationFromMatrix(sceneRotation);
+  group.add(body);
+
+  const imageSize = result.image_size_px || {};
+  const width = Number(imageSize.width || cameraMatrix[0][2] * 2 || 1280);
+  const height = Number(imageSize.height || cameraMatrix[1][2] * 2 || 720);
+  const fx = Number(cameraMatrix[0][0]);
+  const fy = Number(cameraMatrix[1][1]);
+  const cx = Number(cameraMatrix[0][2]);
+  const cy = Number(cameraMatrix[1][2]);
+  const depth = 130;
+  const cameraCorners = [
+    [(0 - cx) * depth / fx, (0 - cy) * depth / fy, depth],
+    [(width - cx) * depth / fx, (0 - cy) * depth / fy, depth],
+    [(width - cx) * depth / fx, (height - cy) * depth / fy, depth],
+    [(0 - cx) * depth / fx, (height - cy) * depth / fy, depth],
+  ];
+  const origin = robotToScene({ x: position[0], y: position[1], z: position[2] });
+  const corners = cameraCorners.map((point) => robotToScene(cameraPointToRobot(point, position, rotation)));
+  const points = [];
+  corners.forEach((corner) => points.push(origin, corner));
+  for (let index = 0; index < corners.length; index += 1) {
+    points.push(corners[index], corners[(index + 1) % corners.length]);
+  }
+  const lineMaterial = new THREE.LineBasicMaterial({ color: result.accepted ? 0x53d18e : 0xff6374 });
+  lineMaterial.userData.disposeWithObject = true;
+  group.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(points), lineMaterial));
+
+  const label = makeTextSprite(
+    `CAM ${Number((result.metrics || {}).confidence || 0).toFixed(2)}`,
+    result.accepted ? "#53d18e" : "#ff6374"
+  );
+  label.position.copy(origin);
+  label.position.y += 28;
+  label.scale.multiplyScalar(0.65);
+  group.add(label);
+  return group;
 }
 
 function robotToScene(point) {
@@ -504,10 +693,15 @@ export class RobotView {
     this.previewGroup = new THREE.Group();
     this.overlayGroup = new THREE.Group();
     this.objectGroup = new THREE.Group();
+    this.calibrationGroup = new THREE.Group();
+    this.workPlateGroup = makeWorkPlate();
+    this.scene.add(this.workPlateGroup);
     this.scene.add(this.armGroup);
     this.scene.add(this.previewGroup);
     this.scene.add(this.overlayGroup);
     this.scene.add(this.objectGroup);
+    this.scene.add(this.calibrationGroup);
+    this.container.dataset.workPlate = `${WORK_PLATE.widthXMm}x${WORK_PLATE.depthYMm}@y${WORK_PLATE.centerYMm}`;
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.8);
     const key = new THREE.DirectionalLight(0xffffff, 1.3);
@@ -515,10 +709,12 @@ export class RobotView {
     this.scene.add(ambient, key);
 
     this.grid = new THREE.GridHelper(720, 18, 0x2d3748, 0x202938);
+    this.grid.position.y = -0.5;
     this.scene.add(this.grid);
 
-    this.axes = new THREE.AxesHelper(180);
+    this.axes = makeRobotAxes();
     this.scene.add(this.axes);
+    this.container.dataset.robotAxes = "x:+sceneX,y:-sceneZ,z:+sceneY";
 
     this.materials = {
       base: new THREE.MeshStandardMaterial({ color: 0x0d1318, roughness: 0.55 }),
@@ -614,6 +810,7 @@ export class RobotView {
     this.lastRenderedAngles = null;
     this.previewAngles = null;
     this.renderRobot();
+    this.setAprilTagCalibration(this.config.camera?.calibration?.apriltag || null);
   }
 
   setAngles(angles) {
@@ -745,6 +942,30 @@ export class RobotView {
     this.render();
   }
 
+  setAprilTagCalibration(calibration) {
+    clearGroup(this.calibrationGroup);
+    if (!calibration) {
+      delete this.container.dataset.aprilTagCalibration;
+      this.render();
+      return;
+    }
+    const settings = calibration.settings || calibration;
+    const tags = settings.tags || {};
+    const defaultSize = Number(settings.tag_size_mm || 40);
+    Object.entries(tags).forEach(([tagId, tag]) => {
+      this.calibrationGroup.add(makeAprilTagMarker(tagId, tag, defaultSize));
+    });
+    const result = calibration.result || calibration.saved_result || settings.result;
+    if (result?.camera_to_robot) {
+      this.calibrationGroup.add(makeCameraPoseOverlay(result));
+      this.container.dataset.aprilTagCalibration = result.id || "live";
+    } else {
+      this.container.dataset.aprilTagCalibration = "tags-only";
+    }
+    this.calibrationGroup.visible = this.framesVisible;
+    this.render();
+  }
+
   setPreviewVisible(visible) {
     this.previewVisible = Boolean(visible);
     this.previewGroup.visible = this.previewVisible;
@@ -765,6 +986,7 @@ export class RobotView {
     this.framesVisible = Boolean(visible);
     this.grid.visible = this.framesVisible;
     this.axes.visible = this.framesVisible;
+    this.calibrationGroup.visible = this.framesVisible;
     this.renderRobot();
     this.render();
   }

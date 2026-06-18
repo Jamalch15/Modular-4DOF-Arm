@@ -17,6 +17,7 @@ Current scope:
 - ESP hardware-config sync on serial connect and Settings save
 - Safety checks for joint limits, known pose, stop, armed hardware mode, live-motion gating, and rate-limited motion
 - Named-position, task, tool, vision, diagnostics, and encoder-readback APIs for the demo path
+- AprilTag workspace calibration with multi-frame accumulation, camera-pose quality metrics, saved planar fallback, and 3D camera/tag overlays
 
 Not included in this iteration:
 
@@ -143,7 +144,9 @@ Use this for demo workflows.
 Use this for Cartesian target experiments.
 
 - Set `x`, `y`, `z` in millimeters and `phi` in degrees.
-- Sliders and viewport faders auto-preview the target while you move them.
+- With `Cart Jog` off, the sliders and viewport faders edit an IK target and only update the preview.
+- With `Cart Jog` on, the viewport faders become Cartesian velocity controls. Simulation can run directly; hardware also requires `Live Real`, `Armed`, a known pose, and valid synced configuration.
+- Releasing the last active fader sends `JOG STOP` and clears the live jog stream. It does not execute the previewed endpoint.
 - `Mode` selects joint-space or Cartesian linear path generation.
 - `Branch` selects the numerical IK seed preference.
 - `Preview` builds a path and updates the ghost arm, target marker, and path line.
@@ -168,6 +171,31 @@ Use this as the shared robot model for both FK and IK.
 - Edit Hardware IO placeholders for stepper pins, TB6600 microstep value, gear ratios, servo pulse range, and enabled axes.
 - Draft edits do not affect FK/IK until you press `Save`.
 - After saving, the backend reloads config, refreshes the dashboard from the saved model, and tries to resync the ESP if serial hardware is connected.
+
+### AprilTag Workspace Calibration
+
+The Settings tab includes a fixed-workspace AprilTag workflow using OpenCV's `DICT_APRILTAG_36H11` detector.
+
+Current assumptions:
+
+- Tag IDs `0, 1, 2, 3` are 40 mm squares.
+- Configured coordinates are the physical workspace corners in robot millimeters.
+- Tags lie on robot `Z=0` and their printed top edges point toward robot `+Y`.
+- Tags are placed inside the workspace. Their outer corners align with the workspace corners: tag 0 bottom-left, tag 1 bottom-right, tag 2 top-right, and tag 3 top-left.
+- For 40 mm tags, the resulting centers are `(-219, 106.5)`, `(219, 106.5)`, `(219, 381.5)`, and `(-219, 381.5)`.
+- The camera is fixed while samples are collected.
+
+Enter measured camera intrinsics (`fx`, `fy`, `cx`, `cy`, and distortion coefficients), save them, reset the sample session, then collect at least 12 observations of every required tag. `Save Pose` requires those per-tag sample counts, an accepted reprojection error, and a camera solution above and facing the workspace. `Verify` compares a fresh pose with the saved position and orientation.
+
+Repeated frames reduce corner noise by taking the median corner location for each tag. Frames with only some tags still contribute observations, but every required ID must reach the configured sample count before saving. Changing the camera source, resolution, or tag dictionary resets incompatible accumulated samples. If intrinsics are missing, the calibration view can still report a planar homography, but it deliberately refuses to claim a 6-DoF camera position.
+
+The same workflow is available from the command line:
+
+```powershell
+cd pc_app
+python tools/calibrate_apriltags.py --frames 20 --show
+python tools/calibrate_apriltags.py --frames 20 --save
+```
 
 ### Hardware IO
 
@@ -207,6 +235,15 @@ pytest
 
 The first tests cover config loading, joint limit validation, emergency-stop behavior, smoothing/rate limiting, FK, and protocol parsing/formatting.
 
+For live Cartesian jog debugging, run the repeatable simulator sweep:
+
+```powershell
+cd pc_app
+python tools/debug_cartesian_jog.py
+```
+
+It checks known joint poses against X/Y/Z jog commands and reports progress, lateral drift, alignment, and blocked steps. Near singularities, blocked directions are intentional: the solver rejects a local step that would be unreachable or drift sideways. Rejected samples are not accumulated, so a valid reverse command can proceed immediately.
+
 ## Configuration
 
 Use `config/robot.example.yaml` as the tracked template. The app prefers `config/robot.local.yaml` when it exists and saves measured calibration there so private hardware values do not have to be committed.
@@ -227,6 +264,8 @@ Important fields:
 - `joints[].hardware.servo`: PWM pin, pulse min/max, PWM frequency, servo range, neutral angle, and servo-to-joint gear ratio
 - `tools`: active gripper or magnet dimensions and IO settings
 - `encoders`: staged AS5048A readback and verification settings
+- `camera.intrinsics`: calibrated camera matrix and distortion coefficients
+- `camera.calibration.apriltag`: tag family, physical layout, quality thresholds, and saved camera pose
 
 ## Coordinate Frame And Kinematics
 
@@ -293,6 +332,13 @@ CONFIG BEGIN / CONFIG JOINT / CONFIG END
 ARM 0|1
 SETPOSE j1 j2 j3 j4
 MOVEJ j1 j2 j3 j4 speed accel
+JOGJ j1 j2 j3 j4 speed accel
+JOGV v1 v2 v3 v4 accel
+JOG STOP
+TRAJ BEGIN count=N duration=seconds speed=deg_per_s accel=deg_per_s2
+TRAJ POINT index=i t=seconds j1=deg j2=deg j3=deg j4=deg
+TRAJ START
+TRAJ CLEAR
 STOP
 ESTOP
 HOME
@@ -311,7 +357,7 @@ Optional/newer status fields include `known=0|1`, `pose_source=<manual|setpose|e
 `e2=<deg>`, `closed_loop=<off|readback|settle_correction>`, `tool_type=<generic|servo_gripper|electromagnet>`,
 `tool=<open|closed|on|off|moving|unknown>`, and `tool_value=<0.000..1.000>`.
 
-Working assumption: the PC remains the planner. The ESP is a safe target follower for PC-streamed `MOVEJ` waypoints.
+Working assumption: the PC remains the planner. Single endpoint moves use `MOVEJ`; multi-waypoint Cartesian/program paths upload a timed `TRAJ` queue; live Cartesian jog converts each current fader velocity sample into a small local differential-IK step and streams the resulting joint velocity with `JOGV`, followed by `JOG STOP` on release. Preview-only IK target editing does not send motion. `JOGJ` remains available as an absolute jog target compatibility command. This is still open-loop target/velocity following, not final closed-loop motion control.
 
 ## Bluetooth Notes
 

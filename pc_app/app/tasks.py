@@ -3,17 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 from .config import RobotConfig
-from .demo_settings import drop_zones, named_positions, task_defaults
+from .demo_settings import drop_zones, named_positions, task_defaults, tool_settings
 
 
-def _cartesian_target(raw: dict[str, Any]) -> dict[str, float]:
+def _cartesian_target(raw: dict[str, Any]) -> dict[str, Any]:
     target = raw.get("target") if isinstance(raw.get("target"), dict) else raw
-    return {
+    pose: dict[str, Any] = {
         "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
         "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
         "z_mm": float(target.get("z_mm", target.get("z", 0.0))),
-        "phi_deg": float(target.get("phi_deg", target.get("phi", 0.0))),
     }
+    raw_phi = target.get("phi_deg", target.get("phi"))
+    if bool(target.get("phi_auto", False)) or raw_phi is None:
+        pose["phi_auto"] = True
+    else:
+        pose["phi_deg"] = float(raw_phi)
+    return pose
 
 
 def _safe_waypoint(config: RobotConfig) -> dict[str, Any]:
@@ -23,6 +28,21 @@ def _safe_waypoint(config: RobotConfig) -> dict[str, Any]:
     if str(safe.get("type", "joint")).lower() == "joint":
         return {"type": "joint", "mode": "joint", "angles_deg": safe.get("angles_deg", config.home_pose)}
     return {"type": "cartesian", "mode": "joint", "target": _cartesian_target(safe)}
+
+
+def _tool_steps(config: RobotConfig) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    tool = tool_settings(config)
+    if str(tool.get("type", "")).lower() == "electromagnet":
+        return (
+            {"kind": "tool", "label": "magnet off", "action": "off"},
+            {"kind": "tool", "label": "magnet on", "action": "on"},
+            {"kind": "tool", "label": "magnet off", "action": "off"},
+        )
+    return (
+        {"kind": "tool", "label": "open gripper", "action": "open"},
+        {"kind": "tool", "label": "close gripper", "action": "close"},
+        {"kind": "tool", "label": "open gripper", "action": "open"},
+    )
 
 
 def build_pick_and_place_sequence(
@@ -51,17 +71,18 @@ def build_pick_and_place_sequence(
     above_drop = {**drop_pose, "z_mm": max(drop_pose["z_mm"], approach_height)}
     at_drop = {**drop_pose, "z_mm": dropoff_height}
     safe = _safe_waypoint(config)
+    release_tool, capture_tool, final_release_tool = _tool_steps(config)
 
     steps: list[dict[str, Any]] = [
         {"kind": "move", "label": "safe", "waypoint": safe},
-        {"kind": "tool", "label": "open gripper", "action": "open"},
+        release_tool,
         {"kind": "move", "label": "above pickup", "waypoint": {"type": "cartesian", "mode": "joint", "target": above_pick}},
         {"kind": "move", "label": "pickup", "waypoint": {"type": "cartesian", "mode": "linear", "target": at_pick}},
-        {"kind": "tool", "label": "close gripper", "action": "close"},
+        capture_tool,
         {"kind": "move", "label": "lift", "waypoint": {"type": "cartesian", "mode": "linear", "target": above_pick}},
         {"kind": "move", "label": "above dropoff", "waypoint": {"type": "cartesian", "mode": "joint", "target": above_drop}},
         {"kind": "move", "label": "dropoff", "waypoint": {"type": "cartesian", "mode": "linear", "target": at_drop}},
-        {"kind": "tool", "label": "open gripper", "action": "open"},
+        final_release_tool,
         {"kind": "move", "label": "lift from dropoff", "waypoint": {"type": "cartesian", "mode": "linear", "target": above_drop}},
         {"kind": "move", "label": "safe", "waypoint": safe},
     ]

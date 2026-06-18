@@ -55,26 +55,89 @@ def default_named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
 
 
 def named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
+    defaults = default_named_positions(config)
     raw = config.raw.get("named_positions")
     if isinstance(raw, dict) and raw:
-        merged = default_named_positions(config)
+        merged = deepcopy(defaults)
         merged.update(deepcopy(raw))
+        merged["home"] = defaults["home"]
         return merged
-    return default_named_positions(config)
+    return defaults
 
 
 def camera_settings(config: RobotConfig) -> dict[str, Any]:
     defaults = {
         "source_index": 0,
         "enabled": False,
+        "resolution": {
+            "width": 1280,
+            "height": 720,
+        },
+        "intrinsics": {
+            "source": "uncalibrated",
+            "fx_px": None,
+            "fy_px": None,
+            "cx_px": None,
+            "cy_px": None,
+            "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+        },
         "calibration": {
             "image_points": [],
             "robot_points": [],
+            "apriltag": {
+                "enabled": True,
+                "dictionary": "DICT_APRILTAG_36H11",
+                "tag_size_mm": 40.0,
+                "required_ids": [0, 1, 2, 3],
+                "min_tags_for_pose": 2,
+                "min_samples": 12,
+                "max_samples": 120,
+                "max_reprojection_error_px": 2.5,
+                "max_tilt_from_down_deg": 45.0,
+                "tags": {
+                    "0": {
+                        "workspace_corner_mm": [-239.0, 86.5, 0.0],
+                        "aligned_tag_corner": "bottom_left",
+                        "yaw_deg": 0.0,
+                    },
+                    "1": {
+                        "workspace_corner_mm": [239.0, 86.5, 0.0],
+                        "aligned_tag_corner": "bottom_right",
+                        "yaw_deg": 0.0,
+                    },
+                    "2": {
+                        "workspace_corner_mm": [239.0, 401.5, 0.0],
+                        "aligned_tag_corner": "top_right",
+                        "yaw_deg": 0.0,
+                    },
+                    "3": {
+                        "workspace_corner_mm": [-239.0, 401.5, 0.0],
+                        "aligned_tag_corner": "top_left",
+                        "yaw_deg": 0.0,
+                    },
+                },
+                "result": None,
+            },
         },
     }
     raw = config.raw.get("camera")
     if isinstance(raw, dict):
-        defaults.update(deepcopy(raw))
+        merged = deepcopy(defaults)
+        for key, value in raw.items():
+            if key not in {"resolution", "intrinsics", "calibration"} or not isinstance(value, dict):
+                merged[key] = deepcopy(value)
+        if isinstance(raw.get("resolution"), dict):
+            merged["resolution"].update(deepcopy(raw["resolution"]))
+        if isinstance(raw.get("intrinsics"), dict):
+            merged["intrinsics"].update(deepcopy(raw["intrinsics"]))
+        if isinstance(raw.get("calibration"), dict):
+            calibration = raw["calibration"]
+            for key, value in calibration.items():
+                if key != "apriltag" or not isinstance(value, dict):
+                    merged["calibration"][key] = deepcopy(value)
+            if isinstance(calibration.get("apriltag"), dict):
+                merged["calibration"]["apriltag"].update(deepcopy(calibration["apriltag"]))
+        return merged
     return defaults
 
 
@@ -87,29 +150,33 @@ def color_profiles(config: RobotConfig) -> dict[str, dict[str, Any]]:
     return deepcopy(DEFAULT_COLOR_PROFILES)
 
 
-def drop_zones(config: RobotConfig) -> dict[str, dict[str, float]]:
+def _pose_from_config_target(target: dict[str, Any], default_z_mm: float = 45.0) -> dict[str, Any]:
+    pose: dict[str, Any] = {
+        "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
+        "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
+        "z_mm": float(target.get("z_mm", target.get("z", default_z_mm))),
+    }
+    raw_phi = target.get("phi_deg", target.get("phi"))
+    if bool(target.get("phi_auto", False)) or raw_phi is None:
+        pose["phi_auto"] = True
+    else:
+        pose["phi_deg"] = float(raw_phi)
+    return pose
+
+
+def drop_zones(config: RobotConfig) -> dict[str, dict[str, Any]]:
     positions = named_positions(config)
-    zones: dict[str, dict[str, float]] = {}
+    zones: dict[str, dict[str, Any]] = {}
     for name in ["dropoff_a", "dropoff_b"]:
         value = positions.get(name, {})
         target = value.get("target") if isinstance(value.get("target"), dict) else value
         if isinstance(target, dict):
-            zones[name] = {
-                "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
-                "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
-                "z_mm": float(target.get("z_mm", target.get("z", 45.0))),
-                "phi_deg": float(target.get("phi_deg", target.get("phi", 0.0))),
-            }
+            zones[name] = _pose_from_config_target(target)
     raw = config.raw.get("drop_zones")
     if isinstance(raw, dict):
         for name, value in raw.items():
             if isinstance(value, dict):
-                zones[name] = {
-                    "x_mm": float(value.get("x_mm", value.get("x", 0.0))),
-                    "y_mm": float(value.get("y_mm", value.get("y", 0.0))),
-                    "z_mm": float(value.get("z_mm", value.get("z", 45.0))),
-                    "phi_deg": float(value.get("phi_deg", value.get("phi", 0.0))),
-                }
+                zones[name] = _pose_from_config_target(value)
     return zones
 
 

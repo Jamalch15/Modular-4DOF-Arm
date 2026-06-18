@@ -612,6 +612,7 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
             _write_dh_rows(data, kinematics["dh_rows"])
 
     joints = updates.get("joints")
+    home_pose_changed = False
     if isinstance(joints, list):
         data.setdefault("joints", [])
         for index, patch in enumerate(joints):
@@ -633,6 +634,8 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
             ]:
                 if key in patch:
                     joint[key] = float(patch[key])
+                    if key == "home_deg":
+                        home_pose_changed = True
             if "direction_sign" in patch:
                 joint["direction_sign"] = _direction_sign(
                     patch["direction_sign"], f"joints[{index}].direction_sign"
@@ -704,6 +707,7 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
         "color_profiles",
         "drop_zones",
         "task_defaults",
+        "path_defaults",
         "tool",
         "tools",
         "encoders",
@@ -712,6 +716,13 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
     ]:
         if key in updates and isinstance(updates[key], dict):
             data[key] = updates[key]
+
+    if home_pose_changed and len(data.get("joints", [])) == 4:
+        data.setdefault("named_positions", {})
+        data["named_positions"]["home"] = {
+            "type": "joint",
+            "angles_deg": [float(joint.get("home_deg", 0.0)) for joint in data["joints"]],
+        }
 
     with config_path.open("w", encoding="utf-8") as handle:
         yaml_rt.dump(data, handle)

@@ -114,6 +114,50 @@ def test_set_targets_surfaces_movej_error_without_status_poll(monkeypatch):
     assert main.state.motion_diagnostics["result"] == "failed"
 
 
+def test_waypoint_path_uses_queued_trajectory_protocol(monkeypatch):
+    reset_hardware_state()
+    start = main.config.home_pose.copy()
+    target = start.copy()
+    target[0] += 5.0
+    fake = FakeSerial(
+        [
+            "OK command=TRAJ_BEGIN count=2",
+            "OK command=TRAJ_POINT index=0",
+            "OK command=TRAJ_POINT index=1",
+            "OK command=TRAJ_START count=2 duration=1.000",
+            status_line_for(target, state="idle"),
+        ]
+    )
+    monkeypatch.setattr(main, "serial_client", fake)
+    monkeypatch.setattr(main, "hardware_ready_for_motion", lambda: (True, ""))
+    preview = {
+        "id": "test-preview",
+        "source": "test",
+        "mode": "linear",
+        "settings": {"global_speed_deg_s": 10.0, "global_accel_deg_s2": 20.0},
+        "trajectory": {
+            "ok": True,
+            "mode": "linear",
+            "duration_s": 1.0,
+            "waypoint_count": 2,
+            "waypoints": [start, target],
+            "segment_durations_s": [0.0, 1.0],
+            "time_from_start_s": [0.0, 1.0],
+            "errors": [],
+        },
+    }
+
+    asyncio.run(main.execute_waypoint_path(preview))
+
+    assert fake.sent[0].startswith("TRAJ BEGIN")
+    assert fake.sent[1].startswith("TRAJ POINT index=0")
+    assert fake.sent[2].startswith("TRAJ POINT index=1")
+    assert fake.sent[3] == "TRAJ START"
+    assert not any(line.startswith("MOVEJ") for line in fake.sent)
+    assert "STATUS" in fake.sent
+    assert main.state.motion_diagnostics["result"] == "reached"
+
+
 def test_wait_for_hardware_target_times_out_when_status_never_reaches_idle(monkeypatch):
     reset_hardware_state()
     target = main.config.home_pose.copy()

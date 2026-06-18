@@ -1,4 +1,6 @@
-from app.config import load_config
+from pytest import approx
+
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.kinematics import forward_kinematics
 from app.motion import (
     RateLimitedMotion,
@@ -131,6 +133,58 @@ def test_linear_cartesian_trajectory_rejects_unreachable_waypoint():
     )
 
     assert not trajectory["ok"]
+
+
+def test_linear_cartesian_trajectory_does_not_lock_to_seed_branch_label():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    start = [-45.0, 0.0, -45.0, -45.0]
+    reachable_end = [-45.0, 0.0, 15.0, -45.0]
+    target_fk = forward_kinematics(reachable_end, config.links)
+
+    trajectory = build_linear_cartesian_trajectory(
+        start,
+        {
+            "x_mm": target_fk["x_mm"],
+            "y_mm": target_fk["y_mm"],
+            "z_mm": target_fk["z_mm"],
+            "phi_deg": target_fk["tool_phi_deg"],
+        },
+        config.links,
+        config.joints,
+        {"cartesian_step_mm": 40.0, "waypoint_rate_hz": 10.0},
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    final_fk = forward_kinematics(trajectory["waypoints"][-1], config.links)
+    assert final_fk["x_mm"] == approx(target_fk["x_mm"], abs=1.0)
+    assert final_fk["y_mm"] == approx(target_fk["y_mm"], abs=1.0)
+    assert final_fk["z_mm"] == approx(target_fk["z_mm"], abs=1.0)
+    assert any(result["selected_branch"] != "current_seed" for result in trajectory["ik_results"])
+
+
+def test_linear_cartesian_trajectory_uses_streaming_path_timing():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    start = [-45.0, 0.0, -45.0, -45.0]
+    reachable_end = [-30.0, 15.0, 15.0, -30.0]
+    target_fk = forward_kinematics(reachable_end, config.links)
+
+    trajectory = build_linear_cartesian_trajectory(
+        start,
+        {
+            "x_mm": target_fk["x_mm"],
+            "y_mm": target_fk["y_mm"],
+            "z_mm": target_fk["z_mm"],
+            "phi_deg": target_fk["tool_phi_deg"],
+        },
+        config.links,
+        config.joints,
+        {"cartesian_step_mm": 15.0, "waypoint_rate_hz": 20.0},
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    assert len(trajectory["segment_durations_s"]) == trajectory["waypoint_count"]
+    assert sum(trajectory["segment_durations_s"]) == approx(trajectory["duration_s"])
+    assert min(trajectory["segment_durations_s"][1:]) < 0.5
 
 
 def test_program_trajectory_accepts_joint_and_cartesian_waypoints():

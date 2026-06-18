@@ -6,6 +6,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .apriltag_calibration import project_image_point_to_plane
+
 
 def planar_transform_from_points(
     image_points: list[list[float]],
@@ -76,11 +78,23 @@ def detect_configured_colors(
     calibration: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     transform = None
+    april_tag_result = None
     if calibration:
         image_points = calibration.get("image_points") or []
         robot_points = calibration.get("robot_points") or []
         if len(image_points) == 4 and len(robot_points) == 4:
             transform = planar_transform_from_points(image_points, robot_points)
+        april_tag = calibration.get("apriltag") if isinstance(calibration.get("apriltag"), dict) else {}
+        saved_result = april_tag.get("result") if isinstance(april_tag.get("result"), dict) else {}
+        if saved_result.get("accepted"):
+            april_tag_result = saved_result
+        elif transform is None:
+            planar = saved_result.get("planar") if isinstance(saved_result.get("planar"), dict) else {}
+            homography = planar.get("homography_image_to_robot")
+            if homography:
+                parsed = np.asarray(homography, dtype=np.float64)
+                if parsed.shape == (3, 3) and np.all(np.isfinite(parsed)):
+                    transform = parsed
 
     detections: list[dict[str, Any]] = []
     for name, profile in profiles.items():
@@ -89,10 +103,29 @@ def detect_configured_colors(
         result = detect_color_blob(image_bgr, profile)
         result["color"] = name
         result["drop_zone"] = profile.get("drop_zone")
-        if result.get("ok") and transform is not None:
+        if result.get("ok") and april_tag_result is not None:
+            center = result["center_px"]
+            try:
+                result["robot"] = project_image_point_to_plane(
+                    [center["x"], center["y"]],
+                    april_tag_result,
+                )
+                result["coordinate_source"] = "apriltag_camera_pose"
+                result["camera_pose_id"] = april_tag_result.get("id")
+                result["camera_pose_timestamp"] = april_tag_result.get("timestamp")
+                result["projection_quality"] = {
+                    "confidence": (april_tag_result.get("metrics") or {}).get("confidence"),
+                    "reprojection_rmse_px": (april_tag_result.get("metrics") or {}).get(
+                        "reprojection_rmse_px"
+                    ),
+                }
+            except ValueError as exc:
+                result["projection_error"] = str(exc)
+        elif result.get("ok") and transform is not None:
             center = result["center_px"]
             robot_xy = apply_planar_transform(transform, [center["x"], center["y"]])
             result["robot"] = robot_xy
+            result["coordinate_source"] = "planar_homography"
         detections.append(result)
     return detections
 

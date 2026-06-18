@@ -14,6 +14,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .apriltag_calibration import (
+    AprilTagCalibrationSession,
+    annotate_apriltag_frame,
+    april_tag_settings,
+    configured_tag_ids,
+    detect_apriltags,
+    estimate_camera_pose,
+)
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
     camera_settings,
@@ -31,7 +39,7 @@ from .demo_settings import (
     validate_named_position,
 )
 from .event_log import EventLog
-from .kinematics import COORDINATE_FRAME, forward_kinematics, inverse_kinematics
+from .kinematics import COORDINATE_FRAME, differential_ik_step, forward_kinematics, inverse_kinematics
 from .motion import (
     RateLimitedMotion,
     build_joint_trajectory,
@@ -45,11 +53,17 @@ from .protocol import (
     format_estop,
     format_hello,
     format_home,
+    format_jog_stop,
+    format_jogj,
+    format_jogv,
     format_movej,
     format_setpose,
     format_status,
     format_stop,
     format_tool,
+    format_traj_begin,
+    format_traj_point,
+    format_traj_start,
     parse_status,
 )
 from .robot_state import MotionState, RobotState
@@ -88,6 +102,20 @@ live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
 event_log = EventLog()
 active_motion_run_id: str | None = None
+simulation_trajectory_active = False
+MAX_TRAJECTORY_UPLOAD_POINTS = 220
+CARTESIAN_JOG_STALE_S = 0.35
+CARTESIAN_JOG_MIN_DT_S = 0.01
+CARTESIAN_JOG_MAX_DT_S = 0.08
+cartesian_jog_runtime: dict[str, Any] = {
+    "active": False,
+    "last_update": 0.0,
+    "last_status_poll": 0.0,
+    "seed_deg": None,
+    "joint_velocity_deg_s": [0.0, 0.0, 0.0, 0.0],
+    "run_id": None,
+}
+april_tag_session = AprilTagCalibrationSession(camera_settings(config))
 
 app = FastAPI(title="4DOF Robot Arm Control Dashboard")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -165,6 +193,17 @@ class LiveTargetRequest(BaseModel):
     settings: PathSettingsRequest | None = None
 
 
+class CartesianJogRequest(BaseModel):
+    vx_mm_s: float = 0.0
+    vy_mm_s: float = 0.0
+    vz_mm_s: float = 0.0
+    vphi_deg_s: float = 0.0
+    dt_s: float | None = None
+    tcp_speed_mm_s: float | None = None
+    phi_speed_deg_s: float | None = None
+    settings: PathSettingsRequest | None = None
+
+
 class CalibrationRequest(BaseModel):
     links_mm: dict[str, float] | None = None
     kinematics: dict[str, Any] | None = None
@@ -176,6 +215,7 @@ class CalibrationRequest(BaseModel):
     color_profiles: dict[str, dict[str, Any]] | None = None
     drop_zones: dict[str, dict[str, Any]] | None = None
     task_defaults: dict[str, Any] | None = None
+    path_defaults: dict[str, Any] | None = None
     tool: dict[str, Any] | None = None
     tools: dict[str, Any] | None = None
     encoders: dict[str, Any] | None = None
@@ -213,6 +253,17 @@ class VisionDetectRequest(BaseModel):
     profile_names: list[str] | None = None
 
 
+class AprilTagCaptureRequest(BaseModel):
+    image_b64: str | None = None
+    sample_count: int = 1
+    sample_interval_ms: int = 80
+    accumulate: bool = True
+
+
+class AprilTagSaveRequest(BaseModel):
+    require_all_tags: bool = True
+
+
 class TaskPreviewRequest(BaseModel):
     task: str = "pick_and_place"
     object_target: dict[str, Any] | None = None
@@ -243,6 +294,7 @@ def public_config() -> dict[str, Any]:
         "color_profiles": color_profiles(config),
         "drop_zones": drop_zones(config),
         "task_defaults": task_defaults(config),
+        "path_defaults": default_path_settings(),
         "tool": tool_settings(config),
         "tools": tools_settings(config),
         "encoders": encoder_settings(config),
@@ -309,7 +361,10 @@ def evaluate_hardware_config() -> dict[str, Any]:
         axis_states.append(state_name)
         enabled_bits.append("1" if enabled and state_name == "hardware" else "0")
 
+    errors.extend(active_tool_hardware_errors())
     if any(axis == "invalid" for axis in axis_states):
+        mode = "invalid"
+    elif errors:
         mode = "invalid"
     elif all(axis == "hardware" for axis in axis_states):
         mode = "hardware"
@@ -346,6 +401,80 @@ def hardware_ready_for_motion() -> tuple[bool, str]:
     if state.config_sync_status != "synced":
         return False, f"hardware config is not synced ({state.config_sync_status})"
     return True, ""
+
+
+def _tool_pin(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be an integer GPIO or -1 for unknown")
+    pin = int(value)
+    if pin < -1 or pin > 48:
+        raise ValueError(f"{name} must be between -1 and 48")
+    return pin
+
+
+def validate_tools_payload(tools: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    active = str(tools.get("active", "gripper"))
+    presets = tools.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return ["tools.presets must define at least one tool"]
+    if active not in presets:
+        errors.append(f"active tool {active} is missing from presets")
+
+    for name, preset in presets.items():
+        if not isinstance(preset, dict):
+            errors.append(f"tool {name} must be a mapping")
+            continue
+        tool_type = str(preset.get("type", "generic"))
+        if tool_type not in {"servo_gripper", "electromagnet", "generic"}:
+            errors.append(f"tool {name} has unsupported type {tool_type}")
+        tcp = preset.get("tcp_offset_mm")
+        if not isinstance(tcp, dict):
+            errors.append(f"tool {name} must define tcp_offset_mm")
+            tcp = {}
+        for axis in ["x", "y", "z"]:
+            try:
+                float(tcp.get(axis, 0.0))
+            except (TypeError, ValueError):
+                errors.append(f"tool {name} tcp_offset_mm.{axis} must be numeric")
+
+        io = preset.get("io") if isinstance(preset.get("io"), dict) else {}
+        try:
+            if tool_type == "servo_gripper":
+                open_value = float(preset.get("open_value", 0.0))
+                closed_value = float(preset.get("closed_value", 1.0))
+                if not 0.0 <= open_value <= 1.0 or not 0.0 <= closed_value <= 1.0:
+                    errors.append(f"tool {name} open_value and closed_value must be in 0.0..1.0")
+                _tool_pin(io.get("pwm_pin", -1), f"tool {name} pwm_pin")
+                pulse_min = int(io.get("pulse_min_us", 500))
+                pulse_max = int(io.get("pulse_max_us", 2500))
+                frequency = int(io.get("pwm_frequency_hz", 50))
+                if pulse_min <= 0 or pulse_max <= pulse_min:
+                    errors.append(f"tool {name} pulse_min_us must be positive and below pulse_max_us")
+                if frequency <= 0:
+                    errors.append(f"tool {name} pwm_frequency_hz must be positive")
+            elif tool_type == "electromagnet":
+                _tool_pin(io.get("pin", -1), f"tool {name} pin")
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
+    return errors
+
+
+def active_tool_hardware_errors() -> list[str]:
+    tools = tools_settings(config)
+    errors = validate_tools_payload(tools)
+    active = str(tools.get("active", "gripper"))
+    preset = tools.get("presets", {}).get(active, {})
+    tool_type = str(preset.get("type", "generic")) if isinstance(preset, dict) else "generic"
+    io = preset.get("io") if isinstance(preset.get("io"), dict) else {}
+    try:
+        if tool_type == "servo_gripper" and _tool_pin(io.get("pwm_pin", -1), f"tool {active} pwm_pin") < 0:
+            errors.append(f"active tool {active} is missing gripper PWM pin")
+        if tool_type == "electromagnet" and _tool_pin(io.get("pin", -1), f"tool {active} pin") < 0:
+            errors.append(f"active tool {active} is missing magnet GPIO pin")
+    except ValueError as exc:
+        errors.append(str(exc))
+    return errors
 
 
 def config_sync_ready() -> tuple[bool, str]:
@@ -385,14 +514,21 @@ def links_from_override(links_mm: dict[str, float] | None) -> LinkConfig:
 
 
 def default_path_settings() -> dict[str, Any]:
-    return {
+    defaults = {
         "global_speed_deg_s": min(joint.max_speed_deg_s for joint in config.joints),
         "global_accel_deg_s2": config.motion.acceleration_deg_s2,
         "waypoint_rate_hz": config.motion.command_rate_limit_hz,
+        "cartesian_step_mm": 10.0,
         "planner_type": "s_curve",
+        "jerk_percent": 25.0,
+        "blend_percent": 0.0,
         "per_joint_speed_deg_s": [joint.max_speed_deg_s for joint in config.joints],
         "per_joint_accel_deg_s2": [joint.max_accel_deg_s2 for joint in config.joints],
     }
+    stored = config.raw.get("path_defaults")
+    if isinstance(stored, dict):
+        defaults.update({key: value for key, value in stored.items() if value is not None})
+    return defaults
 
 
 def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
@@ -404,6 +540,131 @@ def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> d
     return merged
 
 
+def reset_cartesian_jog_runtime() -> None:
+    cartesian_jog_runtime.update(
+        {
+            "active": False,
+            "last_update": 0.0,
+            "last_status_poll": 0.0,
+            "seed_deg": None,
+            "joint_velocity_deg_s": [0.0 for _ in config.joints],
+            "run_id": None,
+        }
+    )
+
+
+def _clamp_scalar(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
+
+
+def _cartesian_jog_dt(requested_dt_s: float | None) -> float:
+    if requested_dt_s is None:
+        now = monotonic()
+        previous = float(cartesian_jog_runtime.get("last_update") or 0.0)
+        if previous > 0.0:
+            return _clamp_scalar(now - previous, CARTESIAN_JOG_MIN_DT_S, CARTESIAN_JOG_MAX_DT_S)
+        return 1.0 / max(config.motion.command_rate_limit_hz, 20.0)
+    return _clamp_scalar(float(requested_dt_s), CARTESIAN_JOG_MIN_DT_S, CARTESIAN_JOG_MAX_DT_S)
+
+
+def _cartesian_jog_seed(now_s: float) -> list[float]:
+    seed = cartesian_jog_runtime.get("seed_deg")
+    last_update = float(cartesian_jog_runtime.get("last_update") or 0.0)
+    if not cartesian_jog_runtime.get("active") or seed is None or now_s - last_update > CARTESIAN_JOG_STALE_S:
+        cartesian_jog_runtime["joint_velocity_deg_s"] = [0.0 for _ in config.joints]
+        return [float(value) for value in state.reported_angles_deg]
+    if state.simulation:
+        return [float(value) for value in state.reported_angles_deg]
+    return [float(value) for value in seed]
+
+
+def _cartesian_jog_task_delta(
+    vx_mm_s: float,
+    vy_mm_s: float,
+    vz_mm_s: float,
+    vphi_deg_s: float,
+    dt_s: float,
+) -> dict[str, float]:
+    """Convert one velocity sample into a local resolved-rate IK step.
+
+    Do not accumulate an endpoint goal here. A rejected local step must not
+    remain hidden in the next request, otherwise reversing the fader continues
+    chasing the stale unreachable goal until the operator releases it.
+    """
+    return {
+        "x_mm": float(vx_mm_s) * dt_s,
+        "y_mm": float(vy_mm_s) * dt_s,
+        "z_mm": float(vz_mm_s) * dt_s,
+        "phi_deg": float(vphi_deg_s) * dt_s,
+    }
+
+
+def _joint_limits_from_settings(settings: dict[str, Any]) -> tuple[list[float], list[float]]:
+    speed_limits = []
+    accel_limits = []
+    per_speed = settings.get("per_joint_speed_deg_s")
+    per_accel = settings.get("per_joint_accel_deg_s2")
+    for index, joint in enumerate(config.joints):
+        speed = float(settings.get("global_speed_deg_s") or joint.max_speed_deg_s)
+        accel = float(settings.get("global_accel_deg_s2") or config.motion.acceleration_deg_s2)
+        if isinstance(per_speed, list) and index < len(per_speed) and per_speed[index] is not None:
+            speed = min(speed, float(per_speed[index]))
+        if isinstance(per_accel, list) and index < len(per_accel) and per_accel[index] is not None:
+            accel = min(accel, float(per_accel[index]))
+        speed_limits.append(max(0.01, min(joint.max_speed_deg_s, speed)))
+        accel_limits.append(max(0.01, min(joint.max_accel_deg_s2, accel)))
+    return speed_limits, accel_limits
+
+
+def _limit_cartesian_jog_target(
+    seed_deg: list[float],
+    requested_target_deg: list[float],
+    dt_s: float,
+    speed_limits_deg_s: list[float],
+    accel_limits_deg_s2: list[float],
+) -> tuple[list[float], list[float], list[str]]:
+    previous_velocity = [
+        float(value)
+        for value in (cartesian_jog_runtime.get("joint_velocity_deg_s") or [0.0 for _ in config.joints])
+    ]
+    desired_velocity = [
+        (float(requested) - float(seed)) / max(dt_s, 1e-6)
+        for seed, requested in zip(seed_deg, requested_target_deg, strict=True)
+    ]
+    speed_scale = 1.0
+    for velocity, limit in zip(desired_velocity, speed_limits_deg_s, strict=True):
+        if abs(velocity) > limit:
+            speed_scale = min(speed_scale, limit / max(abs(velocity), 1e-9))
+    desired_velocity = [velocity * speed_scale for velocity in desired_velocity]
+
+    velocity_delta = [
+        desired - previous
+        for desired, previous in zip(desired_velocity, previous_velocity, strict=True)
+    ]
+    accel_scale = 1.0
+    for delta_v, limit in zip(velocity_delta, accel_limits_deg_s2, strict=True):
+        max_velocity_delta = limit * dt_s
+        if abs(delta_v) > max_velocity_delta:
+            accel_scale = min(accel_scale, max_velocity_delta / max(abs(delta_v), 1e-9))
+    limited_velocity = [
+        previous + delta_v * accel_scale
+        for previous, delta_v in zip(previous_velocity, velocity_delta, strict=True)
+    ]
+
+    target: list[float] = []
+    velocities: list[float] = []
+    notes: list[str] = []
+    for index, (seed, velocity, joint) in enumerate(zip(seed_deg, limited_velocity, config.joints, strict=True)):
+        next_angle = float(seed) + velocity * dt_s
+        clamped = _clamp_scalar(next_angle, joint.min_deg, joint.max_deg)
+        if abs(clamped - next_angle) > 1e-6:
+            velocity = (clamped - float(seed)) / max(dt_s, 1e-6)
+            notes.append(f"{joint.name} limit")
+        target.append(clamped)
+        velocities.append(velocity)
+    return target, velocities, notes
+
+
 def cancel_task(task: asyncio.Task[None] | None) -> None:
     if task is not None and not task.done():
         task.cancel()
@@ -413,10 +674,12 @@ def cancel_motion_tasks() -> None:
     cancel_task(path_task)
     cancel_task(live_task)
     cancel_task(task_task)
+    reset_cartesian_jog_runtime()
 
 
 def disable_live_motion(command: str | None = None) -> None:
     state.live_motion_enabled = False
+    reset_cartesian_jog_runtime()
     if command:
         state.last_command = command
 
@@ -649,6 +912,148 @@ def send_movej_and_read_response(command: str) -> str:
     return response
 
 
+def send_jogj_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=JOGJ", "ERR"), timeout_s=0.75)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def send_jogv_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=JOGV", "ERR"), timeout_s=0.75)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def send_jog_stop_and_read_response() -> str:
+    serial_client.clear_input()
+    serial_client.send_line(format_jog_stop())
+    response = read_serial_until_any(("OK command=JOG_STOP", "ERR"), timeout_s=0.75)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def _trajectory_times_s(trajectory: dict[str, Any], waypoint_count: int) -> list[float]:
+    raw_times = trajectory.get("time_from_start_s")
+    if isinstance(raw_times, list) and len(raw_times) == waypoint_count:
+        times = [max(0.0, float(value)) for value in raw_times]
+    else:
+        elapsed = 0.0
+        times = []
+        durations = trajectory.get("segment_durations_s", [])
+        for index in range(waypoint_count):
+            if index < len(durations):
+                elapsed += max(0.0, float(durations[index]))
+            elif waypoint_count > 1:
+                elapsed = float(trajectory.get("duration_s", elapsed)) * index / (waypoint_count - 1)
+            times.append(elapsed)
+
+    if not times:
+        return []
+    first_time = times[0]
+    if first_time != 0.0:
+        times = [max(0.0, value - first_time) for value in times]
+    for index in range(1, len(times)):
+        if times[index] <= times[index - 1]:
+            times[index] = times[index - 1] + 0.001
+    return times
+
+
+def _interpolate_timed_waypoint(
+    waypoints: list[list[float]],
+    times_s: list[float],
+    sample_time_s: float,
+) -> list[float]:
+    if sample_time_s <= times_s[0]:
+        return waypoints[0].copy()
+    if sample_time_s >= times_s[-1]:
+        return waypoints[-1].copy()
+    for index in range(len(times_s) - 1):
+        t0 = times_s[index]
+        t1 = times_s[index + 1]
+        if sample_time_s <= t1:
+            fraction = (sample_time_s - t0) / max(t1 - t0, 1e-9)
+            return [
+                float(start) + (float(end) - float(start)) * fraction
+                for start, end in zip(waypoints[index], waypoints[index + 1], strict=True)
+            ]
+    return waypoints[-1].copy()
+
+
+def trajectory_upload_points(
+    trajectory: dict[str, Any],
+    max_points: int = MAX_TRAJECTORY_UPLOAD_POINTS,
+) -> list[tuple[float, list[float]]]:
+    waypoints = [[float(value) for value in waypoint] for waypoint in trajectory.get("waypoints", [])]
+    if len(waypoints) < 2:
+        return [(0.0, waypoints[0])] if waypoints else []
+    times = _trajectory_times_s(trajectory, len(waypoints))
+    if len(times) != len(waypoints):
+        return []
+    if len(waypoints) <= max_points:
+        return list(zip(times, waypoints, strict=True))
+
+    duration_s = times[-1]
+    if duration_s <= 0.0:
+        return [(0.0, waypoints[0]), (0.001, waypoints[-1])]
+    sample_count = max(2, max_points)
+    samples: list[tuple[float, list[float]]] = []
+    for index in range(sample_count):
+        sample_time = duration_s * index / (sample_count - 1)
+        samples.append((sample_time, _interpolate_timed_waypoint(waypoints, times, sample_time)))
+    return samples
+
+
+def send_trajectory_and_read_response(
+    trajectory: dict[str, Any],
+    speed_deg_s: float,
+    accel_deg_s2: float,
+) -> dict[str, Any]:
+    points = trajectory_upload_points(trajectory)
+    if len(points) < 2:
+        raise SerialClientError("trajectory upload requires at least two timed points")
+    duration_s = points[-1][0]
+    if duration_s <= 0.0:
+        raise SerialClientError("trajectory upload duration must be positive")
+
+    serial_client.clear_input()
+    begin_line = format_traj_begin(len(points), duration_s, speed_deg_s, accel_deg_s2)
+    serial_client.send_line(begin_line)
+    response = read_serial_until_any(("OK command=TRAJ_BEGIN", "ERR"), timeout_s=1.0)
+    if response.startswith("ERR"):
+        if "UNKNOWN" in response or "unknown" in response:
+            raise SerialClientError("controller firmware does not support TRAJ; upload the updated ESP firmware")
+        raise SerialClientError(response)
+
+    for index, (time_s, joints_deg) in enumerate(points):
+        serial_client.send_line(format_traj_point(index, time_s, joints_deg))
+        response = read_serial_until_any(("OK command=TRAJ_POINT", "ERR"), timeout_s=1.0)
+        if response.startswith("ERR"):
+            raise SerialClientError(response)
+
+    serial_client.send_line(format_traj_start())
+    response = read_serial_until_any(("OK command=TRAJ_START", "ERR"), timeout_s=1.0)
+    state.last_controller_response = response
+    update_motion_diagnostics(
+        controller_response=response,
+        execution_state="accepted" if response.startswith("OK") else "failed",
+        uploaded_waypoint_count=len(points),
+        uploaded_duration_s=duration_s,
+    )
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return {"response": response, "point_count": len(points), "duration_s": duration_s}
+
+
 async def wait_for_hardware_target(
     target_deg: list[float],
     timeout_s: float,
@@ -690,7 +1095,7 @@ def sync_hardware_config() -> dict[str, Any]:
 
     try:
         serial_client.clear_input()
-        for line in format_config_lines(config.joints):
+        for line in format_config_lines(config.joints, tools_settings(config)):
             serial_client.send_line(line)
         response = read_serial_until_any(("OK command=CONFIG", "ERR"), timeout_s=2.0)
     except SerialClientError as exc:
@@ -1045,6 +1450,75 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
         await broadcast_state()
 
 
+async def execute_simulated_waypoint_trajectory(trajectory: dict[str, Any], run_id: str) -> None:
+    global simulation_trajectory_active
+    waypoints = [[float(value) for value in waypoint] for waypoint in trajectory.get("waypoints", [])]
+    if len(waypoints) < 2:
+        state.set_error("simulation trajectory requires at least two waypoints", fault=True)
+        finish_motion_diagnostics("failed", state.last_error, run_id)
+        await broadcast_state()
+        return
+
+    times_s = _trajectory_times_s(trajectory, len(waypoints))
+    if len(times_s) != len(waypoints) or times_s[-1] <= 0.0:
+        state.set_error("simulation trajectory timing is invalid", fault=True)
+        finish_motion_diagnostics("failed", state.last_error, run_id)
+        await broadcast_state()
+        return
+
+    simulation_trajectory_active = True
+    final_target = waypoints[-1]
+    state.target_angles_deg = final_target.copy()
+    state.motion_state = MotionState.MOVING
+    state.motion_execution_state = "executing"
+    state.clear_error()
+    limiter.reset(state.reported_angles_deg)
+    started = monotonic()
+    sample_interval_s = 1.0 / max(config.motion.update_rate_hz, 1.0)
+
+    try:
+        while True:
+            if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                finish_motion_diagnostics("stopped", state.motion_state.value, run_id)
+                return
+
+            elapsed_s = min(monotonic() - started, times_s[-1])
+            current = _interpolate_timed_waypoint(waypoints, times_s, elapsed_s)
+            state.reported_angles_deg = current
+            state.fk = forward_kinematics(current, config.links)
+            limiter.reset(current)
+            waypoint_index = 1
+            for index, waypoint_time_s in enumerate(times_s):
+                if elapsed_s >= waypoint_time_s:
+                    waypoint_index = index + 1
+            update_motion_diagnostics(
+                run_id,
+                execution_state="executing",
+                result="executing",
+                current_waypoint_index=waypoint_index,
+                current_waypoint_total=len(waypoints),
+                active_target_deg=current,
+            )
+            record_motion_sample(run_id)
+            await broadcast_state()
+
+            if elapsed_s >= times_s[-1]:
+                state.reported_angles_deg = final_target.copy()
+                state.target_angles_deg = final_target.copy()
+                state.fk = forward_kinematics(final_target, config.links)
+                limiter.reset(final_target)
+                state.motion_state = MotionState.IDLE
+                finish_motion_diagnostics("reached", run_id=run_id)
+                await broadcast_state()
+                return
+            await asyncio.sleep(sample_interval_s)
+    except asyncio.CancelledError:
+        finish_motion_diagnostics("stopped", "cancelled", run_id)
+        raise
+    finally:
+        simulation_trajectory_active = False
+
+
 async def execute_waypoint_path(preview: dict[str, Any]) -> None:
     trajectory = preview["trajectory"]
     waypoints = trajectory.get("waypoints", [])
@@ -1063,6 +1537,89 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
         step_index=int(preview.get("task_step_index", 0) or 0),
         step_total=int(preview.get("task_step_total", 0) or 0),
     )
+
+    if not waypoints:
+        state.set_error("trajectory has no waypoints", fault=True)
+        finish_motion_diagnostics("failed", state.last_error, run_id)
+        await broadcast_state()
+        return
+
+    if not state.simulation:
+        speed_value = (
+            float(speed)
+            if speed is not None and float(speed) > 0
+            else min(joint.max_speed_deg_s for joint in config.joints)
+        )
+        accel_value = (
+            float(accel)
+            if accel is not None and float(accel) > 0
+            else config.motion.acceleration_deg_s2
+        )
+        try:
+            if not serial_client.is_connected:
+                raise SerialClientError("trajectory execution requires serial hardware connection")
+            update_motion_diagnostics(
+                run_id,
+                execution_state="uploading",
+                result="executing",
+                current_waypoint_index=0,
+                current_waypoint_total=len(waypoints),
+                active_target_deg=final_target,
+            )
+            state.motion_state = MotionState.MOVING
+            state.last_command = f"TRAJ_UPLOAD {len(waypoints)}"
+            state.clear_error()
+            await broadcast_state()
+
+            upload = send_trajectory_and_read_response(trajectory, speed_value, accel_value)
+            state.target_angles_deg = final_target.copy()
+            limiter.current_deg = state.reported_angles_deg.copy()
+            limiter.set_target(state.target_angles_deg)
+            state.last_command = format_traj_start()
+            state.motion_state = MotionState.MOVING
+            update_motion_diagnostics(
+                run_id,
+                execution_state="executing",
+                result="executing",
+                current_waypoint_index=len(waypoints),
+                current_waypoint_total=len(waypoints),
+                active_target_deg=final_target,
+                uploaded_waypoint_count=upload["point_count"],
+                uploaded_duration_s=upload["duration_s"],
+            )
+            log_event(
+                "motion",
+                "trajectory uploaded",
+                preview_id=preview.get("id", ""),
+                waypoint_count=len(waypoints),
+                uploaded_waypoint_count=upload["point_count"],
+            )
+            await broadcast_state()
+
+            ok, message = await wait_for_hardware_target(
+                final_target,
+                timeout_s=max(1.0, float(trajectory.get("duration_s", upload["duration_s"])) * 2.0 + 2.0),
+                tolerance_deg=float(calibration_settings(config).get("movement_tolerance_deg", 0.2)),
+                poll_interval_s=0.20,
+            )
+            if ok:
+                finish_motion_diagnostics("reached", run_id=run_id)
+            else:
+                state.set_error(message, fault=True)
+                finish_motion_diagnostics("failed", message, run_id)
+        except asyncio.CancelledError:
+            finish_motion_diagnostics("stopped", "cancelled", run_id)
+            raise
+        except (SerialClientError, ValueError) as exc:
+            state.set_error(str(exc), fault=True)
+            finish_motion_diagnostics("failed", str(exc), run_id)
+        finally:
+            await broadcast_state()
+        return
+
+    if state.simulation:
+        await execute_simulated_waypoint_trajectory(trajectory, run_id)
+        return
 
     try:
         for index, waypoint in enumerate(waypoints):
@@ -1092,7 +1649,11 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
                 break
 
             wait_s = float(segment_durations[index]) if index < len(segment_durations) else 0.05
+            is_final_waypoint = index == len(waypoints) - 1
             if state.simulation:
+                if not is_final_waypoint:
+                    await asyncio.sleep(max(wait_s, 0.0))
+                    continue
                 deadline = monotonic() + max(1.0, wait_s * 4.0 + 0.5)
                 while monotonic() < deadline:
                     if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
@@ -1109,7 +1670,7 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
                         state.set_error(str(exc), fault=True)
                         finish_motion_diagnostics("failed", str(exc), run_id)
                         break
-                if index == len(waypoints) - 1:
+                if is_final_waypoint:
                     ok, message = await wait_for_hardware_target(
                         waypoint_values,
                         timeout_s=max(1.0, wait_s * 2.0 + 1.0),
@@ -1137,13 +1698,36 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
 
 async def apply_tool_action(action: str, value: float | None = None, tool: str | None = None) -> dict[str, Any]:
     normalized = action.strip().lower()
-    active_tool = tool or str(tools_settings(config).get("active", "gripper"))
+    tools = tools_settings(config)
+    configured_active = str(tools.get("active", "gripper"))
+    active_tool = tool or configured_active
+    presets = tools.get("presets", {})
+    preset = presets.get(active_tool, {}) if isinstance(presets, dict) else {}
+    if active_tool != configured_active:
+        state.set_error(f"select {active_tool} before sending tool commands")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not isinstance(preset, dict) or not preset:
+        state.set_error(f"tool preset {active_tool} is missing")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    tool_type = str(preset.get("type", "generic"))
     state.active_tool = active_tool
-    state.tool_type = str((tools_settings(config).get("presets", {}).get(active_tool, {}) or {}).get("type", "unknown"))
+    state.tool_type = tool_type
+
+    if tool_type == "servo_gripper" and normalized not in {"open", "close", "set"}:
+        state.set_error(f"{active_tool} does not support TOOL {normalized.upper()}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if tool_type == "electromagnet" and normalized not in {"on", "off"}:
+        state.set_error(f"{active_tool} does not support TOOL {normalized.upper()}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
     if normalized in {"open", "close"}:
         command = format_tool(normalized)
         state.tool_state = "open" if normalized == "open" else "closed"
-        state.tool_value = tool_settings(config).get("open_value" if normalized == "open" else "closed_value")
+        state.tool_value = preset.get("open_value" if normalized == "open" else "closed_value")
     elif normalized in {"on", "off"}:
         command = format_tool(normalized)
         state.tool_state = normalized
@@ -1166,6 +1750,11 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if not state.hardware_armed:
         state.set_error("tool commands require the Armed toggle")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    tool_errors = active_tool_hardware_errors()
+    if tool_errors:
+        state.set_error("; ".join(tool_errors))
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
 
@@ -1244,6 +1833,7 @@ def reload_runtime_config() -> None:
     state.active_tool = str(tools_settings(config).get("active", "gripper"))
     state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
     state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
+    april_tag_session.configure(camera_settings(config), preserve_frames=True)
     if not state.simulation:
         apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
     else:
@@ -1316,7 +1906,7 @@ async def startup() -> None:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/config")
@@ -1420,8 +2010,15 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
             merged = presets.get(name, {})
             merged.update(preset)
             presets[name] = merged
+    errors = validate_tools_payload(tools)
+    if errors:
+        state.set_error("; ".join(errors))
+        await broadcast_state()
+        return {"ok": False, "errors": errors, "error": state.last_error, "state": state.to_dict()}
     try:
-        save_calibration_updates(ensure_local_config(), {"tools": tools})
+        calibration = calibration_settings(config)
+        calibration["tool_dimensions_validated"] = False
+        save_calibration_updates(ensure_local_config(), {"tools": tools, "calibration": calibration})
         reload_runtime_config()
         log_validation_warnings()
     except Exception as exc:
@@ -1443,6 +2040,44 @@ async def get_vision_config() -> dict[str, Any]:
     }
 
 
+def open_camera(camera: dict[str, Any]) -> Any:
+    import cv2
+
+    capture = cv2.VideoCapture(int(camera.get("source_index", 0)))
+    resolution = camera.get("resolution") if isinstance(camera.get("resolution"), dict) else {}
+    width = int(resolution.get("width", 0) or 0)
+    height = int(resolution.get("height", 0) or 0)
+    if width > 0:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height > 0:
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError("could not open camera")
+    return capture
+
+
+def capture_camera_frame(camera: dict[str, Any]) -> Any:
+    capture = open_camera(camera)
+    ok, image = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError("could not read camera frame")
+    return image
+
+
+def april_tag_status_payload() -> dict[str, Any]:
+    camera = camera_settings(config)
+    settings = april_tag_settings(camera)
+    saved = settings.get("result") if isinstance(settings.get("result"), dict) else None
+    return {
+        "camera": camera,
+        "settings": settings,
+        "session": april_tag_session.summary(),
+        "saved_result": saved,
+    }
+
+
 @app.post("/api/vision/settings")
 async def save_vision_settings(request: VisionSettingsRequest) -> dict[str, Any]:
     updates = request.__dict__
@@ -1458,6 +2093,178 @@ async def save_vision_settings(request: VisionSettingsRequest) -> dict[str, Any]
     return {"ok": True, "config": public_config(), "state": state.to_dict()}
 
 
+@app.get("/api/vision/apriltag/status")
+async def get_apriltag_status() -> dict[str, Any]:
+    return {"ok": True, **april_tag_status_payload()}
+
+
+@app.post("/api/vision/apriltag/reset")
+async def reset_apriltag_session() -> dict[str, Any]:
+    april_tag_session.configure(camera_settings(config), preserve_frames=False)
+    log_event("vision", "AprilTag calibration session reset")
+    return {"ok": True, **april_tag_status_payload()}
+
+
+@app.post("/api/vision/apriltag/capture")
+async def capture_apriltag_sample(request: AprilTagCaptureRequest) -> dict[str, Any]:
+    camera = camera_settings(config)
+    april_tag_session.configure(camera, preserve_frames=True)
+    sample_count = max(1, min(int(request.sample_count), 60))
+    interval_s = max(0.0, min(float(request.sample_interval_ms) / 1000.0, 1.0))
+    latest_image = None
+    latest_detections = []
+    try:
+        if request.image_b64:
+            sample_count = 1
+            images = [decode_image_b64(request.image_b64)]
+        else:
+            images = []
+            capture = open_camera(camera)
+            try:
+                for index in range(sample_count):
+                    ok, image = capture.read()
+                    if not ok:
+                        raise RuntimeError("could not read camera frame")
+                    images.append(image)
+                    if index + 1 < sample_count and interval_s:
+                        await asyncio.sleep(interval_s)
+            finally:
+                capture.release()
+        for image in images:
+            detections = detect_apriltags(image, april_tag_session.settings)
+            if request.accumulate:
+                april_tag_session.add(detections)
+            latest_image = image
+            latest_detections = detections
+        result = (
+            april_tag_session.solve()
+            if request.accumulate
+            else estimate_camera_pose(latest_detections, camera, april_tag_session.settings)
+        )
+        annotated = annotate_apriltag_frame(latest_image, latest_detections, camera, result)
+    except Exception as exc:
+        state.set_error(f"AprilTag capture failed: {exc}")
+        log_event("vision", "AprilTag capture failed", error=str(exc))
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, **april_tag_status_payload()}
+
+    configured = configured_tag_ids(april_tag_session.settings)
+    detections_payload = [
+        detection.to_dict(configured=detection.tag_id in configured)
+        for detection in latest_detections
+    ]
+    log_event(
+        "vision",
+        "AprilTag sample captured",
+        samples=sample_count,
+        tags=[item["id"] for item in detections_payload],
+        accepted=result.get("accepted", False),
+    )
+    return {
+        "ok": True,
+        "image_b64": encode_image_b64(annotated),
+        "detections": detections_payload,
+        "result": result,
+        **april_tag_status_payload(),
+    }
+
+
+@app.post("/api/vision/apriltag/save")
+async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, Any]:
+    camera = camera_settings(config)
+    april_tag_session.configure(camera, preserve_frames=True)
+    result = april_tag_session.solve()
+    summary = april_tag_session.summary()
+    required_ids = {int(value) for value in april_tag_session.settings.get("required_ids", [])}
+    visible_ids = set(summary.get("tag_ids", []))
+    missing_ids = sorted(required_ids - visible_ids)
+    errors: list[str] = []
+    if request.require_all_tags and missing_ids:
+        errors.append(f"missing required tags: {missing_ids}")
+    if not result.get("minimum_samples_met"):
+        errors.append(
+            f"need at least {summary.get('minimum_samples', 0)} accumulated frames; "
+            f"have {summary.get('frame_count', 0)}"
+        )
+    if request.require_all_tags and not result.get("required_tag_samples_met"):
+        minimum_samples = int(summary.get("minimum_samples", 0))
+        counts = result.get("tag_observation_counts", {})
+        errors.append(
+            f"each required tag needs at least {minimum_samples} observations; "
+            + ", ".join(
+                f"{tag_id}={counts.get(str(tag_id), 0)}"
+                for tag_id in sorted(required_ids)
+            )
+        )
+    if not result.get("accepted"):
+        errors.append(result.get("error") or "camera pose did not pass quality checks")
+    if errors:
+        return {"ok": False, "error": "; ".join(errors), "result": result, **april_tag_status_payload()}
+
+    updated_camera = camera_settings(config)
+    calibration = updated_camera.setdefault("calibration", {})
+    april_tag = calibration.setdefault("apriltag", {})
+    april_tag["result"] = result
+    april_tag["saved_at"] = time()
+    try:
+        save_calibration_updates(ensure_local_config(), {"camera": updated_camera})
+        reload_runtime_config()
+    except Exception as exc:
+        state.set_error(f"could not save AprilTag calibration: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "result": result, **april_tag_status_payload()}
+    log_event(
+        "vision",
+        "AprilTag calibration saved",
+        pose_id=result.get("id"),
+        tags=result.get("tags_used", []),
+        confidence=(result.get("metrics") or {}).get("confidence"),
+    )
+    await broadcast_state()
+    return {"ok": True, "result": result, "config": public_config(), **april_tag_status_payload()}
+
+
+@app.post("/api/vision/apriltag/verify")
+async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[str, Any]:
+    camera = camera_settings(config)
+    saved = april_tag_settings(camera).get("result")
+    if not isinstance(saved, dict) or not saved.get("accepted"):
+        return {"ok": False, "error": "no accepted AprilTag camera pose has been saved"}
+    try:
+        image = decode_image_b64(request.image_b64) if request.image_b64 else capture_camera_frame(camera)
+        detections = detect_apriltags(image, april_tag_settings(camera))
+        live = estimate_camera_pose(detections, camera)
+        if not live.get("ok"):
+            raise RuntimeError(live.get("error", "could not estimate live camera pose"))
+        import cv2
+        import numpy as np
+
+        saved_position = np.asarray(saved["camera_to_robot"]["position_mm"], dtype=np.float64)
+        live_position = np.asarray(live["camera_to_robot"]["position_mm"], dtype=np.float64)
+        saved_rotation = np.asarray(saved["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
+        live_rotation = np.asarray(live["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
+        delta_rotation = saved_rotation.T @ live_rotation
+        delta_rvec, _ = cv2.Rodrigues(delta_rotation)
+        comparison = {
+            "position_delta_mm": float(np.linalg.norm(live_position - saved_position)),
+            "orientation_delta_deg": float(np.linalg.norm(delta_rvec) * 180.0 / np.pi),
+        }
+        annotated = annotate_apriltag_frame(image, detections, camera, live)
+    except Exception as exc:
+        return {"ok": False, "error": f"AprilTag verification failed: {exc}"}
+    return {
+        "ok": True,
+        "image_b64": encode_image_b64(annotated),
+        "live_result": live,
+        "saved_result": saved,
+        "comparison": comparison,
+        "detections": [
+            detection.to_dict(configured=detection.tag_id in configured_tag_ids(april_tag_settings(camera)))
+            for detection in detections
+        ],
+    }
+
+
 @app.post("/api/vision/detect")
 async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
     profiles = color_profiles(config)
@@ -1467,14 +2274,8 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
         if request.image_b64:
             image = decode_image_b64(request.image_b64)
         else:
-            import cv2
-
             camera = camera_settings(config)
-            capture = cv2.VideoCapture(int(camera.get("source_index", 0)))
-            ok, image = capture.read()
-            capture.release()
-            if not ok:
-                raise RuntimeError("could not read camera frame")
+            image = capture_camera_frame(camera)
         detections = detect_configured_colors(image, profiles, camera_settings(config).get("calibration", {}))
     except Exception as exc:
         state.set_error(f"vision detection failed: {exc}")
@@ -1488,14 +2289,8 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
 @app.get("/api/vision/frame")
 async def get_vision_frame() -> dict[str, Any]:
     try:
-        import cv2
-
         camera = camera_settings(config)
-        capture = cv2.VideoCapture(int(camera.get("source_index", 0)))
-        ok, image = capture.read()
-        capture.release()
-        if not ok:
-            raise RuntimeError("could not read camera frame")
+        image = capture_camera_frame(camera)
         detections = detect_configured_colors(image, color_profiles(config), camera.get("calibration", {}))
         annotated = annotated_detection_frame(image, detections)
         return {"ok": True, "image_b64": encode_image_b64(annotated), "detections": detections}
@@ -1571,10 +2366,12 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         state.target_angles_deg = state.reported_angles_deg.copy()
         limiter.current_deg = state.reported_angles_deg.copy()
         limiter.set_target(state.target_angles_deg)
+        state.fk = forward_kinematics(state.reported_angles_deg, config.links)
         state.homed = True
         state.known_pose = True
         state.pose_source = "setpose"
         state.last_command = "SETPOSE_SIM"
+        state.updated_at = time()
         log_event("safety", "simulation pose set", angles_deg=state.reported_angles_deg)
         await broadcast_state()
         return {"ok": True, "state": state.to_dict()}
@@ -1802,8 +2599,16 @@ async def set_live_motion(request: LiveMotionRequest) -> dict[str, Any]:
         state.live_motion_enabled = True
         state.last_command = "LIVE_MOTION_ON"
     else:
+        if cartesian_jog_runtime.get("active") and not state.simulation and serial_client.is_connected:
+            try:
+                send_jog_stop_and_read_response()
+            except SerialClientError as exc:
+                state.set_error(str(exc), fault=True)
+                await broadcast_state()
+                return {"ok": False, "error": str(exc), "state": state.to_dict()}
         state.live_motion_enabled = False
         cancel_task(live_task)
+        reset_cartesian_jog_runtime()
         state.last_command = "LIVE_MOTION_OFF"
     state.updated_at = time()
     await broadcast_state()
@@ -1883,10 +2688,258 @@ async def live_target(request: LiveTargetRequest) -> dict[str, Any]:
     return {**result, "state": state.to_dict()}
 
 
+def _cartesian_jog_can_run() -> tuple[bool, str]:
+    if state.motion_state == MotionState.ESTOP:
+        return False, "emergency stop is active"
+    if state.motion_state == MotionState.FAULT:
+        return False, "clear the fault before Cartesian jog"
+    if path_task is not None and not path_task.done():
+        return False, "cannot Cartesian jog while a path is executing"
+    if task_task is not None and not task_task.done():
+        return False, "cannot Cartesian jog while a task is executing"
+    if live_task is not None and not live_task.done():
+        return False, "another live motion command is executing"
+    if not state.connected and not state.simulation:
+        return False, "not connected to hardware and simulation is disabled"
+    if not state.simulation:
+        if not state.hardware_armed:
+            return False, "Cartesian jog requires the Armed toggle"
+        if not state.live_motion_enabled:
+            return False, "enable Live Real before hardware Cartesian jog"
+        ready, reason = hardware_ready_for_motion()
+        if not ready:
+            return False, reason
+    can_move = validate_can_move(state)
+    if not can_move.ok:
+        return False, can_move.reason
+    return True, ""
+
+
+def _apply_cartesian_jog_target(
+    target_deg: list[float],
+    joint_velocity_deg_s: list[float],
+    accel_deg_s2: float,
+) -> str:
+    state.target_angles_deg = [float(value) for value in target_deg]
+    has_commanded_velocity = any(abs(float(value)) > 0.001 for value in joint_velocity_deg_s)
+    had_hardware_velocity = (
+        not state.simulation
+        and cartesian_jog_runtime.get("active")
+        and any(
+            abs(float(value)) > 0.001
+            for value in (cartesian_jog_runtime.get("joint_velocity_deg_s") or [])
+        )
+    )
+    state.motion_state = MotionState.MOVING if has_commanded_velocity or had_hardware_velocity else MotionState.IDLE
+    state.motion_execution_state = "cartesian_jog"
+    state.clear_error()
+    if state.simulation:
+        state.reported_angles_deg = state.target_angles_deg.copy()
+        state.fk = forward_kinematics(state.reported_angles_deg, config.links)
+        limiter.reset(state.reported_angles_deg)
+        state.last_controller_response = "SIMULATION"
+        state.last_command = "CARTESIAN_JOG_SIM"
+        return state.last_controller_response
+    limiter.set_target(state.target_angles_deg)
+    if not serial_client.is_connected:
+        state.last_controller_response = "SIMULATION"
+        state.last_command = "CARTESIAN_JOG_SIM"
+        return state.last_controller_response
+
+    command = format_jogv(joint_velocity_deg_s, accel_deg_s2)
+    state.last_command = command
+    response = send_jogv_and_read_response(command)
+    now = monotonic()
+    if now - float(cartesian_jog_runtime.get("last_status_poll") or 0.0) >= 0.25:
+        try:
+            refresh_serial_status()
+            cartesian_jog_runtime["last_status_poll"] = now
+        except SerialClientError:
+            # Keep jog commands responsive; the next normal status poll/stop can surface the connection issue.
+            pass
+    return response
+
+
+async def stop_cartesian_jog_internal(reason: str = "cartesian jog stopped") -> dict[str, Any]:
+    run_id = cartesian_jog_runtime.get("run_id")
+    cartesian_jog_runtime["active"] = False
+    cartesian_jog_runtime["seed_deg"] = None
+    cartesian_jog_runtime["joint_velocity_deg_s"] = [0.0 for _ in config.joints]
+    state.target_angles_deg = state.reported_angles_deg.copy()
+    limiter.set_target(state.target_angles_deg)
+    if state.motion_state == MotionState.MOVING:
+        state.motion_state = MotionState.IDLE if state.simulation else MotionState.STOPPED
+    if not state.simulation and serial_client.is_connected:
+        try:
+            send_jog_stop_and_read_response()
+            refresh_serial_status()
+        except SerialClientError as exc:
+            state.set_error(str(exc), fault=True)
+            finish_motion_diagnostics("failed", str(exc), str(run_id) if run_id else None)
+            await broadcast_state()
+            return {"ok": False, "error": str(exc), "state": state.to_dict()}
+    if run_id:
+        finish_motion_diagnostics("stopped", reason, str(run_id))
+    state.last_command = "CARTESIAN_JOG_STOP"
+    await broadcast_state()
+    return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/cartesian-jog")
+async def cartesian_jog(request: CartesianJogRequest) -> dict[str, Any]:
+    ok, reason = _cartesian_jog_can_run()
+    if not ok:
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+
+    vx = float(request.vx_mm_s)
+    vy = float(request.vy_mm_s)
+    vz = float(request.vz_mm_s)
+    vphi = float(request.vphi_deg_s)
+    if not all(value == value and abs(value) < 1e6 for value in [vx, vy, vz, vphi]):
+        state.set_error("Cartesian jog command contains a non-finite or unreasonable velocity")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if abs(vx) + abs(vy) + abs(vz) + abs(vphi) <= 1e-6:
+        return await stop_cartesian_jog_internal("zero Cartesian jog command")
+
+    settings = request_settings(request.settings)
+    dt_s = _cartesian_jog_dt(request.dt_s)
+    tcp_limit = max(1.0, float(request.tcp_speed_mm_s or settings.get("tcp_speed_mm_s") or 60.0))
+    phi_limit = max(1.0, float(request.phi_speed_deg_s or settings.get("phi_speed_deg_s") or 45.0))
+    tcp_speed = (vx * vx + vy * vy + vz * vz) ** 0.5
+    clamp_notes: list[str] = []
+    if tcp_speed > tcp_limit:
+        scale = tcp_limit / max(tcp_speed, 1e-9)
+        vx *= scale
+        vy *= scale
+        vz *= scale
+        clamp_notes.append("TCP speed clamped")
+    if abs(vphi) > phi_limit:
+        vphi = _clamp_scalar(vphi, -phi_limit, phi_limit)
+        clamp_notes.append("phi speed clamped")
+
+    now = monotonic()
+    seed = _cartesian_jog_seed(now)
+    speed_limits, accel_limits = _joint_limits_from_settings(settings)
+    max_joint_step = max(speed_limits) * dt_s
+    task_delta = _cartesian_jog_task_delta(vx, vy, vz, vphi, dt_s)
+    ik_step = differential_ik_step(
+        seed,
+        task_delta,
+        config.links,
+        config.joints,
+        damping=float(config.kinematics.damping),
+        max_joint_step_deg=max_joint_step,
+    )
+    if not ik_step["ok"]:
+        state.set_error(str(ik_step.get("error", "Cartesian jog IK failed")))
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "jog": ik_step, "state": state.to_dict()}
+
+    if ik_step.get("blocked"):
+        # A blocked sample is a rejected velocity command, not a new target.
+        # Send zero joint velocity so hardware decelerates, keep the accepted
+        # seed unchanged, and let the next valid/reverse sample solve cleanly.
+        target_deg = seed.copy()
+        joint_velocity = [0.0 for _ in config.joints]
+        joint_notes: list[str] = []
+    else:
+        target_deg, joint_velocity, joint_notes = _limit_cartesian_jog_target(
+            seed,
+            [float(value) for value in ik_step["target_angles_deg"]],
+            dt_s,
+            speed_limits,
+            accel_limits,
+        )
+    validation = validate_joint_targets(config, target_deg)
+    if not validation.ok:
+        state.set_error(validation.reason)
+        await broadcast_state()
+        return {"ok": False, "error": validation.reason, "jog": ik_step, "state": state.to_dict()}
+
+    run_id = cartesian_jog_runtime.get("run_id")
+    if not cartesian_jog_runtime.get("active") or not run_id:
+        run_id = start_motion_diagnostics(
+            source="cartesian_jog",
+            mode="cartesian_jog",
+            target_deg=target_deg,
+            expected_duration_s=0.0,
+            waypoint_count=0,
+        )
+        cartesian_jog_runtime["run_id"] = run_id
+    update_motion_diagnostics(
+        str(run_id),
+        execution_state="cartesian_jog",
+        result="executing",
+        requested_target_deg=target_deg,
+        active_target_deg=target_deg,
+        cartesian_command={
+            "vx_mm_s": vx,
+            "vy_mm_s": vy,
+            "vz_mm_s": vz,
+            "vphi_deg_s": vphi,
+            "dt_s": dt_s,
+        },
+    )
+
+    try:
+        response = _apply_cartesian_jog_target(
+            target_deg,
+            joint_velocity,
+            accel_deg_s2=max(accel_limits),
+        )
+    except SerialClientError as exc:
+        state.set_error(str(exc), fault=True)
+        finish_motion_diagnostics("failed", str(exc), str(run_id))
+        await broadcast_state()
+        return {"ok": False, "error": str(exc), "jog": ik_step, "state": state.to_dict()}
+
+    cartesian_jog_runtime.update(
+        {
+            "active": True,
+            "last_update": now,
+            "seed_deg": target_deg,
+            "joint_velocity_deg_s": joint_velocity,
+            "run_id": run_id,
+        }
+    )
+    record_motion_sample(str(run_id))
+    state.updated_at = time()
+    jog_result = {
+        **ik_step,
+        "target_angles_deg": target_deg,
+        "joint_velocity_deg_s": joint_velocity,
+        "dt_s": dt_s,
+        "blocked": bool(ik_step.get("blocked")) or bool(joint_notes),
+        "notes": [*ik_step.get("notes", []), *clamp_notes, *joint_notes],
+        "failure_code": ik_step.get("failure_code") or ("joint_limit" if joint_notes else None),
+        "failure_reason": ik_step.get("failure_reason") or (joint_notes[0] if joint_notes else None),
+        "controller_response": response,
+    }
+    await broadcast_state()
+    return {"ok": True, "jog": jog_result, "state": state.to_dict()}
+
+
+@app.post("/api/cartesian-jog/stop")
+async def stop_cartesian_jog() -> dict[str, Any]:
+    return await stop_cartesian_jog_internal()
+
+
 @app.post("/api/config/calibration")
 async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
     config_path = ensure_local_config()
     updates = request.__dict__
+    if isinstance(updates.get("tools"), dict):
+        tool_errors = validate_tools_payload(updates["tools"])
+        if tool_errors:
+            state.set_error("; ".join(tool_errors))
+            await broadcast_state()
+            return {"ok": False, "errors": tool_errors, "error": state.last_error, "state": state.to_dict()}
+        calibration = calibration_settings(config)
+        calibration["tool_dimensions_validated"] = False
+        updates["calibration"] = calibration
     if serial_client.is_connected and not state.simulation:
         ready, reason = config_sync_ready()
         if not ready:
@@ -1977,6 +3030,11 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
 @app.post("/api/disconnect")
 async def disconnect() -> dict[str, Any]:
     cancel_motion_tasks()
+    if serial_client.is_connected and not state.simulation:
+        try:
+            serial_client.send_line(format_stop())
+        except Exception as exc:
+            log_event("connection", "could not send stop before disconnect", error=str(exc))
     serial_client.disconnect()
     state.connected = False
     state.simulation = False
@@ -2123,7 +3181,7 @@ async def simulation_loop() -> None:
         dt_s = max(0.0, now - last)
         last = now
 
-        if state.simulation:
+        if state.simulation and not simulation_trajectory_active:
             apply_simulation_step(state, limiter, dt_s)
         state.fk = forward_kinematics(state.reported_angles_deg, config.links)
         record_motion_sample(active_motion_run_id)

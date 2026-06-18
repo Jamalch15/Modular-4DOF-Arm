@@ -43,6 +43,33 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
                 }
             ],
             "motion": {"command_rate_limit_hz": 14.0, "acceleration_deg_s2": 130.0},
+            "path_defaults": {
+                "global_speed_deg_s": 22.0,
+                "cartesian_step_mm": 8.0,
+                "planner_type": "trapezoid",
+            },
+            "camera": {
+                "enabled": True,
+                "source_index": 1,
+                "resolution": {"width": 1280, "height": 720},
+                "intrinsics": {
+                    "source": "test",
+                    "fx_px": 900.0,
+                    "fy_px": 901.0,
+                    "cx_px": 640.0,
+                    "cy_px": 360.0,
+                    "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+                },
+                "calibration": {
+                    "image_points": [],
+                    "robot_points": [],
+                    "apriltag": {
+                        "dictionary": "DICT_APRILTAG_36H11",
+                        "tag_size_mm": 40.0,
+                        "result": {"accepted": True, "id": "test-pose"},
+                    },
+                },
+            },
             "geometry": {
                 "active_preset": "matlab_prototype",
                 "presets": {
@@ -71,6 +98,7 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
     assert saved.joints[0].max_accel_deg_s2 == 111.0
     assert saved.joints[0].zero_offset_deg == 2.0
     assert saved.joints[0].direction_sign == -1
+    assert saved.raw["named_positions"]["home"]["angles_deg"] == [1.0, 20.0, 20.0, 0.0]
     assert saved.joints[0].hardware.stepper.enabled is True
     assert saved.joints[0].hardware.stepper.step_pin == 17
     assert saved.joints[0].hardware.stepper.dir_pin == 16
@@ -78,6 +106,11 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
     assert saved.joints[0].hardware.stepper.gear_ratio == 4.5
     assert saved.motion.command_rate_limit_hz == 14.0
     assert saved.motion.acceleration_deg_s2 == 130.0
+    assert saved.raw["path_defaults"]["global_speed_deg_s"] == 22.0
+    assert saved.raw["path_defaults"]["planner_type"] == "trapezoid"
+    assert saved.raw["camera"]["source_index"] == 1
+    assert saved.raw["camera"]["intrinsics"]["fx_px"] == 900.0
+    assert saved.raw["camera"]["calibration"]["apriltag"]["result"]["id"] == "test-pose"
     geometry = geometry_settings(saved)
     assert geometry["presets"]["matlab_prototype"]["dimensions_mm"]["L_2"] == 23.2
     assert geometry["presets"]["matlab_prototype"]["signs"]["s4"] == -1

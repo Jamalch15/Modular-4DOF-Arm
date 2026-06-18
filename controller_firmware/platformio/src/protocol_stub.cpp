@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>
 
 // Safe full-arm protocol stub for PC dashboard integration.
 // This intentionally does not drive motors. It only validates and reports
@@ -20,6 +21,8 @@
 namespace {
 constexpr unsigned long kSerialWaitMs = 3000;
 constexpr uint32_t kStatusIntervalMs = 1000;
+constexpr int kMaxTrajectoryPoints = 240;
+constexpr uint32_t kJogWatchdogMs = 350;
 constexpr float kHomePose[4] = {0.0f, 20.0f, 20.0f, 0.0f};
 constexpr float kJointMinDeg[4] = {-160.0f, -30.0f, -120.0f, -120.0f};
 constexpr float kJointMaxDeg[4] = {160.0f, 115.0f, 120.0f, 120.0f};
@@ -36,12 +39,21 @@ ControllerState controllerState = ControllerState::Idle;
 bool homed = false;
 bool armed = false;
 bool configInProgress = false;
+bool jogActive = false;
+bool jogVelocityMode = false;
+uint32_t lastJogMs = 0;
 float currentJointsDeg[4] = {kHomePose[0], kHomePose[1], kHomePose[2],
                              kHomePose[3]};
 float targetJointsDeg[4] = {kHomePose[0], kHomePose[1], kHomePose[2],
                             kHomePose[3]};
 float lastSpeedDegS = 0.0f;
 float lastAccelDegS2 = 0.0f;
+int trajectoryExpectedCount = 0;
+int trajectoryPointCount = 0;
+bool trajectoryReceiving = false;
+bool trajectoryReady = false;
+float trajectoryDurationS = 0.0f;
+float trajectoryLastJointsDeg[4] = {kHomePose[0], kHomePose[1], kHomePose[2], kHomePose[3]};
 char faultText[32] = "OK";
 char toolState[12] = "unknown";
 char poseSourceText[12] = "unknown";
@@ -74,8 +86,31 @@ void clearFaultText() {
   strlcpy(faultText, "OK", sizeof(faultText));
 }
 
+void clearTrajectory() {
+  trajectoryExpectedCount = 0;
+  trajectoryPointCount = 0;
+  trajectoryReceiving = false;
+  trajectoryReady = false;
+  trajectoryDurationS = 0.0f;
+}
+
+void clearJogMotion(bool freezeTarget = false) {
+  jogActive = false;
+  jogVelocityMode = false;
+  lastJogMs = 0;
+  if (!freezeTarget) {
+    return;
+  }
+  for (int i = 0; i < 4; i++) {
+    targetJointsDeg[i] = currentJointsDeg[i];
+  }
+  if (controllerState == ControllerState::Moving) {
+    controllerState = ControllerState::Idle;
+  }
+}
+
 void printHello() {
-  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=1");
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=3");
 }
 
 void printStatus() {
@@ -132,10 +167,93 @@ void handleMoveJ(const char* buffer) {
   }
   lastSpeedDegS = speed;
   lastAccelDegS2 = accel;
+  clearTrajectory();
+  clearJogMotion(false);
   controllerState = ControllerState::Idle;
   clearFaultText();
   ARM_SERIAL.println("OK command=MOVEJ");
   printStatus();
+}
+
+void handleJog(const String& upperCommand, const char* buffer) {
+  if (upperCommand.startsWith("JOG STOP")) {
+    clearJogMotion(true);
+    ARM_SERIAL.println("OK command=JOG_STOP");
+    printStatus();
+    return;
+  }
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "emergency_stop_active");
+    return;
+  }
+
+  if (upperCommand.startsWith("JOGV")) {
+    float velocity[4] = {};
+    float accel = 0.0f;
+    const int parsed =
+        sscanf(buffer, "%*s %f %f %f %f %f", &velocity[0], &velocity[1], &velocity[2], &velocity[3], &accel);
+    if (parsed != 5) {
+      printError("USAGE", "JOGV_requires_v1_v2_v3_v4_accel");
+      return;
+    }
+    if (accel <= 0.0f) {
+      printError("LIMIT", "accel_must_be_positive");
+      return;
+    }
+    float requested[4] = {};
+    for (int i = 0; i < 4; i++) {
+      requested[i] = currentJointsDeg[i] + velocity[i] * 0.05f;
+    }
+    if (!validateJoints(requested)) {
+      return;
+    }
+    clearTrajectory();
+    for (int i = 0; i < 4; i++) {
+      targetJointsDeg[i] = requested[i];
+      currentJointsDeg[i] = requested[i];
+    }
+    lastSpeedDegS = 0.0f;
+    lastAccelDegS2 = accel;
+    jogActive = true;
+    jogVelocityMode = true;
+    lastJogMs = millis();
+    controllerState = ControllerState::Idle;
+    clearFaultText();
+    ARM_SERIAL.println("OK command=JOGV hw=simulated");
+    return;
+  }
+
+  float requested[4] = {};
+  float speed = 0.0f;
+  float accel = 0.0f;
+  const int parsed =
+      sscanf(buffer, "%*s %f %f %f %f %f %f", &requested[0], &requested[1],
+             &requested[2], &requested[3], &speed, &accel);
+  if (parsed != 6) {
+    printError("USAGE", "JOGJ_requires_j1_j2_j3_j4_speed_accel");
+    return;
+  }
+  if (speed <= 0.0f || accel <= 0.0f) {
+    printError("LIMIT", "speed_and_accel_must_be_positive");
+    return;
+  }
+  if (!validateJoints(requested)) {
+    return;
+  }
+
+  clearTrajectory();
+  for (int i = 0; i < 4; i++) {
+    targetJointsDeg[i] = requested[i];
+    currentJointsDeg[i] = requested[i];
+  }
+  lastSpeedDegS = speed;
+  lastAccelDegS2 = accel;
+  jogActive = true;
+  jogVelocityMode = false;
+  lastJogMs = millis();
+  controllerState = ControllerState::Idle;
+  clearFaultText();
+  ARM_SERIAL.println("OK command=JOGJ hw=simulated");
 }
 
 void handleArm(const char* buffer) {
@@ -146,6 +264,8 @@ void handleArm(const char* buffer) {
   }
   armed = requested != 0;
   if (!armed && controllerState != ControllerState::Estop) {
+    clearTrajectory();
+    clearJogMotion(true);
     controllerState = ControllerState::Stopped;
   }
   ARM_SERIAL.printf("OK command=ARM armed=%d\r\n", armed ? 1 : 0);
@@ -170,6 +290,8 @@ void handleSetPose(const char* buffer) {
     targetJointsDeg[i] = requested[i];
     currentJointsDeg[i] = requested[i];
   }
+  clearTrajectory();
+  clearJogMotion(false);
   homed = true;
   strlcpy(poseSourceText, "setpose", sizeof(poseSourceText));
   controllerState = ControllerState::Stopped;
@@ -190,6 +312,103 @@ float tokenFloat(const String& line, const char* key, float fallback) {
     end = line.length();
   }
   return line.substring(start, end).toFloat();
+}
+
+int tokenInt(const String& line, const char* key, int fallback) {
+  const String prefix = String(key) + "=";
+  int start = line.indexOf(prefix);
+  if (start < 0) {
+    return fallback;
+  }
+  start += prefix.length();
+  int end = line.indexOf(' ', start);
+  if (end < 0) {
+    end = line.length();
+  }
+  return line.substring(start, end).toInt();
+}
+
+void handleTrajectory(const String& rawCommand, const String& upperCommand) {
+  if (upperCommand.startsWith("TRAJ CLEAR")) {
+    clearTrajectory();
+    clearJogMotion(false);
+    ARM_SERIAL.println("OK command=TRAJ_CLEAR");
+    return;
+  }
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "emergency_stop_active");
+    return;
+  }
+  if (upperCommand.startsWith("TRAJ BEGIN")) {
+    const int count = tokenInt(rawCommand, "count", 0);
+    const float durationS = tokenFloat(rawCommand, "duration", 0.0f);
+    const float speed = tokenFloat(rawCommand, "speed", 0.0f);
+    const float accel = tokenFloat(rawCommand, "accel", 0.0f);
+    if (count < 2 || count > kMaxTrajectoryPoints) {
+      printError("LIMIT", "trajectory_count_out_of_range");
+      return;
+    }
+    if (durationS <= 0.0f || speed <= 0.0f || accel <= 0.0f) {
+      printError("LIMIT", "trajectory_duration_speed_accel_must_be_positive");
+      return;
+    }
+    clearTrajectory();
+    clearJogMotion(false);
+    trajectoryExpectedCount = count;
+    trajectoryDurationS = durationS;
+    trajectoryReceiving = true;
+    lastSpeedDegS = speed;
+    lastAccelDegS2 = accel;
+    ARM_SERIAL.printf("OK command=TRAJ_BEGIN count=%d duration=%.3f\r\n", count, durationS);
+    return;
+  }
+  if (upperCommand.startsWith("TRAJ POINT")) {
+    if (!trajectoryReceiving) {
+      printError("STATE", "trajectory_begin_required");
+      return;
+    }
+    const int index = tokenInt(rawCommand, "index", -1);
+    if (index != trajectoryPointCount || index < 0 || index >= trajectoryExpectedCount) {
+      printError("USAGE", "trajectory_point_index_must_be_sequential");
+      return;
+    }
+    float requested[4] = {};
+    for (int i = 0; i < 4; i++) {
+      const String key = String("j") + String(i + 1);
+      requested[i] = tokenFloat(rawCommand, key.c_str(), NAN);
+      if (!isfinite(requested[i])) {
+        printError("USAGE", "trajectory_point_requires_j1_j2_j3_j4");
+        return;
+      }
+    }
+    if (!validateJoints(requested)) {
+      return;
+    }
+    for (int i = 0; i < 4; i++) {
+      trajectoryLastJointsDeg[i] = requested[i];
+    }
+    trajectoryPointCount++;
+    trajectoryReady = trajectoryPointCount == trajectoryExpectedCount;
+    ARM_SERIAL.printf("OK command=TRAJ_POINT index=%d\r\n", index);
+    return;
+  }
+  if (upperCommand.startsWith("TRAJ START")) {
+    if (!trajectoryReady || trajectoryPointCount != trajectoryExpectedCount) {
+      printError("STATE", "trajectory_not_ready");
+      return;
+    }
+    for (int i = 0; i < 4; i++) {
+      targetJointsDeg[i] = trajectoryLastJointsDeg[i];
+      currentJointsDeg[i] = trajectoryLastJointsDeg[i];
+    }
+    trajectoryReceiving = false;
+    trajectoryReady = false;
+    controllerState = ControllerState::Idle;
+    clearFaultText();
+    ARM_SERIAL.printf("OK command=TRAJ_START count=%d duration=%.3f\r\n", trajectoryPointCount, trajectoryDurationS);
+    return;
+  }
+  printError("USAGE", "TRAJ_requires_BEGIN_POINT_START_or_CLEAR");
 }
 
 void handleTool(const String& rawCommand, const String& upperCommand) {
@@ -226,10 +445,18 @@ void handleConfig(const String& upperCommand) {
       printError("CONFIG", "stop_motion_before_config");
       return;
     }
+    clearTrajectory();
+    clearJogMotion(true);
     configInProgress = true;
     return;
   }
   if (upperCommand.startsWith("CONFIG JOINT")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+    }
+    return;
+  }
+  if (upperCommand.startsWith("CONFIG TOOL")) {
     if (!configInProgress) {
       printError("CONFIG", "begin_required");
     }
@@ -258,6 +485,8 @@ void handleHome() {
     targetJointsDeg[i] = kHomePose[i];
     currentJointsDeg[i] = kHomePose[i];
   }
+  clearTrajectory();
+  clearJogMotion(false);
   homed = true;
   strlcpy(poseSourceText, "home", sizeof(poseSourceText));
   controllerState = ControllerState::Idle;
@@ -267,6 +496,8 @@ void handleHome() {
 }
 
 void handleStop() {
+  clearTrajectory();
+  clearJogMotion(true);
   for (int i = 0; i < 4; i++) {
     targetJointsDeg[i] = currentJointsDeg[i];
   }
@@ -279,6 +510,8 @@ void handleStop() {
 }
 
 void handleEstop() {
+  clearTrajectory();
+  clearJogMotion(true);
   for (int i = 0; i < 4; i++) {
     targetJointsDeg[i] = currentJointsDeg[i];
   }
@@ -310,6 +543,10 @@ void handleCommand(String rawCommand) {
     handleConfig(upperCommand);
   } else if (strcasecmp(command, "MOVEJ") == 0) {
     handleMoveJ(buffer);
+  } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 || strcasecmp(command, "JOG") == 0) {
+    handleJog(upperCommand, buffer);
+  } else if (strcasecmp(command, "TRAJ") == 0) {
+    handleTrajectory(rawCommand, upperCommand);
   } else if (strcasecmp(command, "ARM") == 0) {
     handleArm(buffer);
   } else if (strcasecmp(command, "SETPOSE") == 0) {
@@ -339,6 +576,12 @@ void readSerialCommands() {
   }
 }
 
+void updateJogWatchdog(uint32_t nowMs) {
+  if (jogActive && nowMs - lastJogMs > kJogWatchdogMs) {
+    clearJogMotion(true);
+  }
+}
+
 void turnOffOnboardRgbLed() {
 #if defined(ESP32)
   pinMode(ESP_RGB_LED_PIN, OUTPUT);
@@ -358,6 +601,7 @@ void setup() {
   }
 
   clearFaultText();
+  clearJogMotion(false);
   lastStatusMs = millis();
   printHello();
   printStatus();
@@ -367,6 +611,7 @@ void loop() {
   readSerialCommands();
 
   const uint32_t nowMs = millis();
+  updateJogWatchdog(nowMs);
   if (nowMs - lastStatusMs >= kStatusIntervalMs) {
     lastStatusMs = nowMs;
     printStatus();

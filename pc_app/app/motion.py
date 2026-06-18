@@ -112,6 +112,10 @@ def _profile_progress(t: float, profile: str, ramp_fraction: float) -> float:
     return (t - 0.5 * ramp) / (1.0 - ramp)
 
 
+def _signed_angle_delta_deg(start: float, end: float) -> float:
+    return (float(end) - float(start) + 180.0) % 360.0 - 180.0
+
+
 def _joint_speed_limits(
     joints: list[JointConfig],
     global_speed_deg_s: float | None,
@@ -164,11 +168,19 @@ def _segment_duration_s(
     profile: str = "s_curve",
     ramp_fraction: float = 0.25,
 ) -> float:
+    deltas = [abs(end - start) for start, end in zip(start_deg, end_deg, strict=True)]
+    return _joint_delta_duration_s(deltas, speed_limits_deg_s, accel_limits_deg_s2, profile, ramp_fraction)
+
+
+def _joint_delta_duration_s(
+    deltas_deg: list[float],
+    speed_limits_deg_s: list[float],
+    accel_limits_deg_s2: list[float],
+    profile: str = "s_curve",
+    ramp_fraction: float = 0.25,
+) -> float:
     duration = 0.0
-    for start, end, speed, accel in zip(
-        start_deg, end_deg, speed_limits_deg_s, accel_limits_deg_s2, strict=True
-    ):
-        delta = abs(end - start)
+    for delta, speed, accel in zip(deltas_deg, speed_limits_deg_s, accel_limits_deg_s2, strict=True):
         if delta <= 1e-9:
             continue
         if profile == "linear":
@@ -182,6 +194,65 @@ def _segment_duration_s(
             accel_time = 2.5 * sqrt(delta / max(accel, 1e-6))
         duration = max(duration, speed_time, accel_time)
     return duration
+
+
+def _joint_path_deltas(waypoints: list[list[float]]) -> list[float]:
+    if not waypoints:
+        return []
+    deltas = [0.0 for _ in waypoints[0]]
+    for start, end in zip(waypoints, waypoints[1:], strict=False):
+        for index, (start_angle, end_angle) in enumerate(zip(start, end, strict=True)):
+            deltas[index] += abs(float(end_angle) - float(start_angle))
+    return deltas
+
+
+def _joint_segment_distance(start_deg: list[float], end_deg: list[float]) -> float:
+    return sum(abs(float(end) - float(start)) for start, end in zip(start_deg, end_deg, strict=True))
+
+
+def _cumulative_times(segment_durations_s: list[float]) -> list[float]:
+    elapsed = 0.0
+    times: list[float] = []
+    for duration in segment_durations_s:
+        elapsed += max(0.0, float(duration))
+        times.append(elapsed)
+    return times
+
+
+def _continuous_ik_branch(branch: str) -> str:
+    return branch if branch in {"elbow_up", "elbow_down"} else "auto"
+
+
+def _select_continuous_ik_candidate(ik: dict[str, Any], previous_deg: list[float], branch: str) -> dict[str, Any] | None:
+    if branch in {"elbow_up", "elbow_down"}:
+        return ik.get("selected")
+    valid_candidates = [candidate for candidate in ik.get("candidates", []) if candidate.get("valid")]
+    if not valid_candidates:
+        return None
+    return min(
+        valid_candidates,
+        key=lambda candidate: (
+            sum(
+                angle_distance_deg(float(angle), float(previous_deg[index]))
+                for index, angle in enumerate(candidate.get("angles_deg", []))
+            ),
+            float(candidate.get("position_error_mm", 0.0)),
+            float(candidate.get("phi_error_deg", 0.0)),
+            0 if candidate.get("branch") in {"current_seed", "elbow_down"} else 1,
+        ),
+    )
+
+
+def _linear_ik_error(index: int, ik: dict[str, Any]) -> str:
+    details: list[str] = []
+    for note in ik.get("notes", [])[:3]:
+        details.append(str(note))
+    for candidate in ik.get("candidates", [])[:4]:
+        reasons = candidate.get("reasons") or []
+        if reasons:
+            details.append(f"{candidate.get('branch', 'candidate')}: {reasons[0]}")
+    suffix = f": {'; '.join(details)}" if details else ""
+    return f"linear waypoint {index} has no valid position/orientation IK solution{suffix}"
 
 
 def build_joint_trajectory(
@@ -218,6 +289,7 @@ def build_joint_trajectory(
             "waypoint_count": 1,
             "waypoints": [target_deg],
             "segment_durations_s": [0.0],
+            "time_from_start_s": [0.0],
             "errors": [],
         }
 
@@ -231,6 +303,7 @@ def build_joint_trajectory(
         )
 
     segment_duration = duration_s / max(steps - 1, 1)
+    segment_durations = [0.0] + [segment_duration for _ in waypoints[1:]]
     return {
         "ok": True,
         "mode": "joint",
@@ -238,7 +311,8 @@ def build_joint_trajectory(
         "duration_s": duration_s,
         "waypoint_count": len(waypoints),
         "waypoints": waypoints,
-        "segment_durations_s": [0.0] + [segment_duration for _ in waypoints[1:]],
+        "segment_durations_s": segment_durations,
+        "time_from_start_s": _cumulative_times(segment_durations),
         "speed_limits_deg_s": speed_limits,
         "accel_limits_deg_s2": accel_limits,
         "errors": [],
@@ -315,7 +389,8 @@ def build_linear_cartesian_trajectory(
     cartesian_waypoints: list[dict[str, float]] = []
     ik_results: list[dict[str, Any]] = []
     previous = start_deg
-    selected_branch = branch
+    ik_branch = _continuous_ik_branch(branch)
+    phi_delta = _signed_angle_delta_deg(start_pose["phi_deg"], end_pose["phi_deg"])
 
     for index in range(steps):
         t = index / (steps - 1)
@@ -323,28 +398,28 @@ def build_linear_cartesian_trajectory(
             "x_mm": start_pose["x_mm"] + (end_pose["x_mm"] - start_pose["x_mm"]) * t,
             "y_mm": start_pose["y_mm"] + (end_pose["y_mm"] - start_pose["y_mm"]) * t,
             "z_mm": start_pose["z_mm"] + (end_pose["z_mm"] - start_pose["z_mm"]) * t,
-            "phi_deg": start_pose["phi_deg"] + (end_pose["phi_deg"] - start_pose["phi_deg"]) * t,
+            "phi_deg": start_pose["phi_deg"] + phi_delta * t,
         }
-        ik = inverse_kinematics(pose, links, joints, previous, selected_branch)
+        ik = inverse_kinematics(pose, links, joints, previous, ik_branch)
+        selected = _select_continuous_ik_candidate(ik, previous, ik_branch)
         ik_results.append(
             {
                 "index": index,
-                "ok": ik["ok"],
-                "selected_branch": ik["selected_branch"],
+                "ok": selected is not None,
+                "selected_branch": selected["branch"] if selected else ik["selected_branch"],
                 "notes": ik["notes"],
             }
         )
-        if not ik["ok"] or not ik["selected"]:
+        if selected is None:
             return {
                 "ok": False,
                 "mode": "linear",
                 "waypoints": waypoints,
                 "cartesian_waypoints": cartesian_waypoints,
                 "ik_results": ik_results,
-                "errors": [f"linear waypoint {index} is unreachable or outside joint limits"],
+                "errors": [_linear_ik_error(index, ik)],
             }
-        selected_branch = ik["selected_branch"] or selected_branch
-        previous = [float(value) for value in ik["selected"]["angles_deg"]]
+        previous = [float(value) for value in selected["angles_deg"]]
         waypoints.append(previous)
         cartesian_waypoints.append(pose)
 
@@ -359,17 +434,26 @@ def build_linear_cartesian_trajectory(
         settings.get("global_accel_deg_s2"),
         settings.get("per_joint_accel_deg_s2"),
     )
-    segment_durations = [0.0]
     profile = _profile_name(settings)
     ramp_fraction = _trapezoid_ramp_fraction(settings)
-    for start, end in zip(waypoints, waypoints[1:], strict=False):
-        segment_durations.append(
-            max(
-                1.0 / waypoint_rate_hz,
-                _segment_duration_s(start, end, speed_limits, accel_limits, profile, ramp_fraction),
-            )
-        )
-    duration_s = sum(segment_durations)
+    path_deltas = _joint_path_deltas(waypoints)
+    duration_s = _joint_delta_duration_s(path_deltas, speed_limits, accel_limits, profile, ramp_fraction)
+    duration_s = max(duration_s, (len(waypoints) - 1) / waypoint_rate_hz)
+    segment_distances = [
+        _joint_segment_distance(start, end)
+        for start, end in zip(waypoints, waypoints[1:], strict=False)
+    ]
+    total_segment_distance = sum(segment_distances)
+    if total_segment_distance <= 1e-9:
+        segment_durations = [0.0] + [
+            duration_s / max(len(waypoints) - 1, 1)
+            for _ in waypoints[1:]
+        ]
+    else:
+        segment_durations = [0.0] + [
+            duration_s * distance / total_segment_distance
+            for distance in segment_distances
+        ]
 
     return {
         "ok": True,
@@ -380,6 +464,7 @@ def build_linear_cartesian_trajectory(
         "waypoints": waypoints,
         "cartesian_waypoints": cartesian_waypoints,
         "segment_durations_s": segment_durations,
+        "time_from_start_s": _cumulative_times(segment_durations),
         "speed_limits_deg_s": speed_limits,
         "accel_limits_deg_s2": accel_limits,
         "ik_results": ik_results,
@@ -532,6 +617,7 @@ def build_program_trajectory(
         "waypoint_count": len(combined_waypoints),
         "waypoints": combined_waypoints,
         "segment_durations_s": combined_durations,
+        "time_from_start_s": _cumulative_times(combined_durations),
         "segments": segment_summaries,
         "cartesian_waypoints": cartesian_waypoints,
         "errors": [],

@@ -7,7 +7,7 @@ from app.config import (
     load_config,
     matlab_geometry_to_dh_rows,
 )
-from app.kinematics import forward_kinematics, inverse_kinematics
+from app.kinematics import differential_ik_step, forward_kinematics, inverse_kinematics
 
 
 def test_forward_kinematics_zero_pose_extends_up_from_shoulder():
@@ -130,6 +130,60 @@ def test_inverse_kinematics_round_trips_reachable_target():
     assert selected_fk["tool_phi_deg"] == approx(target_fk["tool_phi_deg"], abs=1e-6)
 
 
+def test_differential_ik_step_moves_tcp_in_requested_direction():
+    config = load_config()
+    start = [0.0, 45.0, 25.0, -20.0]
+    start_fk = forward_kinematics(start, config.links)
+
+    result = differential_ik_step(
+        start,
+        {"x_mm": 1.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0},
+        config.links,
+        config.joints,
+    )
+
+    assert result["ok"], result
+    end_fk = forward_kinematics(result["target_angles_deg"], config.links)
+    assert end_fk["x_mm"] > start_fk["x_mm"]
+    assert abs(end_fk["y_mm"] - start_fk["y_mm"]) < 2.0
+    assert abs(end_fk["z_mm"] - start_fk["z_mm"]) < 2.0
+
+
+def test_differential_ik_step_reports_low_authority_direction():
+    config = load_config()
+
+    result = differential_ik_step(
+        [0.0, 90.0, 0.0, 0.0],
+        {"x_mm": 1.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0},
+        config.links,
+        config.joints,
+    )
+
+    assert result["ok"], result
+    assert result["blocked"]
+    assert result["failure_code"] == "local_step_unreachable"
+    assert "locally unreachable" in result["failure_reason"]
+    assert result["target_angles_deg"] == [0.0, 90.0, 0.0, 0.0]
+
+
+def test_differential_ik_step_blocks_lateral_drift_direction():
+    config = load_config()
+
+    result = differential_ik_step(
+        [0.0, 62.3, 0.0, 0.0],
+        {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 3.0, "phi_deg": 0.0},
+        config.links,
+        config.joints,
+    )
+
+    assert result["ok"], result
+    assert result["blocked"]
+    assert result["position_alignment"] < 0.70
+    assert result["failure_code"] == "excessive_lateral_drift"
+    assert "excessive lateral TCP drift" in result["failure_reason"]
+    assert result["target_angles_deg"] == [0.0, 62.3, 0.0, 0.0]
+
+
 def test_inverse_kinematics_returns_seed_candidates():
     config = load_config()
     target = {"x_mm": -80.0, "y_mm": 180.0, "z_mm": 190.0, "phi_deg": 0.0}
@@ -156,9 +210,10 @@ def test_inverse_kinematics_rejects_unreachable_target():
 
 
 def test_inverse_kinematics_auto_phi_chooses_reachable_orientation():
-    config = load_config()
-    # Target at high z-position where phi=0.0 is unreachable but auto-phi finds a solution
-    target = {"x_mm": 200.0, "y_mm": 0.0, "z_mm": 350.0}
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    # Use the tracked example geometry so private/local calibration changes do
+    # not invalidate the reachability assumption behind this regression.
+    target = {"x_mm": -250.0, "y_mm": 0.0, "z_mm": 400.0}
 
     fixed_phi = inverse_kinematics(
         {**target, "phi_deg": 0.0},
@@ -220,6 +275,24 @@ def test_inverse_kinematics_prefers_nearest_valid_solution():
     second = inverse_kinematics(target, config.links, config.joints, expected["angles_deg"], expected["branch"])
 
     assert second["selected_branch"] == expected["branch"]
+
+
+def test_inverse_kinematics_auto_prefers_continuity_over_tiny_error_difference():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    current = [40.0, 45.0, 20.0, 40.0]
+    current_fk = forward_kinematics(current, config.links)
+    target = {
+        "x_mm": current_fk["x_mm"] + 3.333,
+        "y_mm": current_fk["y_mm"],
+        "z_mm": current_fk["z_mm"],
+        "phi_deg": current_fk["tool_phi_deg"],
+    }
+
+    result = inverse_kinematics(target, config.links, config.joints, current)
+
+    assert result["ok"], result["notes"]
+    selected = result["selected"]["angles_deg"]
+    assert sum(abs(angle - current[index]) for index, angle in enumerate(selected)) < 5.0
 
 
 def test_analytic_seed_round_trips_multiple_fk_targets_from_home():

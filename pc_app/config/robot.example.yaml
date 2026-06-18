@@ -239,9 +239,42 @@ named_positions:
 camera:
   enabled: false
   source_index: 0
+  resolution:
+    width: 1280
+    height: 720
+  # Full 6-DoF AprilTag camera pose requires measured camera intrinsics.
+  # Keep source=uncalibrated until these values come from a checkerboard or
+  # the camera manufacturer's calibrated model.
+  intrinsics:
+    source: uncalibrated
+    fx_px:
+    fy_px:
+    cx_px:
+    cy_px:
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
   calibration:
+    # Legacy four-point homography fallback.
     image_points: []
     robot_points: []
+    apriltag:
+      enabled: true
+      dictionary: DICT_APRILTAG_36H11
+      tag_size_mm: 40.0
+      required_ids: [0, 1, 2, 3]
+      min_tags_for_pose: 2
+      min_samples: 12
+      max_samples: 120
+      max_reprojection_error_px: 2.5
+      max_tilt_from_down_deg: 45.0
+      # Each configured workspace corner coincides with the named outer corner
+      # of a tag placed inside the workspace. Printed tag top edges point
+      # toward robot +Y. All tags lie on workspace Z=0.
+      tags:
+        "0": {workspace_corner_mm: [-239.0, 86.5, 0.0], aligned_tag_corner: bottom_left, yaw_deg: 0.0}
+        "1": {workspace_corner_mm: [239.0, 86.5, 0.0], aligned_tag_corner: bottom_right, yaw_deg: 0.0}
+        "2": {workspace_corner_mm: [239.0, 401.5, 0.0], aligned_tag_corner: top_right, yaw_deg: 0.0}
+        "3": {workspace_corner_mm: [-239.0, 401.5, 0.0], aligned_tag_corner: top_left, yaw_deg: 0.0}
+      result:
 
 color_profiles:
   red:
@@ -275,6 +308,16 @@ task_defaults:
   pickup_height_mm: 25.0
   dropoff_height_mm: 45.0
   default_drop_zone: dropoff_a
+
+# Operator defaults used for new path previews and programs.
+path_defaults:
+  global_speed_deg_s: 25.0
+  global_accel_deg_s2: 120.0
+  waypoint_rate_hz: 12.0
+  cartesian_step_mm: 10.0
+  planner_type: s_curve
+  jerk_percent: 25.0
+  blend_percent: 0.0
 
 tools:
   active: gripper

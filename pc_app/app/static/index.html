@@ -4,7 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Modular 4DOF Arm Control</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css?v=20260618-settings-revamp-3" />
     <script type="importmap">
       {
         "imports": {
@@ -19,7 +20,7 @@
       <section class="app-layout" id="appLayout">
         <aside class="left-panel" aria-label="Sandbox controls">
           <div class="left-panel-scroll">
-            <header class="tab-header">
+            <header class="tab-header" id="tabHeader">
               <div class="panel-brand">
                 <span class="panel-brand-title">Modular 4DOF</span>
                 <span class="panel-brand-sub">Real arm sandbox</span>
@@ -82,7 +83,6 @@
                   <div id="gripperControls" class="button-row action-row">
                     <button id="toolOpenBtn" type="button">Open</button>
                     <button id="toolCloseBtn" type="button">Close</button>
-                    <button id="toolSetBtn" class="ghost" type="button">Set</button>
                   </div>
                   <div id="magnetControls" class="button-row action-row" hidden>
                     <button id="toolOnBtn" type="button">Magnet On</button>
@@ -236,74 +236,180 @@
               </section>
 
               <section id="settingsTab" class="app-tab">
-                <section class="panel-section">
+                <div class="settings-sticky">
+                  <div class="settings-save-bar">
+                    <div class="settings-save-copy" aria-live="polite">
+                      <span id="settingsSaveIndicator" class="settings-save-indicator"></span>
+                      <div>
+                        <strong id="settingsSaveStatus">No unsaved changes</strong>
+                        <p id="calibrationStatus">Geometry, joints, motion, tooling, hardware, and camera settings are saved separately where noted.</p>
+                      </div>
+                    </div>
+                    <div class="settings-save-actions">
+                      <button id="discardSettingsBtn" class="ghost" type="button" disabled>Discard changes</button>
+                      <button id="saveCalibrationBtn" class="primary" type="button" disabled>Save all settings</button>
+                    </div>
+                  </div>
+                  <nav class="settings-section-nav" aria-label="Settings sections">
+                    <button type="button" data-settings-target="settingsGeometry">Geometry</button>
+                    <button type="button" data-settings-target="settingsJoints">Joints</button>
+                    <button type="button" data-settings-target="settingsMotion">Motion</button>
+                    <button type="button" data-settings-target="settingsTooling">Tooling</button>
+                    <button type="button" data-settings-target="settingsCamera">Camera</button>
+                    <button type="button" data-settings-target="settingsHardware">Hardware</button>
+                  </nav>
+                </div>
+
+                <section class="panel-section settings-section" id="settingsGeometry">
                   <div class="section-header">
                     <div>
-                      <h2>Robot Model</h2>
-                      <p class="hint">Saved geometry and limits</p>
+                      <h2>Robot geometry</h2>
+                      <p class="hint">Physical dimensions used to derive the robot model. All lengths are millimeters.</p>
                     </div>
-                    <button id="saveCalibrationBtn" class="primary" type="button">Save</button>
                   </div>
-                  <h3>Measured Geometry</h3>
                   <div id="geometryPresetEditor" class="geometry-preset"></div>
-                  <h3>Derived Model</h3>
-                  <div id="linkCalibration" class="path-summary"></div>
-                  <div id="dhTableEditor" class="dh-table"></div>
-                  <p id="dhTableStatus" class="hint">DH rows are derived from measured geometry. Save to use the draft model for FK and IK.</p>
-                  <h3>Tool Dimensions</h3>
-                  <div id="toolCalibration" class="path-summary"></div>
-                  <h3>Motion Defaults</h3>
-                  <div class="control-grid">
-                    <label>Speed deg/s <input id="globalSpeedInput" type="number" min="0.1" step="1" /></label>
-                    <label>Accel deg/s2 <input id="globalAccelInput" type="number" min="0.1" step="5" /></label>
-                    <label>Waypoint Hz <input id="waypointRateInput" type="number" min="1" step="1" /></label>
-                    <label>Linear step mm <input id="cartesianStepInput" type="number" min="1" step="1" /></label>
-                    <label>Profile
+                  <details class="advanced-block">
+                    <summary>
+                      <span>Derived kinematic model</span>
+                      <small>Advanced: calculated DH values used by FK and IK</small>
+                    </summary>
+                    <div class="advanced-block-body">
+                      <div id="linkCalibration" class="path-summary"></div>
+                      <div id="dhTableEditor" class="dh-table"></div>
+                      <p id="dhTableStatus" class="field-help">The table is calculated from the physical dimensions above.</p>
+                    </div>
+                  </details>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsJoints">
+                  <div class="section-header">
+                    <div>
+                      <h2>Joint limits and calibration</h2>
+                      <p class="hint">Safe range limits motion. Home is the expected joint angle at the home pose. Zero offset aligns the software angle with the mechanism.</p>
+                    </div>
+                  </div>
+                  <div id="jointCalibration" class="joint-calibration"></div>
+                  <p class="field-help">Direction is positive when a positive software command increases the physical joint angle. Choose Inverted if the mechanism moves the opposite way.</p>
+                  <details class="advanced-block">
+                    <summary>
+                      <span>Encoder readback</span>
+                      <small>Current staged AS5048A diagnostics</small>
+                    </summary>
+                    <div class="advanced-block-body">
+                      <div id="encoderCalibration" class="path-summary"></div>
+                    </div>
+                  </details>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsMotion">
+                  <div class="section-header">
+                    <div>
+                      <h2>Motion defaults</h2>
+                      <p class="hint">Default planning limits. Per-joint limits below always take priority.</p>
+                    </div>
+                  </div>
+                  <div class="settings-field-grid">
+                    <label>Default speed
+                      <span class="input-with-unit"><input id="globalSpeedInput" type="number" min="0.1" step="1" /><span>deg/s</span></span>
+                    </label>
+                    <label>Default acceleration
+                      <span class="input-with-unit"><input id="globalAccelInput" type="number" min="0.1" step="5" /><span>deg/s²</span></span>
+                    </label>
+                    <label>Command update rate
+                      <span class="input-with-unit"><input id="waypointRateInput" type="number" min="1" step="1" /><span>Hz</span></span>
+                    </label>
+                    <label>Linear path step
+                      <span class="input-with-unit"><input id="cartesianStepInput" type="number" min="1" step="1" /><span>mm</span></span>
+                    </label>
+                    <label>Motion profile
                       <select id="plannerTypeSelect">
                         <option value="s_curve">S-curve</option>
                         <option value="trapezoid">Trapezoid</option>
                         <option value="linear">Linear test</option>
                       </select>
                     </label>
-                    <label>Smoothing %
-                      <input id="jerkPercentInput" type="number" min="0" max="45" step="1" value="25" />
+                    <label>Smoothing
+                      <span class="input-with-unit"><input id="jerkPercentInput" type="number" min="0" max="45" step="1" value="25" /><span>%</span></span>
                     </label>
-                    <label>Blend %
-                      <input id="blendPercentInput" type="number" min="0" max="45" step="1" value="0" />
+                    <label>Waypoint blend
+                      <span class="input-with-unit"><input id="blendPercentInput" type="number" min="0" max="45" step="1" value="0" /><span>%</span></span>
                     </label>
                   </div>
-                  <p id="calibrationStatus" class="hint">Draft edits do not affect FK or IK until saved.</p>
-                </section>
-
-                <section class="panel-section">
-                  <div class="section-header">
-                    <h2>Joint Calibration</h2>
-                    <span class="hint">limits, home, zero, direction</span>
+                  <div class="subsection-heading">
+                    <h3>Per-joint motion limits</h3>
+                    <p class="hint">Maximum speed and acceleration used for preview and execution.</p>
                   </div>
-                  <div id="jointCalibration" class="joint-calibration"></div>
-                  <div id="encoderCalibration" class="path-summary"></div>
+                  <div id="perJointTuning" class="per-joint-tuning"></div>
                 </section>
 
-                <section class="panel-section">
+                <section class="panel-section settings-section" id="settingsTooling">
                   <div class="section-header">
                     <div>
-                      <h2>Hardware IO</h2>
-                      <p class="hint">Pins and actuator mapping saved with Settings</p>
+                      <h2>Tooling</h2>
+                      <p class="hint">TCP offsets and electrical settings for each end effector.</p>
+                    </div>
+                  </div>
+                  <div id="toolCalibration" class="path-summary"></div>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsCamera">
+                  <div class="section-header">
+                    <div>
+                      <h2>Camera and workspace calibration</h2>
+                      <p class="hint">Logitech C270 at 1280×720. AprilTag 36h11 IDs 0–3 define workspace Z=0.</p>
+                    </div>
+                    <span id="aprilTagStatus" class="status-chip">Uncalibrated</span>
+                  </div>
+                  <div class="subsection-heading">
+                    <h3>Camera model</h3>
+                    <p class="hint">Image size and pinhole intrinsics. The current C270 values are an estimated starting point.</p>
+                  </div>
+                  <div class="control-grid camera-intrinsics-grid">
+                    <label>Camera index <input id="cameraSourceInput" type="number" min="0" step="1" /></label>
+                    <label>Image width <input id="cameraWidthInput" type="number" min="1" step="1" /></label>
+                    <label>Image height <input id="cameraHeightInput" type="number" min="1" step="1" /></label>
+                    <label>Horizontal focal length (fx) <input id="cameraFxInput" type="number" min="0.01" step="0.01" /></label>
+                    <label>Vertical focal length (fy) <input id="cameraFyInput" type="number" min="0.01" step="0.01" /></label>
+                    <label>Principal point X (cx) <input id="cameraCxInput" type="number" step="0.01" /></label>
+                    <label>Principal point Y (cy) <input id="cameraCyInput" type="number" step="0.01" /></label>
+                    <label>Lens distortion (k1, k2, p1, p2, k3)
+                      <input id="cameraDistortionInput" type="text" />
+                    </label>
+                  </div>
+                  <div class="button-row">
+                    <button id="saveCameraIntrinsicsBtn" type="button">Save camera settings</button>
+                  </div>
+                  <div class="subsection-heading">
+                    <h3>AprilTag pose calibration</h3>
+                    <p class="hint">Collect stable frames, save the solved camera pose, then verify it against a fresh image.</p>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="resetAprilTagBtn" type="button" class="ghost">Reset Samples</button>
+                    <button id="captureAprilTagBtn" type="button">Capture</button>
+                    <button id="collectAprilTagBtn" type="button" class="primary">Collect 12</button>
+                    <button id="saveAprilTagBtn" type="button">Save Pose</button>
+                    <button id="verifyAprilTagBtn" type="button">Verify</button>
+                  </div>
+                  <div class="camera-frame april-tag-frame">
+                    <img id="aprilTagFrame" alt="AprilTag calibration frame" />
+                    <div id="aprilTagPlaceholder">No AprilTag frame yet</div>
+                  </div>
+                  <div id="aprilTagMetrics" class="path-summary"></div>
+                  <div id="aprilTagDetections" class="program-list compact-list"></div>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsHardware">
+                  <div class="section-header">
+                    <div>
+                      <h2>Hardware I/O</h2>
+                      <p class="hint">Controller pins, drivers, servo ranges, and actuator mapping.</p>
                     </div>
                     <div class="button-row">
-                      <button id="syncHardwareBtn" class="ghost" type="button">Sync ESP</button>
+                      <button id="syncHardwareBtn" class="ghost" type="button">Save and sync controller</button>
                     </div>
                   </div>
                   <div id="hardwareStatus" class="path-summary"></div>
                   <div id="hardwareIo" class="hardware-io"></div>
-                </section>
-
-                <section class="panel-section">
-                  <div class="section-header">
-                    <h2>Per-Joint Limits</h2>
-                    <span class="hint">preview and execution defaults</span>
-                  </div>
-                  <div id="perJointTuning" class="per-joint-tuning"></div>
                 </section>
               </section>
             </div>
@@ -325,7 +431,11 @@
           <section class="scene-hud" id="sceneHud" aria-label="End effector HUD">
             <div class="scene-hud-header">
               <span>HUD</span>
-              <button class="hud-minimize" type="button" data-collapse-widget="sceneHud">&lsaquo;</button>
+              <button class="hud-minimize" type="button" data-collapse-widget="sceneHud" aria-label="Collapse HUD">
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M6 12l4-4 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
             </div>
             <div class="scene-hud-body">
               <div class="hud-section">
@@ -346,9 +456,26 @@
           <section class="scene-faders" id="sceneFaders" aria-label="Target faders">
             <div class="scene-hud-header">
               <span>Faders</span>
-              <button class="hud-minimize" type="button" data-collapse-widget="sceneFaders">&lsaquo;</button>
+              <button class="hud-minimize" type="button" data-collapse-widget="sceneFaders" aria-label="Collapse faders">
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M6 12l4-4 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
             </div>
             <div class="scene-hud-body">
+              <div class="cartesian-jog-strip">
+                <label class="live-toggle">
+                  <input id="cartesianJogToggle" type="checkbox" />
+                  <span>Cart Jog</span>
+                </label>
+                <label>TCP
+                  <input id="cartesianJogSpeedInput" type="number" min="1" max="200" step="1" value="60" />
+                </label>
+                <label>Phi
+                  <input id="cartesianJogPhiSpeedInput" type="number" min="1" max="180" step="1" value="45" />
+                </label>
+                <span id="cartesianJogStatus" class="status-chip">IK preview only</span>
+              </div>
               <div id="targetFaders" class="fader-list">
                 <div class="fader-row"><span>X</span><div class="target-fader" role="slider" aria-label="Adjust X target" data-fader-key="x" data-fader-speed="150"></div></div>
                 <div class="fader-row"><span>Y</span><div class="target-fader" role="slider" aria-label="Adjust Y target" data-fader-key="y" data-fader-speed="150"></div></div>
@@ -433,6 +560,6 @@
       </aside>
     </main>
 
-    <script type="module" src="/static/app.js"></script>
+    <script type="module" src="/static/app.js?v=20260618-settings-revamp-3"></script>
   </body>
 </html>

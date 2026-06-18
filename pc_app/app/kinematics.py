@@ -22,6 +22,9 @@ Standard DH kinematics with the project robot frame mapped from the DH frame:
 - Tool TCP +Z is treated as the tool-forward axis, which maps to local DH +X.
 """.strip()
 
+CARTESIAN_POSITION_PROGRESS_MIN_FRACTION = 0.20
+CARTESIAN_DIRECTION_ALIGNMENT_MIN = 0.95
+
 
 def _default_rows(links: LinkConfig) -> list[DHRowConfig]:
     return [
@@ -330,6 +333,180 @@ def _numeric_jacobian(target: dict[str, float], angles_deg: list[float], links: 
     return jacobian
 
 
+def differential_ik_step(
+    current_joints_deg: list[float],
+    task_delta: dict[str, float] | list[float] | tuple[float, ...],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    damping: float = 0.35,
+    max_joint_step_deg: float = 8.0,
+) -> dict[str, Any]:
+    """Solve one small Cartesian jog step with damped least-squares IK.
+
+    The task vector is [x_mm, y_mm, z_mm, phi_deg]. This is intended for
+    resolved-rate jogging; callers still need to apply velocity, acceleration,
+    stale-input, and hardware safety policy around it.
+    """
+    if len(current_joints_deg) != len(joints):
+        return {"ok": False, "error": f"expected {len(joints)} joint angles"}
+    if isinstance(task_delta, dict):
+        delta = np.array(
+            [
+                float(task_delta.get("x_mm", task_delta.get("x", 0.0))),
+                float(task_delta.get("y_mm", task_delta.get("y", 0.0))),
+                float(task_delta.get("z_mm", task_delta.get("z", 0.0))),
+                float(task_delta.get("phi_deg", task_delta.get("phi", 0.0))),
+            ],
+            dtype=float,
+        )
+    else:
+        if len(task_delta) != 4:
+            return {"ok": False, "error": "task_delta must have four values"}
+        delta = np.array([float(value) for value in task_delta], dtype=float)
+    if not np.all(np.isfinite(delta)):
+        return {"ok": False, "error": "task_delta contains a non-finite value"}
+
+    current = _clamp_to_limits([float(value) for value in current_joints_deg], joints)
+    jacobian = _numeric_jacobian({}, current, links)
+    active_rows: list[int] = []
+    if float(np.linalg.norm(delta[:3])) > 1e-9:
+        active_rows.extend([0, 1, 2])
+    if abs(float(delta[3])) > 1e-9:
+        active_rows.append(3)
+    if not active_rows:
+        current_fk = forward_kinematics(current, links)
+        return {
+            "ok": True,
+            "target_angles_deg": current,
+            "joint_delta_deg": [0.0 for _ in current],
+            "raw_joint_delta_deg": [0.0 for _ in current],
+            "requested_delta": {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0},
+            "achieved_delta": {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0},
+            "candidate_achieved_delta": {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0},
+            "position_progress_mm": 0.0,
+            "position_lateral_mm": 0.0,
+            "position_alignment": None,
+            "predicted_fk": current_fk,
+            "condition": 0.0,
+            "singularity_warning": False,
+            "blocked": False,
+            "notes": [],
+        }
+    task_jacobian = jacobian[active_rows, :]
+    task_delta = delta[active_rows]
+    lhs = task_jacobian @ task_jacobian.T + (max(float(damping), 1e-6) ** 2) * np.identity(len(active_rows))
+    try:
+        condition = float(np.linalg.cond(lhs))
+        joint_delta = task_jacobian.T @ np.linalg.solve(lhs, task_delta)
+    except np.linalg.LinAlgError:
+        return {"ok": False, "error": "differential IK solve failed"}
+
+    raw_joint_delta = joint_delta.copy()
+    max_step = max(0.001, float(max_joint_step_deg))
+    max_requested_step = float(np.max(np.abs(joint_delta))) if joint_delta.size else 0.0
+    joint_step_scale = 1.0
+    if max_requested_step > max_step:
+        joint_step_scale = max_step / max(max_requested_step, 1e-9)
+        joint_delta = joint_delta * joint_step_scale
+    unclamped_target = [angle + float(step) for angle, step in zip(current, joint_delta, strict=True)]
+    candidate_target = _clamp_to_limits(unclamped_target, joints)
+    limit_reasons = _joint_limit_reasons(joints, unclamped_target)
+    candidate_fk = forward_kinematics(candidate_target, links)
+    current_fk = forward_kinematics(current, links)
+    candidate_delta = {
+        "x_mm": float(candidate_fk["x_mm"] - current_fk["x_mm"]),
+        "y_mm": float(candidate_fk["y_mm"] - current_fk["y_mm"]),
+        "z_mm": float(candidate_fk["z_mm"] - current_fk["z_mm"]),
+        "phi_deg": float(_signed_angle_error_deg(candidate_fk["tool_phi_deg"], current_fk["tool_phi_deg"])),
+    }
+    requested_norm = float(np.linalg.norm(delta[:3]))
+    achieved_position = np.array([candidate_delta["x_mm"], candidate_delta["y_mm"], candidate_delta["z_mm"]])
+    achieved_norm = float(np.linalg.norm(achieved_position))
+    position_progress = 0.0
+    position_lateral = 0.0
+    position_alignment: float | None = None
+    if requested_norm > 1e-6:
+        requested_direction = delta[:3] / requested_norm
+        position_progress = float(achieved_position @ requested_direction)
+        lateral_vector = achieved_position - position_progress * requested_direction
+        position_lateral = float(np.linalg.norm(lateral_vector))
+        position_alignment = position_progress / max(achieved_norm, 1e-9)
+    position_blocked = (
+        requested_norm > 1e-6
+        and position_progress < requested_norm * CARTESIAN_POSITION_PROGRESS_MIN_FRACTION
+    )
+    direction_blocked = (
+        requested_norm > 1e-6
+        and achieved_norm > requested_norm * CARTESIAN_POSITION_PROGRESS_MIN_FRACTION
+        and position_alignment is not None
+        and position_alignment < CARTESIAN_DIRECTION_ALIGNMENT_MIN
+    )
+    requested_phi = abs(float(delta[3]))
+    achieved_phi = abs(float(candidate_delta["phi_deg"]))
+    phi_blocked = requested_phi > 1e-6 and achieved_phi < requested_phi * 0.2
+    notes: list[str] = []
+    failure_code: str | None = None
+    failure_reason: str | None = None
+    if position_blocked:
+        failure_code = "local_step_unreachable"
+        failure_reason = "requested Cartesian step is locally unreachable from the current pose"
+        notes.append(failure_reason)
+    if direction_blocked:
+        failure_code = failure_code or "excessive_lateral_drift"
+        failure_reason = failure_reason or (
+            "near singularity or a joint limit: the requested axis would cause excessive lateral TCP drift"
+        )
+        notes.append(
+            "near singularity or a joint limit: the requested axis would cause excessive lateral TCP drift"
+        )
+    if phi_blocked:
+        failure_code = failure_code or "phi_step_unreachable"
+        failure_reason = failure_reason or "requested tool-angle step is locally unreachable from the current pose"
+        notes.append("requested tool-angle step is locally unreachable from the current pose")
+    if condition > 1e6:
+        notes.append("near-singular Jacobian")
+    if joint_step_scale < 1.0 - 1e-9:
+        notes.append("joint step scaled")
+    notes.extend(limit_reasons)
+    if limit_reasons and failure_code is None:
+        failure_code = "joint_limit"
+        failure_reason = limit_reasons[0]
+    hard_blocked = position_blocked or direction_blocked or phi_blocked
+    target = current if hard_blocked else candidate_target
+    predicted_fk = current_fk if hard_blocked else candidate_fk
+    achieved_delta = (
+        {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "phi_deg": 0.0}
+        if hard_blocked
+        else candidate_delta
+    )
+    blocked = bool(limit_reasons) or hard_blocked
+
+    return {
+        "ok": True,
+        "target_angles_deg": target,
+        "joint_delta_deg": [float(value) for value in (np.array(target) - np.array(current))],
+        "raw_joint_delta_deg": [float(value) for value in raw_joint_delta],
+        "requested_delta": {
+            "x_mm": float(delta[0]),
+            "y_mm": float(delta[1]),
+            "z_mm": float(delta[2]),
+            "phi_deg": float(delta[3]),
+        },
+        "achieved_delta": achieved_delta,
+        "candidate_achieved_delta": candidate_delta,
+        "position_progress_mm": position_progress,
+        "position_lateral_mm": position_lateral,
+        "position_alignment": position_alignment,
+        "predicted_fk": predicted_fk,
+        "condition": condition,
+        "singularity_warning": condition > 1e6,
+        "blocked": blocked,
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "notes": notes,
+    }
+
+
 def _clamp_to_limits(angles_deg: list[float], joints: list[JointConfig]) -> list[float]:
     return [max(joint.min_deg, min(joint.max_deg, angle)) for angle, joint in zip(angles_deg, joints, strict=True)]
 
@@ -591,10 +768,10 @@ def _select_candidate(
     return min(
         candidates,
         key=lambda candidate: (
+            _candidate_continuity_error(candidate, current),
             candidate["position_error_mm"],
             candidate.get("phi_error_deg", 0.0),
-            0 if candidate["branch"] == "elbow_down" else 1,
-            _candidate_continuity_error(candidate, current),
+            0 if candidate["branch"] in {"current_seed", "elbow_down"} else 1,
         ),
     ), notes
 

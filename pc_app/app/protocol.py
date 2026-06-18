@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .config import JointConfig
 
@@ -18,6 +19,57 @@ def format_movej(joints_deg: list[float], speed: float, accel: float) -> str:
         raise ValueError("MOVEJ requires exactly four joint angles")
     values = " ".join(f"{angle:.3f}" for angle in joints_deg)
     return f"MOVEJ {values} {speed:.3f} {accel:.3f}"
+
+
+def format_jogj(joints_deg: list[float], speed: float, accel: float) -> str:
+    if len(joints_deg) != 4:
+        raise ValueError("JOGJ requires exactly four joint angles")
+    if speed <= 0 or accel <= 0:
+        raise ValueError("JOGJ requires positive speed and acceleration")
+    values = " ".join(f"{angle:.3f}" for angle in joints_deg)
+    return f"JOGJ {values} {speed:.3f} {accel:.3f}"
+
+
+def format_jogv(joint_velocity_deg_s: list[float], accel: float) -> str:
+    if len(joint_velocity_deg_s) != 4:
+        raise ValueError("JOGV requires exactly four joint velocities")
+    if accel <= 0:
+        raise ValueError("JOGV requires positive acceleration")
+    values = " ".join(f"{velocity:.3f}" for velocity in joint_velocity_deg_s)
+    return f"JOGV {values} {accel:.3f}"
+
+
+def format_jog_stop() -> str:
+    return "JOG STOP"
+
+
+def format_traj_begin(point_count: int, duration_s: float, speed: float, accel: float) -> str:
+    if point_count < 2:
+        raise ValueError("TRAJ BEGIN requires at least two points")
+    if duration_s <= 0:
+        raise ValueError("TRAJ BEGIN requires a positive duration")
+    if speed <= 0 or accel <= 0:
+        raise ValueError("TRAJ BEGIN requires positive speed and acceleration")
+    return f"TRAJ BEGIN count={point_count} duration={duration_s:.3f} speed={speed:.3f} accel={accel:.3f}"
+
+
+def format_traj_point(index: int, time_s: float, joints_deg: list[float]) -> str:
+    if index < 0:
+        raise ValueError("TRAJ POINT index must be non-negative")
+    if time_s < 0:
+        raise ValueError("TRAJ POINT time must be non-negative")
+    if len(joints_deg) != 4:
+        raise ValueError("TRAJ POINT requires exactly four joint angles")
+    values = " ".join(f"j{joint_index}={angle:.3f}" for joint_index, angle in enumerate(joints_deg, start=1))
+    return f"TRAJ POINT index={index} t={time_s:.3f} {values}"
+
+
+def format_traj_start() -> str:
+    return "TRAJ START"
+
+
+def format_traj_clear() -> str:
+    return "TRAJ CLEAR"
 
 
 def format_stop() -> str:
@@ -55,7 +107,51 @@ def format_tool(action: str, value: float | None = None) -> str:
     raise ValueError(f"unsupported TOOL action {action}")
 
 
-def format_config_lines(joints: list[JointConfig]) -> list[str]:
+def _tool_config_lines(tools: dict[str, Any] | None) -> list[str]:
+    if not isinstance(tools, dict):
+        return []
+    active = str(tools.get("active", "gripper")).replace(" ", "_")
+    presets = tools.get("presets")
+    if not isinstance(presets, dict):
+        return []
+
+    lines: list[str] = []
+    for name, preset in presets.items():
+        if not isinstance(preset, dict):
+            continue
+        tool_type = str(preset.get("type", "generic")).replace(" ", "_")
+        safe_name = str(name).replace(" ", "_")
+        tcp = preset.get("tcp_offset_mm") if isinstance(preset.get("tcp_offset_mm"), dict) else {}
+        common = (
+            "CONFIG TOOL "
+            f"name={safe_name} active={1 if safe_name == active else 0} type={tool_type} "
+            f"tcp_x={float(tcp.get('x', 0.0)):.3f} "
+            f"tcp_y={float(tcp.get('y', 0.0)):.3f} "
+            f"tcp_z={float(tcp.get('z', 0.0)):.3f}"
+        )
+        io = preset.get("io") if isinstance(preset.get("io"), dict) else {}
+        if tool_type == "servo_gripper":
+            lines.append(
+                common
+                + f" open={float(preset.get('open_value', 0.0)):.3f}"
+                + f" close={float(preset.get('closed_value', 1.0)):.3f}"
+                + f" pwm={int(io.get('pwm_pin', -1))}"
+                + f" min_us={int(io.get('pulse_min_us', 500))}"
+                + f" max_us={int(io.get('pulse_max_us', 2500))}"
+                + f" freq={int(io.get('pwm_frequency_hz', 50))}"
+            )
+        elif tool_type == "electromagnet":
+            lines.append(
+                common
+                + f" pin={int(io.get('pin', -1))}"
+                + f" active_high={1 if bool(io.get('active_high', True)) else 0}"
+            )
+        else:
+            lines.append(common)
+    return lines
+
+
+def format_config_lines(joints: list[JointConfig], tools: dict[str, Any] | None = None) -> list[str]:
     if len(joints) != 4:
         raise ValueError("hardware CONFIG requires exactly four joints")
     lines = ["CONFIG BEGIN axes=4"]
@@ -88,6 +184,7 @@ def format_config_lines(joints: list[JointConfig]) -> list[str]:
                 f"driver={driver_model} full_steps={stepper.motor_full_steps_per_rev} "
                 f"microsteps={stepper.microsteps} gear={stepper.gear_ratio:.6f}"
             )
+    lines.extend(_tool_config_lines(tools))
     lines.append("CONFIG END")
     return lines
 

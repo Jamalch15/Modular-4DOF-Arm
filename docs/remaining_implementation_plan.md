@@ -20,28 +20,41 @@ Currently present at a rough level:
 
 - Main tabs have been renamed to `Control`, `Tasks`, `Kinematics`, `Program`, and `Settings`.
 - The old permanent COM text box has been replaced with a serial modal.
-- The Control tab has a gripper/magnet tool selector.
-- The backend has generic `TOOL` commands and a `tools` config section.
+- The Control tab has a gripper/magnet tool selector and shows only the matching control group for the selected tool.
+- The backend has tool-type-aware `TOOL` commands, a `tools` config section, and active tool validation.
 - The backend has a Standard DH data model and Jacobian IK plumbing.
 - The app has an editable MATLAB prototype geometry preset with `L_1..L_9`, `s4`, `s6`, and `s8`.
+- The Settings view has a derived DH table, but it is currently read-only.
 - The 3D view has DH-based rendering and object marker plumbing.
 - The backend has basic color/blob vision helpers and task sequence builders.
 - Firmware/backend protocol parsing includes some newer status fields.
+- Firmware/backend now have a timed `TRAJ` upload/start path for multi-waypoint motion, replacing repeated hardware `MOVEJ` waypoint streaming for linear/program paths.
+- The viewport faders have a first-pass Cartesian live jog mode using differential IK and `JOGV` firmware velocity updates.
 - Encoder readback fields exist in software, but are not a real hardware workflow yet.
+- Analytic IK seed generation exists as a backend first pass and has regression tests.
+- Backend unit tests currently pass, and the protocol stub plus full-arm controller firmware targets build.
+
+Recent verification from the 2026-06-17 audit and the 2026-06-18 calibration continuation:
+
+- `python -m pytest -q` in `pc_app`: 92 passed, with two FastAPI `on_event` deprecation warnings.
+- Python compilation, frontend ES-module syntax checks, API/static route smoke checks, and the documented AprilTag CLI `--help` invocation passed.
+- `pio run -e esp32-s3-arm-protocol-stub -e esp32-s3-arm-controller`: both firmware targets built successfully.
+- Headless Chrome rendered UI check through DevTools Protocol: selecting `Gripper` shows only gripper controls and the slider; selecting `Magnet` shows only magnet controls; no browser console errors were reported.
+- No real hardware movement or real tool IO was verified during this audit.
 
 Still missing or not production-ready:
 
 - Control preview/live jog behavior needs to be proven stable.
-- Tool controls are still shallow and should show only the selected tool controls.
-- Tool dimensions do not fully drive the active TCP model.
-- Tool and encoder pins cannot be properly edited from Settings.
+- Tool controls switch by selected tool, and unsupported tool commands are rejected in software; real unsafe/hardware states still need physical validation.
+- Tool TCP offsets drive the backend active TCP model as a first pass; visible 3D tool geometry and physical calibration still need work.
+- Tool pins can be edited from Settings. Encoder pins cannot be properly edited from Settings yet.
 - Camera preview should move out of the side panel into a movable popup.
-- DH editing needs to become a proper table, not generic input blocks.
-- The current kinematics implementation should be reconciled with the MATLAB prototype.
+- DH editing needs an editable table workflow; the current table is derived/read-only.
+- FK and analytic seeding have been partially reconciled with the MATLAB prototype, but the Jacobian implementation still needs to be reconciled with the DH-frame cross-product model.
 - The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
 - Calibration is not yet a guided workflow.
-- AprilTag-based camera/world calibration is not implemented yet.
-- The viewport does not yet show the camera pose, tag boards, camera frustum, or camera image projected into robot space.
+- AprilTag-based camera/world calibration is implemented as a first pass with a fixed four-tag workspace layout, multi-frame accumulation, pose-quality checks, persistence, and verification.
+- The viewport now shows configured AprilTags and a solved camera frustum in calibration/frame mode. Projecting the live camera image onto the workspace is still missing.
 - Planned, estimated, and actual executed TCP paths are not clearly separated in the viewport.
 - Cartesian waypoint execution does not yet guarantee blended continuous motion through waypoints.
 - End-effector speed/acceleration limits in `mm/s` and `mm/s^2` are not first-class motion settings yet.
@@ -231,7 +244,9 @@ This order keeps useful operator fixes first, then builds the kinematics and mov
 
 ### SHELL-01: Control Preview And Live Jog Stability
 
-Status: needs verification and likely refinement.
+Status: implemented as a source-level first pass; needs browser and hardware verification.
+
+Reality note: frontend state now separates draft, commanded, pending, and reported angles well enough on source review. This still needs rendered UI testing during live jog and real hardware feedback.
 
 Work:
 
@@ -255,6 +270,8 @@ Acceptance:
 
 Status: missing.
 
+Reality note: source review still shows the camera frame rendered inline in the Tasks side panel.
+
 Work:
 
 - Remove the large inline camera preview from the Tasks side panel.
@@ -271,7 +288,9 @@ Acceptance:
 
 ### SHELL-03: HUD And Fader Chrome Polish
 
-Status: missing.
+Status: partial; placement and arrows still need UI polish.
+
+Reality note: HUD and fader widgets have collapse buttons and CSS rotation, but the placement and arrow direction have not been browser-verified and still match the user-reported problem area.
 
 Work:
 
@@ -288,7 +307,9 @@ Acceptance:
 
 ### SHELL-04: Serial Modal Polish
 
-Status: partial.
+Status: implemented as a first pass; stale-port behavior still needs hardware verification.
+
+Reality note: serial connection is modal, lists detected ports with descriptions/HWID, supports baud selection, and saves the last selected port after a successful connection.
 
 Work:
 
@@ -307,7 +328,9 @@ Acceptance:
 
 ### TOOL-01: Selected Tool Controls Only
 
-Status: partial.
+Status: implemented as a first pass; needs real hardware validation.
+
+Reality note: the Control tab now hides gripper controls for magnet and hides magnet controls for gripper, including the CSS `[hidden]` override fix that caused both groups to appear at once. Frontend command buttons are gated by connection/armed/fault state, and backend tool actions reject commands unsupported by the active tool type. A headless Chrome rendered check verified the gripper and magnet selection behavior; real hardware behavior still needs validation.
 
 Work:
 
@@ -330,7 +353,9 @@ Acceptance:
 
 ### TOOL-02: End-Effector Settings And IO Editor
 
-Status: missing.
+Status: implemented as a first pass; needs hardware values and operator review.
+
+Reality note: Settings now has editable tool preset cards for type, display label, TCP offset, gripper servo IO/range/open-close values, and magnet GPIO/polarity. Saves go through `robot.local.yaml` calibration updates with validation before persistence. The real pin numbers, pulse ranges, and TCP offsets still need to be confirmed on the physical build.
 
 Work:
 
@@ -354,7 +379,9 @@ Acceptance:
 
 ### TOOL-03: Active Tool TCP Integration
 
-Status: partial or missing.
+Status: implemented as a backend first pass; 3D geometry and physical calibration still incomplete.
+
+Reality note: the backend loads the active tool TCP offset and applies it through the active link/tool model. The UI editor can update the offsets, active tool geometry changes mark tool calibration stale, and pick/place task tool steps now follow the active tool type. The 3D view does not yet visibly change the rendered tool geometry, and the physical TCP offsets are still unvalidated.
 
 Work:
 
@@ -372,7 +399,9 @@ Acceptance:
 
 ### TOOL-04: Real Firmware Tool IO
 
-Status: protocol exists, real IO likely incomplete.
+Status: implemented as a firmware first pass; real IO untested.
+
+Reality note: the PC config sync now emits active `CONFIG TOOL` lines, the protocol stub accepts them, and `arm_controller.cpp` parses the active tool config. The controller drives a configured gripper PWM output for `OPEN`, `CLOSE`, and `SET`, drives a configured magnet GPIO for `ON` and `OFF`, rejects unsupported commands for the active tool type, and sets the tool safe on boot/stop/fault/disable. This has compiled for the ESP32-S3 targets, but it has not been tested against the real servo, transistor, magnet, or power wiring.
 
 Work:
 
@@ -412,9 +441,9 @@ Acceptance:
 
 ### KIN-02: Professional DH Table Editor
 
-Status: implemented as a first pass.
+Status: partial.
 
-Reality note: the table editor now validates and previews DH drafts, but it is not yet a guided calibration workflow.
+Reality note: the Settings UI now renders the derived DH rows as a table and validates the derived draft, but the table is read-only. Direct DH-row editing in a proper table is still missing.
 
 Work:
 
@@ -474,7 +503,9 @@ Acceptance:
 
 ### KIN-04: Analytic Seed Before Jacobian IK
 
-Status: missing or incomplete.
+Status: implemented as a backend first pass.
+
+Reality note: analytic seed candidate generation exists, runs before the numerical solver for the measured-prototype DH shape, and is covered by regression tests. It still needs hardware validation and clearer UI diagnostics for rejected seeds and selected branches.
 
 Work:
 
@@ -500,6 +531,8 @@ Acceptance:
 ### KIN-05: DH-Based Jacobian IK Diagnostics
 
 Status: partial.
+
+Reality note: IK reports candidates, selected branch, convergence errors, iterations, notes, and singularity warnings. The current solver still uses a finite-difference numeric Jacobian, not the DH-frame axis cross-product Jacobian from the MATLAB prototype.
 
 Work:
 
@@ -638,7 +671,9 @@ Acceptance:
 
 ### MOVE-05: Motion Diagnostics
 
-Status: missing.
+Status: partial.
+
+Reality note: backend motion diagnostics track run id, execution state, waypoint progress, expected/actual duration, final error, controller response, and actual TCP samples. The UI diagnostics are still not organized into the full motion/IK plots and failure-mode views described below.
 
 Work:
 
@@ -726,14 +761,27 @@ Acceptance:
 
 ### MOVE-08: Continuous Cartesian Live Jog And Plane Drawing
 
-Status: new idea, missing.
+Status: implemented as a first pass for live Cartesian jog; plane drawing remains missing.
 
-Goal: dragging X/Y/Z controls should make the TCP move smoothly along straight Cartesian directions, and later allow drawing constrained paths in planes.
+Goal: dragging X/Y/Z/Phi controls should make the TCP move smoothly along Cartesian directions without running a full endpoint IK preview/planning cycle for every tiny UI change. Later this can support constrained plane drawing.
+
+Working assumption: this should be implemented as resolved-rate Cartesian jogging / differential IK. The current full IK preview path is still useful for "go to this point", but it is too heavy and too stop-start for live slider control.
+
+Reality note: the viewport faders now have an explicit `Cart Jog` mode with TCP and Phi speed limits. With that mode off they are preview-only; `Live Real` alone does not turn an IK target preview into Cartesian jogging. The backend exposes `/api/cartesian-jog` and `/api/cartesian-jog/stop`, computes one bounded local resolved-rate step per velocity sample with damped least-squares differential IK, seeds simulation jogs from the reported/current pose, vector-scales joint steps/velocity limits so the joint direction is not distorted, and uses `JOGV`/`JOG STOP` for hardware. Rejected samples are not accumulated as a hidden Cartesian endpoint, so a smaller or reverse command is evaluated immediately from the last accepted seed. Frontend jog and stop requests are serialized so an old response cannot overwrite a newer drag. Translation-only jogs do not silently constrain Phi; Phi is included when the Phi jog command is non-zero. Firmware and the no-motor stub accept `JOGV`; the full controller integrates streamed joint velocities with acceleration limiting and has a watchdog that ramps velocity toward zero if updates stop. Locally constrained or near-singular directions report whether the local step is unreachable, would cause excessive lateral drift, or hit a joint limit. A repeatable simulation/debug harness exists at `pc_app/tools/debug_cartesian_jog.py` to sweep known poses and classify paths before testing on hardware. This has unit-test coverage, but live hardware smoothness still needs physical validation.
 
 Work:
 
-- Add a live Cartesian jog mode separate from joint live jog.
-- Treat X/Y/Z sliders or faders as Cartesian target/velocity commands, not as one-off IK endpoint commands.
+- Add a live Cartesian jog mode separate from joint live jog. Status: first pass implemented.
+- Add operator controls for:
+  - X jog,
+  - Y jog,
+  - Z jog,
+  - Phi jog or fixed/auto phi behavior,
+  - TCP jog speed,
+  - live-enable/deadman state for hardware.
+  Status: first pass implemented through viewport faders, `Cart Jog`, TCP/Phi speed fields, and existing Live Real/Arm gating.
+- Treat X/Y/Z/Phi sliders or faders as Cartesian velocity or small-delta commands, not as one-off IK endpoint commands.
+- Prefer "hold/drag to jog" controls over absolute sliders for the first hardware version so accidental large target jumps are harder to create.
 - Maintain a live Cartesian goal state:
   - current TCP,
   - desired TCP,
@@ -741,11 +789,31 @@ Work:
   - phi fixed or auto,
   - TCP speed/accel limits.
 - Run a continuous PC-side control loop:
-  - sample UI target at a fixed rate,
+  - throttle browser input to a fixed command rate, for example 20-30 Hz,
+  - sample UI target or commanded Cartesian velocity at a fixed rate,
   - generate a bounded Cartesian step,
-  - solve IK from the previous joint pose,
-  - stream joint targets at a safe fixed rate,
+  - compute joint deltas with a Jacobian pseudo-inverse or damped least-squares differential IK,
+  - seed each update from the previous joint solution/current reported pose, not a fresh global solve,
+  - clamp joint velocity, joint acceleration, joint limits, TCP speed, and TCP acceleration,
+  - stream short joint targets or mini timed `TRAJ` updates at a safe fixed rate,
   - stop cleanly when input stops or target is reached.
+  Status: implemented with `/api/cartesian-jog`, differential IK, command throttling, speed/accel clamping, and `JOGV`.
+- Add singularity and limit handling:
+  - damped least-squares fallback near singular Jacobians,
+  - reject or slow commands that require excessive joint velocity,
+  - show blocked directions when workspace, joint limit, or singularity limits prevent motion,
+  - avoid branch flips by keeping continuity from the previous solution.
+  Status: implemented for live jog with direction-authority checks and regression tests. The current policy intentionally blocks some near-singular local directions rather than allowing a visible sideways TCP drift.
+- Add backend API shape for Cartesian jog:
+  - start/stop live Cartesian jog,
+  - update commanded Cartesian velocity/delta,
+  - return current TCP, accepted command, clamped command, and block reason,
+  - enforce stale-input timeout.
+- Add firmware/protocol support if needed after the PC-side prototype:
+  - a live jog/servo mode with watchdog timeout,
+  - queued mini-trajectories that replace smoothly,
+  - no uncontrolled motion if PC updates stop.
+  Status: `JOGV` live jog with acceleration ramping and watchdog deceleration is implemented. Queued mini-trajectory replacement remains a possible refinement if hardware tests show velocity jog is still not smooth enough.
 - Add optional plane constraints:
   - XY plane at fixed Z,
   - XZ plane at fixed Y,
@@ -765,7 +833,9 @@ Work:
 
 Acceptance:
 
-- Moving an X/Y/Z control produces smooth TCP motion in the intended Cartesian direction.
+- Moving an X/Y/Z/Phi control produces smooth TCP motion in the intended Cartesian direction.
+- The first usable version feels responsive without solving full endpoint IK for every slider event.
+- Near singularities or joint limits, the UI shows that a direction is blocked or slowed instead of twitching or jumping.
 - The viewport shows the estimated path and the actual executed TCP trail.
 - Plane drawing can constrain motion to a selected plane and record the result.
 - Stopping input stops motion without leaving stale targets streaming.
@@ -833,7 +903,9 @@ Acceptance:
 
 ### CAL-04: Named Positions
 
-Status: partial or missing.
+Status: partial.
+
+Reality note: default named positions and backend validation exist, and the UI can preview/move them. Editable named-position management and save/delete workflows are still missing.
 
 Work:
 
@@ -858,6 +930,8 @@ Acceptance:
 
 Status: missing.
 
+Reality note: Settings currently shows encoder summary rows for every configured axis, including disabled elbow/wrist entries. Normal operator settings should expose only base/shoulder encoder setup for the current hardware plan.
+
 Work:
 
 - Show only base and shoulder encoder setup in normal Settings.
@@ -878,6 +952,8 @@ Acceptance:
 ### ENC-02: Config-Driven AS5048A Readback
 
 Status: partial.
+
+Reality note: `arm_controller.cpp` has optional compile-time AS5048A readback for base/shoulder using fixed build-time CS pins. It is not yet driven from PC-app encoder settings, and zero offset/direction handling is not yet applied in firmware status.
 
 Work:
 
@@ -923,7 +999,9 @@ Acceptance:
 
 ### ENC-04: Encoder Verification And Fault Detection
 
-Status: missing.
+Status: partial backend plumbing.
+
+Reality note: the backend can compare reported encoder angles to commanded targets and set an encoder fault, but this is not yet a guided workflow and has not been proven with real AS5048A hardware.
 
 Work:
 
@@ -981,6 +1059,8 @@ Future work:
 ### VISION-01: Live Annotated Camera Popup
 
 Status: missing.
+
+Reality note: detection refresh and annotated frame plumbing exist, but the UI still renders the camera inline in the Tasks side panel.
 
 Work:
 
@@ -1055,9 +1135,11 @@ Acceptance:
 
 ### VISION-05: AprilTag World Anchors
 
-Status: new idea, missing.
+Status: implemented as a first pass for the fixed workspace.
 
-Working assumption: AprilTags will be mounted at known positions relative to the robot base or workspace plane. The exact tag family, tag size, and mounting pattern are not yet decided.
+Working assumption: `DICT_APRILTAG_36H11` tags 0-3 are 40 mm squares placed inside the workspace. The configured coordinates are the four 478 x 315 mm workspace corners, not tag centers. Tag 0's bottom-left, tag 1's bottom-right, tag 2's top-right, and tag 3's top-left corner coincide with those workspace corners. Each printed top edge points toward robot +Y. The Logitech C270 currently uses a clearly labeled 55-degree-diagonal-FOV intrinsic estimate; per-camera checkerboard calibration remains required for accurate distortion and millimeter projection.
+
+Reality note: `app/apriltag_calibration.py` now owns tag detection, world-corner generation, robust PnP solving/refinement, planar homography fallback, camera-pose inversion, reprojection/tilt/inlier/confidence metrics, frame accumulation, distortion-aware workspace-plane ray projection, and invalidation when camera pixel geometry changes. FastAPI exposes reset, capture/accumulate, status, save, and verify endpoints. Settings provides intrinsics entry, collection, save, verification, annotated frames, and metrics. `tools/calibrate_apriltags.py` provides the same fixed-camera workflow outside the GUI. Saving requires every configured tag to reach the minimum observation count and an accepted 6-DoF pose.
 
 Work:
 
@@ -1085,7 +1167,9 @@ Acceptance:
 
 ### VISION-06: Camera-Space To Robot-Space Object Mapping
 
-Status: new idea, missing.
+Status: implemented as a first pass for objects on workspace Z=0.
+
+Reality note: color-blob centers now use a saved accepted AprilTag camera pose to cast a camera ray onto workspace Z=0. Detection output records the camera-pose ID and coordinate source. The old four-point homography remains the fallback when no accepted pose exists. Bounding/quality checks against the physical workspace and non-planar object support remain open.
 
 Work:
 
@@ -1138,6 +1222,8 @@ Acceptance:
 ### TASK-01: Dedicated Task Panel
 
 Status: placeholder-level.
+
+Reality note: task sequence builders and preview/execute endpoints exist, but the operator workflow still mixes task settings, inline camera, detection summaries, and execution controls in a prototype layout.
 
 Work:
 
@@ -1278,7 +1364,9 @@ Acceptance:
 
 ### VIEW-04: AprilTag And Camera Pose Overlay
 
-Status: new idea, missing.
+Status: implemented as a first-pass calibration overlay.
+
+Reality note: the viewport renders the configured tag squares and IDs on workspace Z=0 plus a camera body/frustum colored by accepted/rejected pose state. The overlay follows the existing Frames visibility toggle. Detailed stale/unknown-tag states and a dedicated overlay toggle remain open.
 
 Work:
 
@@ -1332,6 +1420,8 @@ Acceptance:
 
 Status: partial.
 
+Reality note: the UI/protocol no longer exposes software microstep pins, and sync is guarded while motion/live/task execution is active. Physical TB6600 timing, wiring, and config-sync behavior still need hardware validation.
+
 Work:
 
 - Remove software microstep pin fields from the UI.
@@ -1351,7 +1441,9 @@ Acceptance:
 
 ### FW-02: Protocol Status Extensions
 
-Status: partial.
+Status: implemented as a first pass.
+
+Reality note: backend parsing and firmware status output include known pose, pose source, encoder availability, encoder angles, closed-loop mode, tool state, and tool value fields while keeping older status lines parseable.
 
 Work:
 
@@ -1376,6 +1468,8 @@ Acceptance:
 
 Status: partial.
 
+Reality note: PC and firmware have Stop/ESTOP paths and motion cancellation. Tool-output fail-safe behavior cannot be complete until real tool IO exists.
+
 Work:
 
 - Keep internal emergency/fault handling.
@@ -1390,27 +1484,21 @@ Acceptance:
 
 ### FW-04: Queued And Blended Trajectory Following
 
-Status: missing.
+Status: partial.
 
-Problem: sending many independent `MOVEJ` commands can create stop-start behavior if the controller treats each waypoint as its own target. Smooth Cartesian motion needs either a blended waypoint queue or a higher-rate target-following mode with clear timing.
+Problem: sending many independent `MOVEJ` commands can create stop-start behavior if the controller treats each waypoint as its own target. Smooth Cartesian motion needs a queued path or a higher-rate target-following mode with clear timing.
+
+Reality note: the dashboard now uploads multi-waypoint hardware paths with `TRAJ BEGIN`, sequential `TRAJ POINT` lines containing `time_from_start_s`, and `TRAJ START`. The full-arm controller stores the timed queue, interpolates between points with a clamped cubic Hermite segment, and clears the queue on stop, E-stop, home, set-pose, disarm, config changes, or a new `MOVEJ`. The no-motor protocol stub accepts the same commands for safe integration testing. This has compiled, but real hardware smoothness still needs validation.
 
 Work:
 
-- Add a trajectory/streaming protocol that supports one of:
-  - queued waypoints with timestamps,
-  - queued waypoints with segment durations,
-  - fixed-rate target streaming with watchdog timeout.
-- Add controller-side blending so the arm does not fully decelerate at every intermediate waypoint unless commanded.
+- Validate the queued timestamp protocol on real hardware.
+- Tune controller-side interpolation/blending so the arm does not fully decelerate at every intermediate waypoint unless commanded.
 - Support synchronized joint arrival across axes.
 - Apply speed and acceleration limits consistently for steppers and servos.
-- Add stream lifecycle commands:
-  - begin trajectory,
-  - append waypoint,
-  - end/commit,
-  - abort/clear queue,
-  - report queue progress.
+- Add queue progress reporting if the UI needs it.
 - Add stale-stream safety:
-  - timeout if PC stops sending,
+  - timeout if the upload is started but not completed,
   - controlled stop,
   - fault or stopped state if queue underruns unexpectedly.
 
@@ -1445,7 +1533,9 @@ Acceptance:
 
 ### TEST-01: Backend Unit Tests
 
-Status: partial.
+Status: partial but currently green.
+
+Reality note: the 2026-06-18 continuation ran `python -m pytest -q`: 92 tests passed. Coverage is still backend-heavy and does not replace real hardware tests.
 
 Work:
 
@@ -1484,6 +1574,8 @@ Acceptance:
 ### TEST-03: Firmware Build And Protocol Tests
 
 Status: partial.
+
+Reality note: the 2026-06-17 audit built `esp32-s3-arm-protocol-stub` and `esp32-s3-arm-controller` successfully with PlatformIO. There are still no automated firmware protocol tests running against the compiled binaries or hardware.
 
 Work:
 
@@ -1527,7 +1619,7 @@ These should be answered before implementing hardware-heavy packages.
 - What are the first demo object colors and drop zones?
 - What speed and acceleration values are safe for the physical arm?
 - What TCP speed and TCP acceleration should be considered safe for first Cartesian live jog tests?
-- Should live Cartesian jogging be allowed on hardware immediately, or simulation-only until queued/blended firmware support exists?
+- Should live Cartesian jogging be allowed on hardware immediately, or simulation-only until the queued `TRAJ` follower has been validated on the real arm?
 - What fixed update rate is realistic for PC-to-controller target streaming over the chosen serial/Bluetooth link?
 - Which plane drawing mode matters first: XY table plane, vertical XZ/YZ plane, or arbitrary custom plane?
 
@@ -1548,7 +1640,7 @@ Implement KIN-01 through KIN-03 and add tests against the MATLAB geometry.
 ```
 
 ```text
-Implement KIN-04 and KIN-05 using the MATLAB analytic seed and Jacobian ideas.
+Finish KIN-05 by replacing the numeric Jacobian with the DH-frame cross-product Jacobian and surfacing IK diagnostics in the UI.
 ```
 
 ```text
@@ -1564,7 +1656,7 @@ Implement MOVE-07 in simulation only: TCP speed/accel-limited Cartesian preview.
 ```
 
 ```text
-Implement MOVE-08 in simulation only: live Cartesian drag with X/Y/Z controls.
+Implement MOVE-08 in simulation only: live Cartesian drag/jog with X/Y/Z/Phi controls using differential IK.
 ```
 
 Avoid broad requests like:

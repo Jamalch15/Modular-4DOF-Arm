@@ -1,4 +1,4 @@
-import { RobotView } from "/static/robot_view.js";
+import { RobotView } from "/static/robot_view.js?v=20260618-settings-revamp-3";
 
 const state = {
   config: null,
@@ -13,6 +13,7 @@ const state = {
   activeTab: "joint",
   previewId: null,
   latestPreview: null,
+  previewAngles: null,
   viewPreviewSource: null,
   ikPreviewTimer: null,
   ikPreviewInFlight: false,
@@ -27,30 +28,49 @@ const state = {
   pendingLiveTarget: null,
   programWaypoints: [],
   hardwareDraftDirty: false,
+  settingsDirtyScopes: new Set(),
   taskPreviewId: null,
   selectedSerialPort: null,
   latestDetections: [],
   cameraTimer: null,
   linkDraft: null,
   dhDraftRows: null,
+  toolSliderDraftValue: null,
+  toolSliderEditing: false,
+  toolSliderSendTimer: null,
+  toolSliderSendInFlight: false,
+  toolSliderInFlightValue: null,
+  toolSliderQueuedValue: null,
+  toolSliderLastCommandValue: null,
+  cartesianJogTimer: null,
+  cartesianJogInFlight: false,
+  cartesianJogQueued: false,
+  cartesianJogVelocity: { vx_mm_s: 0, vy_mm_s: 0, vz_mm_s: 0, vphi_deg_s: 0 },
+  cartesianJogLastSentMs: 0,
+  cartesianJogActiveAxes: new Set(),
+  cartesianJogEpoch: 0,
+  cartesianJogStopPending: false,
+  cartesianJogStopInFlight: false,
+  aprilTagBusy: false,
+  aprilTagStatus: null,
 };
 
 const geometryDimensionFields = [
-  ["L_1", "L1"],
-  ["L_2", "L2"],
-  ["L_3", "L3"],
-  ["L_4", "L4"],
-  ["L_5", "L5"],
-  ["L_6", "L6"],
-  ["L_7", "L7"],
-  ["L_8", "L8"],
-  ["L_9", "L9"],
+  ["L_1", "L1", "Base vertical section"],
+  ["L_2", "L2", "Base side offset"],
+  ["L_3", "L3", "Shoulder height section"],
+  ["L_4", "L4", "Shoulder lateral offset"],
+  ["L_5", "L5", "Upper arm length"],
+  ["L_6", "L6", "Elbow lateral offset"],
+  ["L_7", "L7", "Forearm length"],
+  ["L_8", "L8", "Wrist lateral offset"],
+  ["L_9", "L9", "Wrist link length"],
 ];
 
 const geometrySignFields = [
-  ["s4", "s4"],
-  ["s6", "s6"],
-  ["s8", "s8"],
+  ["s4", "Shoulder offset direction"],
+  ["s6", "Elbow offset direction"],
+  ["s8", "Wrist offset direction"],
 ];
 
 const targetDefs = [
@@ -73,6 +93,7 @@ const elements = {
     settings: $("#settingsTab"),
   },
   panelResizer: $("#panelResizer"),
+  tabHeader: $("#tabHeader"),
   collapsePanelBtn: $("#collapsePanelBtn"),
   jointControls: $("#jointControls"),
   connectionBadge: $("#connectionBadge"),
@@ -115,6 +136,10 @@ const elements = {
   closeDiagnosticsBtn: $("#closeDiagnosticsBtn"),
   liveJogToggle: $("#liveJogToggle"),
   liveRealToggle: $("#liveRealToggle"),
+  cartesianJogToggle: $("#cartesianJogToggle"),
+  cartesianJogSpeedInput: $("#cartesianJogSpeedInput"),
+  cartesianJogPhiSpeedInput: $("#cartesianJogPhiSpeedInput"),
+  cartesianJogStatus: $("#cartesianJogStatus"),
   applyJointPreviewBtn: $("#applyJointPreviewBtn"),
   resetJointPreviewBtn: $("#resetJointPreviewBtn"),
   hardwareArmToggle: $("#hardwareArmToggle"),
@@ -132,6 +157,11 @@ const elements = {
   hardwareStatus: $("#hardwareStatus"),
   syncHardwareBtn: $("#syncHardwareBtn"),
   saveCalibrationBtn: $("#saveCalibrationBtn"),
+  discardSettingsBtn: $("#discardSettingsBtn"),
+  settingsSaveStatus: $("#settingsSaveStatus"),
+  settingsSaveIndicator: $("#settingsSaveIndicator"),
+  settingsSaveBar: $(".settings-save-bar"),
+  settingsSectionNav: $(".settings-section-nav"),
   calibrationStatus: $("#calibrationStatus"),
   ikTargetControls: $("#ikTargetControls"),
   sliderRangeControls: $("#sliderRangeControls"),
@@ -163,7 +193,6 @@ const elements = {
   magnetControls: $("#magnetControls"),
   toolOpenBtn: $("#toolOpenBtn"),
   toolCloseBtn: $("#toolCloseBtn"),
-  toolSetBtn: $("#toolSetBtn"),
   toolOnBtn: $("#toolOnBtn"),
   toolOffBtn: $("#toolOffBtn"),
   taskModeSelect: $("#taskModeSelect"),
@@ -184,6 +213,25 @@ const elements = {
   geometryPresetEditor: $("#geometryPresetEditor"),
   toolCalibration: $("#toolCalibration"),
   encoderCalibration: $("#encoderCalibration"),
+  aprilTagStatus: $("#aprilTagStatus"),
+  cameraSourceInput: $("#cameraSourceInput"),
+  cameraWidthInput: $("#cameraWidthInput"),
+  cameraHeightInput: $("#cameraHeightInput"),
+  cameraFxInput: $("#cameraFxInput"),
+  cameraFyInput: $("#cameraFyInput"),
+  cameraCxInput: $("#cameraCxInput"),
+  cameraCyInput: $("#cameraCyInput"),
+  cameraDistortionInput: $("#cameraDistortionInput"),
+  saveCameraIntrinsicsBtn: $("#saveCameraIntrinsicsBtn"),
+  resetAprilTagBtn: $("#resetAprilTagBtn"),
+  captureAprilTagBtn: $("#captureAprilTagBtn"),
+  collectAprilTagBtn: $("#collectAprilTagBtn"),
+  saveAprilTagBtn: $("#saveAprilTagBtn"),
+  verifyAprilTagBtn: $("#verifyAprilTagBtn"),
+  aprilTagFrame: $("#aprilTagFrame"),
+  aprilTagPlaceholder: $("#aprilTagPlaceholder"),
+  aprilTagMetrics: $("#aprilTagMetrics"),
+  aprilTagDetections: $("#aprilTagDetections"),
 };
 
 function format(value, decimals = 1) {
@@ -241,13 +289,14 @@ function isMoveEnabled() {
 }
 
 function linkDefaults() {
+  const tcpReach = activeToolTcpReach();
   const links = state.linkDraft;
   if (links) {
     return {
       l1: links.base_height || 0,
       l2: links.upper_arm || 0,
       l3: links.forearm || 0,
-      l4: (links.wrist || 0) + (links.tool || 0),
+      l4: (links.wrist || 0) + (links.tool || 0) + tcpReach,
     };
   }
   const configLinks = state.config?.links_mm || {};
@@ -255,8 +304,24 @@ function linkDefaults() {
     l1: configLinks.base_height_mm ?? configLinks.base_height ?? 0,
     l2: configLinks.upper_arm_mm ?? configLinks.upper_arm ?? 0,
     l3: configLinks.forearm_mm ?? configLinks.forearm ?? 0,
-    l4: (configLinks.wrist_mm ?? configLinks.wrist ?? 0) + (configLinks.tool_mm ?? configLinks.tool ?? 0),
+    l4: (configLinks.wrist_mm ?? configLinks.wrist ?? 0) + (configLinks.tool_mm ?? configLinks.tool ?? 0) + tcpReach,
   };
+}
+
+function tcpOffsetReach(offset = {}) {
+  const x = Number(offset.x ?? offset.x_mm ?? 0);
+  const y = Number(offset.y ?? offset.y_mm ?? 0);
+  const z = Number(offset.z ?? offset.z_mm ?? 0);
+  return Math.hypot(Number.isFinite(x) ? x : 0, Number.isFinite(y) ? y : 0, Number.isFinite(z) ? z : 0);
+}
+
+function activeToolTcpReach() {
+  const linksOffset = state.config?.links_mm?.tool_tcp_offset_mm;
+  if (linksOffset) return tcpOffsetReach(linksOffset);
+  const tools = state.config?.tools || {};
+  const active = tools.active || state.robotState?.active_tool || state.config?.tool?.active || "gripper";
+  const preset = tools.presets?.[active] || {};
+  return tcpOffsetReach(preset.tcp_offset_mm || state.config?.tool?.tcp_offset_mm || {});
 }
 
 function buildJointControls() {
@@ -288,9 +353,13 @@ function buildPerJointTuning() {
     const row = document.createElement("div");
     row.className = "tuning-row";
     row.innerHTML = `
-      <strong>${joint.name}</strong>
-      <label>Max speed <input class="joint-speed-limit" data-index="${index}" type="number" min="0.1" step="1" value="${format(joint.max_speed_deg_s, 1)}" /></label>
-      <label>Max accel <input class="joint-accel-limit" data-index="${index}" type="number" min="0.1" step="5" value="${format(joint.max_accel_deg_s2, 1)}" /></label>
+      <div class="calibration-joint"><strong>${joint.name}</strong><span>J${index + 1}</span></div>
+      <label>Maximum speed
+        <span class="input-with-unit"><input class="joint-speed-limit" data-index="${index}" type="number" min="0.1" step="1" value="${format(joint.max_speed_deg_s, 1)}" /><span>deg/s</span></span>
+      </label>
+      <label>Maximum acceleration
+        <span class="input-with-unit"><input class="joint-accel-limit" data-index="${index}" type="number" min="0.1" step="5" value="${format(joint.max_accel_deg_s2, 1)}" /><span>deg/s²</span></span>
+      </label>
     `;
     elements.perJointTuning.appendChild(row);
   });
@@ -298,6 +367,56 @@ function buildPerJointTuning() {
 
 function clonePlain(value) {
   return JSON.parse(JSON.stringify(value || {}));
+}
+
+const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware"]);
+
+function savedSettingsDetail() {
+  if (state.robotState?.simulation) return "Saved locally. Controller sync is not required in simulation.";
+  if (!state.robotState?.connected) return "Saved locally. Connect the controller to sync hardware settings.";
+  const syncStatus = state.robotState?.config_sync_status || "unknown";
+  if (syncStatus === "synced") return "Saved locally and synced to the controller.";
+  return `Saved locally. Controller sync: ${syncStatus}.`;
+}
+
+function updateSettingsSaveBar(options = {}) {
+  if (!elements.settingsSaveBar) return;
+  const dirty = state.settingsDirtyScopes.size > 0;
+  const mode = options.mode || (dirty ? "dirty" : "saved");
+  elements.settingsSaveBar.classList.toggle("dirty", mode === "dirty");
+  elements.settingsSaveBar.classList.toggle("saving", mode === "saving");
+  elements.settingsSaveBar.classList.toggle("error", mode === "error");
+  if (elements.settingsSaveStatus) {
+    elements.settingsSaveStatus.textContent =
+      options.title || (dirty ? "Unsaved settings changes" : "All settings saved");
+  }
+  if (elements.calibrationStatus) {
+    elements.calibrationStatus.textContent =
+      options.detail ||
+      (dirty
+        ? "Save all settings to apply the current drafts, or discard them to reload the saved configuration."
+        : savedSettingsDetail());
+  }
+  if (elements.saveCalibrationBtn) {
+    elements.saveCalibrationBtn.disabled = !dirty || mode === "saving";
+  }
+  if (elements.discardSettingsBtn) {
+    elements.discardSettingsBtn.disabled = !dirty || mode === "saving";
+  }
+}
+
+function markSettingsDirty(scope, detail = null) {
+  state.settingsDirtyScopes.add(scope);
+  updateSettingsSaveBar({
+    mode: "dirty",
+    detail: detail || `${scope} settings changed. Save all settings to persist the draft.`,
+  });
+}
+
+function clearSettingsDirty(scope = null) {
+  if (scope) state.settingsDirtyScopes.delete(scope);
+  else state.settingsDirtyScopes.clear();
+  updateSettingsSaveBar();
 }
 
 function activeGeometryPreset() {
@@ -315,37 +434,37 @@ function buildGeometryPresetEditor() {
   const names = Object.keys(presets).length ? Object.keys(presets) : [active];
   const dimensions = preset.dimensions_mm || {};
   const signs = preset.signs || {};
-  const units = preset.units || { length: "mm", angle: "deg" };
-  elements.geometryPresetEditor.innerHTML = `
-    <div class="geometry-header">
-      <label>Preset
+  const presetControl = names.length > 1
+    ? `
+      <label>Geometry preset
         <select id="geometryPresetSelect">
           ${names.map((name) => `<option value="${name}" ${name === active ? "selected" : ""}>${presets[name]?.label || name}</option>`).join("")}
         </select>
       </label>
-      <div class="geometry-source">
-        <span class="badge">${preset.status || "working_assumption"}</span>
-        <code>${preset.source || "manual"}</code>
-        <code>${units.length || "mm"} / ${units.angle || "deg"}</code>
-      </div>
+    `
+    : `<select id="geometryPresetSelect" hidden><option value="${active}" selected>${active}</option></select>`;
+  elements.geometryPresetEditor.innerHTML = `
+    <div class="geometry-header">
+      ${presetControl}
     </div>
     <div class="geometry-grid">
-      ${geometryDimensionFields.map(([key, label]) => `
-        <label>${label}
+      ${geometryDimensionFields.map(([key, label, description]) => `
+        <label>
+          <span class="geometry-field-label"><strong>${label}</strong><small>${description}</small></span>
           <input data-geometry-dimension="${key}" type="number" min="0" step="0.01" value="${format(dimensions[key], 2)}" />
         </label>
       `).join("")}
     </div>
     <div class="geometry-sign-grid">
       ${geometrySignFields.map(([key, label]) => `
-        <label>${label}
+        <label>${label} (${key})
           <select data-geometry-sign="${key}">
-            <option value="1" ${Number(signs[key] ?? 1) === 1 ? "selected" : ""}>+1</option>
-            <option value="-1" ${Number(signs[key] ?? 1) === -1 ? "selected" : ""}>-1</option>
+            <option value="1" ${Number(signs[key] ?? 1) === 1 ? "selected" : ""}>Positive (+)</option>
+            <option value="-1" ${Number(signs[key] ?? 1) === -1 ? "selected" : ""}>Negative (-)</option>
           </select>
         </label>
       `).join("")}
-      <button id="applyGeometryPresetBtn" class="ghost" type="button">Preview Model Draft</button>
+      <button id="applyGeometryPresetBtn" class="ghost" type="button">Preview geometry</button>
     </div>
   `;
 }
@@ -495,7 +614,7 @@ function previewDhDraft() {
     dh_rows: validation.rows,
   };
   state.view.setConfig(draftConfig);
-  state.view.setAngles(state.robotState?.reported_angles_deg || state.view.angles);
+  state.view.setAngles(jointControlAngles() || state.view.angles);
   if (elements.dhTableStatus) elements.dhTableStatus.textContent = "Model draft is shown in the viewport. Backend FK/IK changes after Save.";
 }
 
@@ -564,44 +683,177 @@ function refreshDerivedModelDraft() {
 function applyGeometryPresetToDhDraft() {
   const validation = refreshDerivedModelDraft();
   if (validation.ok) previewDhDraft();
-  if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry model draft is previewed. Save to persist.";
+  markSettingsDirty("geometry", "Geometry preview updated in the viewport. Save all settings to use it for FK and IK.");
+}
+
+function toolTypeLabel(type) {
+  if (type === "electromagnet") return "Magnet";
+  if (type === "servo_gripper") return "Gripper";
+  return "Generic";
+}
+
+function toolPresetIsMagnet(name, preset = null) {
+  const activePreset = preset || state.config?.tools?.presets?.[name] || {};
+  return name === "magnet" || activePreset.type === "electromagnet";
+}
+
+function renderToolSelectOptions(activeOverride = null) {
+  if (!elements.toolSelect) return;
+  const tools = state.config?.tools || { active: "gripper", presets: {} };
+  const presets = tools.presets || {};
+  const active = activeOverride || tools.active || Object.keys(presets)[0] || elements.toolSelect.value || "gripper";
+  elements.toolSelect.innerHTML = "";
+  const entries = Object.keys(presets).length
+    ? Object.entries(presets)
+    : [
+        ["gripper", { type: "servo_gripper" }],
+        ["magnet", { type: "electromagnet" }],
+      ];
+  entries.forEach(([name, preset]) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = preset.label || toolTypeLabel(preset.type) || name;
+    elements.toolSelect.appendChild(option);
+  });
+  if (!entries.some(([name]) => name === active)) {
+    const option = document.createElement("option");
+    option.value = active;
+    option.textContent = active;
+    elements.toolSelect.appendChild(option);
+  }
+  elements.toolSelect.value = active;
+}
+
+function renderToolEditor() {
+  if (!elements.toolCalibration || !state.config) return;
+  const tools = state.config.tools || { active: "gripper", presets: {} };
+  const active = tools.active || "gripper";
+  const presets = tools.presets || {};
+  elements.toolCalibration.classList.add("tool-editor");
+  elements.toolCalibration.innerHTML = Object.entries(presets)
+    .map(([name, preset]) => {
+      const tcp = preset.tcp_offset_mm || {};
+      const io = preset.io || {};
+      const type = preset.type || "generic";
+      const isMagnet = type === "electromagnet";
+      const specificFields = isMagnet
+        ? `
+          <label>Magnet GPIO <input data-tool-preset="${name}" data-tool-io-field="pin" type="number" step="1" value="${io.pin ?? -1}" /></label>
+          <label class="toggle-label compact-toggle">
+            <input data-tool-preset="${name}" data-tool-io-field="active_high" type="checkbox" ${io.active_high !== false ? "checked" : ""} />
+            <span>Active high</span>
+          </label>
+        `
+        : `
+          <label>Open value <input data-tool-preset="${name}" data-tool-field="open_value" type="number" min="0" max="1" step="0.01" value="${format(preset.open_value ?? 0, 2)}" /></label>
+          <label>Closed value <input data-tool-preset="${name}" data-tool-field="closed_value" type="number" min="0" max="1" step="0.01" value="${format(preset.closed_value ?? 1, 2)}" /></label>
+          <label>PWM GPIO <input data-tool-preset="${name}" data-tool-io-field="pwm_pin" type="number" step="1" value="${io.pwm_pin ?? -1}" /></label>
+          <label>Min us <input data-tool-preset="${name}" data-tool-io-field="pulse_min_us" type="number" min="100" step="10" value="${io.pulse_min_us ?? 500}" /></label>
+          <label>Max us <input data-tool-preset="${name}" data-tool-io-field="pulse_max_us" type="number" min="100" step="10" value="${io.pulse_max_us ?? 2500}" /></label>
+          <label>Frequency <input data-tool-preset="${name}" data-tool-io-field="pwm_frequency_hz" type="number" min="1" step="1" value="${io.pwm_frequency_hz ?? 50}" /></label>
+        `;
+      return `
+        <div class="tool-card ${name === active ? "active" : ""}" data-tool-card="${name}">
+          <div class="hardware-title">
+            <strong>${preset.label || name}</strong>
+            <span class="badge">${name === active ? "active" : type}</span>
+          </div>
+          <div class="tool-grid">
+            <label>Name <input data-tool-preset="${name}" data-tool-field="label" type="text" value="${preset.label || name}" /></label>
+            <label>Type
+              <select data-tool-preset="${name}" data-tool-field="type">
+                <option value="servo_gripper" ${type === "servo_gripper" ? "selected" : ""}>Gripper</option>
+                <option value="electromagnet" ${type === "electromagnet" ? "selected" : ""}>Magnet</option>
+                <option value="generic" ${type === "generic" ? "selected" : ""}>Generic</option>
+              </select>
+            </label>
+            <label>TCP X mm <input data-tool-preset="${name}" data-tool-tcp-field="x" type="number" step="0.1" value="${format(tcp.x ?? 0, 1)}" /></label>
+            <label>TCP Y mm <input data-tool-preset="${name}" data-tool-tcp-field="y" type="number" step="0.1" value="${format(tcp.y ?? 0, 1)}" /></label>
+            <label>TCP Z mm <input data-tool-preset="${name}" data-tool-tcp-field="z" type="number" step="0.1" value="${format(tcp.z ?? 0, 1)}" /></label>
+            ${specificFields}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function readToolsPayload() {
+  const current = clonePlain(state.config?.tools || { active: "gripper", presets: {} });
+  current.presets = current.presets || {};
+  current.active = elements.toolSelect?.value || current.active || "gripper";
+  elements.toolCalibration?.querySelectorAll("[data-tool-card]").forEach((card) => {
+    const name = card.dataset.toolCard;
+    const preset = clonePlain(current.presets[name] || {});
+    preset.tcp_offset_mm = preset.tcp_offset_mm || {};
+    preset.io = preset.io || {};
+    card.querySelectorAll("[data-tool-field]").forEach((input) => {
+      const field = input.dataset.toolField;
+      if (field === "label" || field === "type") {
+        preset[field] = input.value;
+      } else {
+        preset[field] = readNumber(input, preset[field] ?? 0);
+      }
+    });
+    card.querySelectorAll("[data-tool-tcp-field]").forEach((input) => {
+      preset.tcp_offset_mm[input.dataset.toolTcpField] = readNumber(input, 0);
+    });
+    card.querySelectorAll("[data-tool-io-field]").forEach((input) => {
+      const field = input.dataset.toolIoField;
+      preset.io[field] = input.type === "checkbox" ? input.checked : readNumber(input, 0);
+    });
+    current.presets[name] = preset;
+  });
+  return current;
 }
 
 function buildCalibrationEditors() {
   buildGeometryPresetEditor();
   refreshDerivedModelDraft();
 
-  elements.jointCalibration.innerHTML = "";
+  elements.jointCalibration.innerHTML = `
+    <div class="calibration-row calibration-header" aria-hidden="true">
+      <span>Joint</span>
+      <span>Safe operating range</span>
+      <span>Home angle</span>
+      <span>Zero offset</span>
+      <span>Positive direction</span>
+      <span>Check</span>
+    </div>
+  `;
   state.config.joints.forEach((joint, index) => {
     const row = document.createElement("div");
     row.className = "calibration-row";
+    row.dataset.calibrationIndex = String(index);
     row.innerHTML = `
-      <strong>${joint.name}</strong>
-      <label>Min <input data-joint-index="${index}" data-calib-limit="min" type="number" step="0.1" value="${format(joint.min_deg, 1)}" /></label>
-      <label>Max <input data-joint-index="${index}" data-calib-limit="max" type="number" step="0.1" value="${format(joint.max_deg, 1)}" /></label>
-      <label>Home <input data-joint-index="${index}" data-calib-field="home_deg" type="number" step="0.1" value="${format(joint.home_deg, 1)}" /></label>
-      <label>Zero <input data-joint-index="${index}" data-calib-field="zero_offset_deg" type="number" step="0.1" value="${format(joint.zero_offset_deg, 1)}" /></label>
-      <label>Dir
-        <select data-joint-index="${index}" data-calib-field="direction_sign">
-          <option value="1" ${joint.direction_sign === 1 ? "selected" : ""}>+1</option>
-          <option value="-1" ${joint.direction_sign === -1 ? "selected" : ""}>-1</option>
+      <div class="calibration-joint"><strong>${joint.name}</strong><span>J${index + 1}</span></div>
+      <div class="calibration-range">
+        <input aria-label="${joint.name} minimum safe angle" title="Minimum safe angle in degrees" data-joint-index="${index}" data-calib-limit="min" type="number" step="0.1" value="${format(joint.min_deg, 1)}" />
+        <span>to</span>
+        <input aria-label="${joint.name} maximum safe angle" title="Maximum safe angle in degrees" data-joint-index="${index}" data-calib-limit="max" type="number" step="0.1" value="${format(joint.max_deg, 1)}" />
+      </div>
+      <label class="calibration-cell">
+        <span>Home angle</span>
+        <input aria-label="${joint.name} home angle" title="Expected joint angle at the home pose" data-joint-index="${index}" data-calib-field="home_deg" type="number" step="0.1" value="${format(joint.home_deg, 1)}" />
+      </label>
+      <label class="calibration-cell">
+        <span>Zero offset</span>
+        <input aria-label="${joint.name} zero offset" title="Offset between mechanism zero and software zero" data-joint-index="${index}" data-calib-field="zero_offset_deg" type="number" step="0.1" value="${format(joint.zero_offset_deg, 1)}" />
+      </label>
+      <label class="calibration-cell">
+        <span>Positive direction</span>
+        <select aria-label="${joint.name} positive direction" title="Invert if positive commands move toward negative joint angles" data-joint-index="${index}" data-calib-field="direction_sign">
+          <option value="1" ${joint.direction_sign === 1 ? "selected" : ""}>Normal (+)</option>
+          <option value="-1" ${joint.direction_sign === -1 ? "selected" : ""}>Inverted (-)</option>
         </select>
       </label>
+      <span class="calibration-check">Valid</span>
     `;
     elements.jointCalibration.appendChild(row);
   });
+  validateJointCalibrationDraft();
 
-  if (elements.toolCalibration) {
-    const tools = state.config.tools || {};
-    const active = tools.active || "gripper";
-    const presets = tools.presets || {};
-    elements.toolCalibration.innerHTML = Object.entries(presets)
-      .map(([name, preset]) => {
-        const tcp = preset.tcp_offset_mm || {};
-        return `<div class="log-line"><span>${name}${name === active ? " active" : ""}</span><code>type ${preset.type || "-"}, tcp z ${format(tcp.z, 1)} mm</code></div>`;
-      })
-      .join("");
-  }
+  renderToolEditor();
 
   if (elements.encoderCalibration) {
     const encoders = state.config.encoders || {};
@@ -613,6 +865,36 @@ function buildCalibrationEditors() {
       })
       .join("");
   }
+}
+
+function validateJointCalibrationDraft() {
+  if (!elements.jointCalibration || !state.config) return { ok: true, errors: [] };
+  const errors = [];
+  state.config.joints.forEach((joint, index) => {
+    const minInput = $(`[data-joint-index="${index}"][data-calib-limit="min"]`);
+    const maxInput = $(`[data-joint-index="${index}"][data-calib-limit="max"]`);
+    const homeInput = $(`[data-joint-index="${index}"][data-calib-field="home_deg"]`);
+    const zeroInput = $(`[data-joint-index="${index}"][data-calib-field="zero_offset_deg"]`);
+    const row = elements.jointCalibration.querySelector(`[data-calibration-index="${index}"]`);
+    const check = row?.querySelector(".calibration-check");
+    const minimum = Number(minInput?.value);
+    const maximum = Number(maxInput?.value);
+    const home = Number(homeInput?.value);
+    const zero = Number(zeroInput?.value);
+    let message = "Valid";
+    if (![minimum, maximum, home, zero].every(Number.isFinite)) {
+      message = "Enter numbers";
+    } else if (minimum >= maximum) {
+      message = "Min ≥ max";
+    } else if (home < minimum || home > maximum) {
+      message = "Home outside range";
+    }
+    const valid = message === "Valid";
+    row?.classList.toggle("invalid", !valid);
+    if (check) check.textContent = message;
+    if (!valid) errors.push(`${joint.name}: ${message}`);
+  });
+  return { ok: errors.length === 0, errors };
 }
 
 function buildHardwareIoEditors() {
@@ -750,25 +1032,58 @@ function renderOperatorPanels() {
   renderToolControls();
 }
 
-function renderToolControls() {
-  if (!elements.toolSelect || !state.config) return;
-  const tools = state.config.tools || {};
-  const active = state.robotState?.active_tool || tools.active || "gripper";
+function renderToolControls(activeOverride = null) {
+  if (!elements.toolSelect) return;
+  const tools = state.config?.tools || {};
+  renderToolSelectOptions(activeOverride);
+  const active = activeOverride || tools.active || state.robotState?.active_tool || elements.toolSelect.value || "gripper";
   elements.toolSelect.value = active;
-  const isMagnet = active === "magnet" || tools.presets?.[active]?.type === "electromagnet";
+  const preset = tools.presets?.[active] || {};
+  const isMagnet = toolPresetIsMagnet(active, preset);
   if (elements.gripperControls) elements.gripperControls.hidden = isMagnet;
   if (elements.gripperSliderLabel) elements.gripperSliderLabel.hidden = isMagnet;
   if (elements.magnetControls) elements.magnetControls.hidden = !isMagnet;
-  if (elements.toolValueSlider && state.robotState?.tool_value != null) {
-    elements.toolValueSlider.value = String(state.robotState.tool_value);
+  if (elements.toolValueSlider) {
+    if (state.toolSliderDraftValue != null) {
+      elements.toolValueSlider.value = String(state.toolSliderDraftValue);
+    } else if (state.robotState?.tool_value != null && !state.toolSliderEditing) {
+      elements.toolValueSlider.value = String(state.robotState.tool_value);
+    }
   }
+  const connected = Boolean(state.robotState?.simulation || state.robotState?.connected);
+  const realHardwareReady = Boolean(state.robotState?.simulation || state.robotState?.hardware_armed);
+  const notFaulted = !["estop", "fault"].includes(state.robotState?.motion_state);
+  const canCommand = connected && realHardwareReady && notFaulted;
+  if (elements.toolValueSlider) elements.toolValueSlider.disabled = isMagnet || !canCommand;
+  [elements.toolOpenBtn, elements.toolCloseBtn].forEach((button) => {
+    if (button) button.disabled = isMagnet || !canCommand;
+  });
+  [elements.toolOnBtn, elements.toolOffBtn].forEach((button) => {
+    if (button) button.disabled = !isMagnet || !canCommand;
+  });
+}
+
+function clearToolSliderLiveState() {
+  if (state.toolSliderSendTimer) window.clearTimeout(state.toolSliderSendTimer);
+  state.toolSliderSendTimer = null;
+  state.toolSliderInFlightValue = null;
+  state.toolSliderQueuedValue = null;
+  state.toolSliderLastCommandValue = null;
+  state.toolSliderDraftValue = null;
+  state.toolSliderEditing = false;
 }
 
 async function saveActiveTool(active) {
+  clearToolSliderLiveState();
+  if (!state.config?.tools) {
+    renderToolControls(active);
+    return;
+  }
   if (state.config?.tools) state.config.tools.active = active;
   if (state.robotState) state.robotState.active_tool = active;
-  renderToolControls();
+  renderToolControls(active);
   const tools = state.config?.tools || { active, presets: {} };
+  tools.active = active;
   const payload = await postJson("/api/tools", { active, presets: tools.presets || {} });
   if (payload.ok && payload.config) applyConfig(payload.config);
   if (payload.state) renderState(payload.state);
@@ -887,9 +1202,90 @@ async function moveNamedPosition(name) {
 }
 
 async function sendTool(action, value = null) {
+  clearToolSliderLiveState();
   const payload = await postJson("/api/tool", { action, value, tool: state.config?.tools?.active });
   if (payload.state) renderState(payload.state);
   await refreshDiagnostics();
+}
+
+function updateToolSliderDraft() {
+  if (!elements.toolValueSlider) return null;
+  const value = clamp(Number(elements.toolValueSlider.value || 0), 0, 1);
+  state.toolSliderDraftValue = Number.isFinite(value) ? value : 0;
+  return state.toolSliderDraftValue;
+}
+
+function beginToolSliderEdit() {
+  state.toolSliderEditing = true;
+  updateToolSliderDraft();
+}
+
+function endToolSliderEdit() {
+  updateToolSliderDraft();
+  state.toolSliderEditing = false;
+}
+
+function canSendLiveToolSlider() {
+  const tools = state.config?.tools || {};
+  const active = tools.active || state.robotState?.active_tool || elements.toolSelect?.value || "gripper";
+  const preset = tools.presets?.[active] || {};
+  const connected = Boolean(state.robotState?.simulation || state.robotState?.connected);
+  const realHardwareReady = Boolean(state.robotState?.simulation || state.robotState?.hardware_armed);
+  const notFaulted = !["estop", "fault"].includes(state.robotState?.motion_state);
+  return !toolPresetIsMagnet(active, preset) && connected && realHardwareReady && notFaulted;
+}
+
+function sameToolSliderValue(left, right) {
+  return left != null && right != null && Math.abs(Number(left) - Number(right)) < 0.001;
+}
+
+function queueToolSliderLiveSet({ immediate = false } = {}) {
+  const value = updateToolSliderDraft();
+  if (value == null || !canSendLiveToolSlider()) return;
+  if (sameToolSliderValue(value, state.toolSliderQueuedValue)) {
+    if (immediate && state.toolSliderSendTimer) flushToolSliderLiveSet();
+    return;
+  }
+  if (state.toolSliderSendInFlight && state.toolSliderQueuedValue == null && sameToolSliderValue(value, state.toolSliderInFlightValue)) {
+    return;
+  }
+  if (!state.toolSliderEditing && sameToolSliderValue(value, state.toolSliderLastCommandValue)) return;
+  state.toolSliderQueuedValue = value;
+  if (immediate) {
+    flushToolSliderLiveSet();
+    return;
+  }
+  if (!state.toolSliderSendTimer && !state.toolSliderSendInFlight) {
+    state.toolSliderSendTimer = window.setTimeout(flushToolSliderLiveSet, 75);
+  }
+}
+
+async function flushToolSliderLiveSet() {
+  if (state.toolSliderSendTimer) window.clearTimeout(state.toolSliderSendTimer);
+  state.toolSliderSendTimer = null;
+  if (state.toolSliderSendInFlight || state.toolSliderQueuedValue == null) return;
+  const value = state.toolSliderQueuedValue;
+  state.toolSliderQueuedValue = null;
+  state.toolSliderSendInFlight = true;
+  state.toolSliderInFlightValue = value;
+  state.toolSliderLastCommandValue = value;
+  try {
+    const payload = await postJson("/api/tool", { action: "set", value, tool: state.config?.tools?.active });
+    if (payload.state) renderState(payload.state);
+    const reportedValue = Number(payload.state?.tool_value);
+    if (payload.ok && !state.toolSliderEditing && state.toolSliderQueuedValue == null && Math.abs(reportedValue - value) < 0.001) {
+      state.toolSliderDraftValue = null;
+      renderToolControls();
+    }
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+  } finally {
+    state.toolSliderSendInFlight = false;
+    state.toolSliderInFlightValue = null;
+    if (state.toolSliderQueuedValue != null) {
+      state.toolSliderSendTimer = window.setTimeout(flushToolSliderLiveSet, 0);
+    }
+  }
 }
 
 function renderTaskSummary(sequence, preview) {
@@ -926,8 +1322,8 @@ async function previewTask() {
         };
   const payload = await postJson("/api/task/preview", request);
   if (payload.ok) {
-    state.taskPreviewId = payload.preview_id;
     renderPreview(payload.preview);
+    state.taskPreviewId = payload.preview_id;
     renderTaskSummary(payload.sequence, payload.preview);
     elements.executeTaskBtn.disabled = false;
     elements.taskStatus.textContent = "Preview ready";
@@ -941,6 +1337,16 @@ async function previewTask() {
 async function executeTask() {
   if (!state.taskPreviewId) return;
   const payload = await postJson("/api/task/execute", { preview_id: state.taskPreviewId });
+  if (payload.ok) {
+    releaseJointControlIntent();
+    state.previewId = null;
+    state.previewAngles = null;
+    state.taskPreviewId = null;
+    state.ikUserEdited = false;
+  }
+  if (payload.state) renderState(payload.state);
+  else syncJointControls();
+  updateDisabledState();
   elements.taskStatus.textContent = payload.ok ? "Task running" : payload.error || "Task failed";
   await refreshDiagnostics();
 }
@@ -971,6 +1377,216 @@ async function detectVision() {
     elements.visionSummary.appendChild(line);
   });
   await refreshDiagnostics();
+}
+
+function setAprilTagBusy(busy, status = null) {
+  state.aprilTagBusy = Boolean(busy);
+  [
+    elements.saveCameraIntrinsicsBtn,
+    elements.resetAprilTagBtn,
+    elements.captureAprilTagBtn,
+    elements.collectAprilTagBtn,
+    elements.saveAprilTagBtn,
+    elements.verifyAprilTagBtn,
+  ].forEach((button) => {
+    if (button) button.disabled = state.aprilTagBusy;
+  });
+  if (status && elements.aprilTagStatus) elements.aprilTagStatus.textContent = status;
+}
+
+function renderCameraIntrinsics(camera = state.config?.camera || {}) {
+  const resolution = camera.resolution || {};
+  const intrinsics = camera.intrinsics || {};
+  if (elements.cameraSourceInput) elements.cameraSourceInput.value = String(camera.source_index ?? 0);
+  if (elements.cameraWidthInput) elements.cameraWidthInput.value = String(resolution.width ?? 1280);
+  if (elements.cameraHeightInput) elements.cameraHeightInput.value = String(resolution.height ?? 720);
+  if (elements.cameraFxInput) elements.cameraFxInput.value = intrinsics.fx_px ?? "";
+  if (elements.cameraFyInput) elements.cameraFyInput.value = intrinsics.fy_px ?? "";
+  if (elements.cameraCxInput) elements.cameraCxInput.value = intrinsics.cx_px ?? "";
+  if (elements.cameraCyInput) elements.cameraCyInput.value = intrinsics.cy_px ?? "";
+  if (elements.cameraDistortionInput) {
+    elements.cameraDistortionInput.value = (intrinsics.distortion_coefficients || [0, 0, 0, 0, 0]).join(", ");
+  }
+}
+
+function cameraSettingsDraft() {
+  const camera = clonePlain(state.config?.camera || {});
+  const distortion = String(elements.cameraDistortionInput?.value || "")
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value));
+  const fx = readNumber(elements.cameraFxInput, NaN);
+  const fy = readNumber(elements.cameraFyInput, NaN);
+  const cx = readNumber(elements.cameraCxInput, NaN);
+  const cy = readNumber(elements.cameraCyInput, NaN);
+  if (![fx, fy, cx, cy].every(Number.isFinite) || fx <= 0 || fy <= 0) {
+    throw new Error("Enter valid positive fx/fy and finite cx/cy camera intrinsics.");
+  }
+  if (![4, 5, 8, 12, 14].includes(distortion.length)) {
+    throw new Error("Distortion must contain 4, 5, 8, 12, or 14 comma-separated values.");
+  }
+  camera.source_index = Math.max(0, Math.round(readNumber(elements.cameraSourceInput, 0)));
+  camera.resolution = {
+    width: Math.max(1, Math.round(readNumber(elements.cameraWidthInput, 1280))),
+    height: Math.max(1, Math.round(readNumber(elements.cameraHeightInput, 720))),
+  };
+  camera.intrinsics = {
+    ...(camera.intrinsics || {}),
+    source: "manual",
+    fx_px: fx,
+    fy_px: fy,
+    cx_px: cx,
+    cy_px: cy,
+    camera_matrix: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+    distortion_coefficients: distortion,
+  };
+  return camera;
+}
+
+async function saveCameraIntrinsics() {
+  setAprilTagBusy(true, "Saving intrinsics...");
+  try {
+    const payload = await postJson("/api/vision/settings", { camera: cameraSettingsDraft() });
+    if (payload.ok && payload.config) {
+      applyConfig(payload.config);
+      elements.aprilTagStatus.textContent = "Intrinsics saved";
+      clearSettingsDirty("camera");
+    } else if (elements.aprilTagStatus) {
+      elements.aprilTagStatus.textContent = payload.error || "Could not save intrinsics";
+    }
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+    elements.aprilTagStatus.textContent = "Invalid intrinsics";
+  } finally {
+    setAprilTagBusy(false);
+  }
+}
+
+function renderAprilTagDetections(detections = []) {
+  if (!elements.aprilTagDetections) return;
+  elements.aprilTagDetections.innerHTML = "";
+  if (!detections.length) {
+    const empty = document.createElement("div");
+    empty.className = "program-item";
+    empty.textContent = "No tags detected.";
+    elements.aprilTagDetections.appendChild(empty);
+    return;
+  }
+  detections.forEach((detection) => {
+    const item = document.createElement("div");
+    item.className = `program-item ${detection.configured ? "" : "invalid"}`;
+    const center = detection.center_px || {};
+    item.innerHTML = `
+      <div class="program-title"><span>Tag ${detection.id}</span><span>${detection.configured ? "configured" : "unknown"}</span></div>
+      <code>px ${format(center.x, 1)}, ${format(center.y, 1)} - area ${format(detection.area_px, 0)}</code>
+    `;
+    elements.aprilTagDetections.appendChild(item);
+  });
+}
+
+function renderAprilTagCalibration(payload = {}) {
+  state.aprilTagStatus = payload;
+  const result = payload.result || payload.live_result || payload.saved_result || null;
+  const session = payload.session || {};
+  const metrics = result?.metrics || {};
+  const pose = result?.camera_to_robot || {};
+  const position = pose.position_mm || [];
+  const comparison = payload.comparison || {};
+  const accepted = Boolean(result?.accepted);
+  const sessionResult = result?.frames_used != null;
+  const enoughSamples = !sessionResult || result?.minimum_samples_met !== false;
+  const enoughRequiredTagSamples = !sessionResult || result?.required_tag_samples_met !== false;
+  const saveReady = accepted && enoughSamples && enoughRequiredTagSamples;
+  const planarOnly = Boolean(result?.planar?.ok && !result?.ok);
+  if (elements.aprilTagStatus) {
+    elements.aprilTagStatus.textContent = payload.comparison && accepted
+      ? `Verified ${format(metrics.confidence, 2)}`
+      : saveReady
+        ? `Ready ${format(metrics.confidence, 2)}`
+        : accepted
+          ? "Pose good; collect all samples"
+      : planarOnly
+        ? "Planar only"
+        : result?.error || "Uncalibrated";
+  }
+  if (elements.aprilTagMetrics) {
+    elements.aprilTagMetrics.innerHTML = `
+      <div class="log-line"><span>Samples</span><code>${session.frame_count || result?.frames_used || 0} / ${session.minimum_samples || 0}</code></div>
+      <div class="log-line"><span>Tags</span><code>${(result?.tags_used || session.tag_ids || []).join(", ") || "-"}</code></div>
+      <div class="log-line"><span>Tag samples</span><code>${Object.entries(result?.tag_observation_counts || session.tag_observation_counts || {}).map(([id, count]) => `${id}:${count}`).join(" ") || "-"}</code></div>
+      <div class="log-line"><span>Reprojection</span><code>${result?.ok ? `${format(metrics.reprojection_rmse_px, 2)} px RMSE` : "-"}</code></div>
+      <div class="log-line"><span>Camera XYZ</span><code>${position.length ? position.map((value) => format(value, 1)).join(", ") + " mm" : "-"}</code></div>
+      <div class="log-line"><span>Tilt</span><code>${result?.ok ? `${format(metrics.tilt_from_down_deg, 1)} deg from down` : "-"}</code></div>
+      <div class="log-line"><span>Verify delta</span><code>${comparison.position_delta_mm != null ? `${format(comparison.position_delta_mm, 1)} mm / ${format(comparison.orientation_delta_deg, 2)} deg` : "-"}</code></div>
+      <div class="log-line"><span>Message</span><code>${result?.error || (accepted ? "quality checks passed" : "collect samples and configure intrinsics")}</code></div>
+    `;
+  }
+  if (payload.image_b64 && elements.aprilTagFrame) {
+    elements.aprilTagFrame.src = payload.image_b64;
+    elements.aprilTagFrame.hidden = false;
+    if (elements.aprilTagPlaceholder) elements.aprilTagPlaceholder.hidden = true;
+  }
+  renderAprilTagDetections(payload.detections || []);
+  const settings = payload.settings || state.config?.camera?.calibration?.apriltag || {};
+  if (state.view) state.view.setAprilTagCalibration({ settings, result });
+}
+
+async function loadAprilTagStatus() {
+  const response = await fetch("/api/vision/apriltag/status");
+  const payload = await response.json();
+  if (payload.ok) renderAprilTagCalibration(payload);
+}
+
+async function resetAprilTagCalibration() {
+  setAprilTagBusy(true, "Resetting...");
+  try {
+    const payload = await postJson("/api/vision/apriltag/reset");
+    if (payload.ok) renderAprilTagCalibration(payload);
+    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Reset failed";
+  } finally {
+    setAprilTagBusy(false);
+  }
+}
+
+async function captureAprilTags(sampleCount = 1, accumulate = true) {
+  setAprilTagBusy(true, sampleCount > 1 ? "Collecting..." : "Capturing...");
+  try {
+    const payload = await postJson("/api/vision/apriltag/capture", {
+      sample_count: sampleCount,
+      sample_interval_ms: 80,
+      accumulate,
+    });
+    if (payload.ok) renderAprilTagCalibration(payload);
+    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Capture failed";
+  } finally {
+    setAprilTagBusy(false);
+  }
+}
+
+async function saveAprilTagCalibration() {
+  setAprilTagBusy(true, "Saving pose...");
+  try {
+    const payload = await postJson("/api/vision/apriltag/save", { require_all_tags: true });
+    if (payload.ok) {
+      if (payload.config) applyConfig(payload.config);
+      renderAprilTagCalibration(payload);
+    } else {
+      renderAprilTagCalibration(payload);
+    }
+  } finally {
+    setAprilTagBusy(false);
+  }
+}
+
+async function verifyAprilTagCalibration() {
+  setAprilTagBusy(true, "Verifying...");
+  try {
+    const payload = await postJson("/api/vision/apriltag/verify", { accumulate: false });
+    if (payload.ok) renderAprilTagCalibration(payload);
+    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Verification failed";
+  } finally {
+    setAprilTagBusy(false);
+  }
 }
 
 function renderDetectionList(detections) {
@@ -1032,9 +1648,21 @@ function renderHardwareDraftBadges() {
 function markHardwareDraftDirty() {
   state.hardwareDraftDirty = true;
   renderHardwareDraftBadges();
-  if (elements.calibrationStatus) {
-    elements.calibrationStatus.textContent = "Hardware IO has unsaved draft changes. Press Save or Sync ESP.";
-  }
+  markSettingsDirty("hardware", "Hardware I/O changed. Save all settings, or use Save and sync controller below.");
+}
+
+function markJointCalibrationDraftDirty() {
+  const validation = validateJointCalibrationDraft();
+  markSettingsDirty(
+    "joints",
+    validation.ok
+      ? "Joint limits or calibration changed. Save all settings to apply them."
+      : `Fix joint calibration before saving: ${validation.errors.join("; ")}`
+  );
+}
+
+function markToolDraftDirty() {
+  markSettingsDirty("tooling", "Tool dimensions or I/O changed. Save all settings to apply them.");
 }
 
 function buildIkTargetControls() {
@@ -1150,6 +1778,8 @@ function formatCartesianTarget(target = {}) {
 function clearIkSolutionPreview() {
   state.previewId = null;
   state.latestPreview = null;
+  state.previewAngles = null;
+  state.taskPreviewId = null;
   if (state.view) {
     state.view.setPreviewAngles(null);
     state.view.setPathWaypoints([]);
@@ -1164,6 +1794,7 @@ function clearIkSolutionPreview() {
   elements.pathHud.textContent = "0 pts";
   elements.executeIkBtn.disabled = true;
   elements.executeProgramBtn.disabled = true;
+  syncJointControls();
 }
 
 function updateIkTargetMarker(options = {}) {
@@ -1190,6 +1821,51 @@ function pathSettings() {
     per_joint_speed_deg_s: [...document.querySelectorAll(".joint-speed-limit")].map((input) => readNumber(input, 1)),
     per_joint_accel_deg_s2: [...document.querySelectorAll(".joint-accel-limit")].map((input) => readNumber(input, 1)),
   };
+}
+
+function normalizeJointAngles(values) {
+  const expectedCount = state.config?.joints?.length || state.robotState?.reported_angles_deg?.length || 4;
+  if (!Array.isArray(values) || values.length !== expectedCount) return null;
+  const angles = values.map(Number);
+  return angles.every(Number.isFinite) ? angles : null;
+}
+
+function previewEndpointAngles(preview = state.latestPreview) {
+  const waypoints = preview?.trajectory?.waypoints;
+  const lastWaypoint = Array.isArray(waypoints) && waypoints.length ? waypoints[waypoints.length - 1] : null;
+  return normalizeJointAngles(lastWaypoint) || normalizeJointAngles(preview?.ik?.selected?.angles_deg);
+}
+
+function jointControlAngles(robotState = state.robotState) {
+  return (
+    normalizeJointAngles(state.draftAngles) ||
+    normalizeJointAngles(state.pendingAngles) ||
+    normalizeJointAngles(state.previewAngles) ||
+    normalizeJointAngles(state.commandedAngles) ||
+    normalizeJointAngles(robotState?.target_angles_deg) ||
+    normalizeJointAngles(robotState?.reported_angles_deg) ||
+    normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg))
+  );
+}
+
+function syncJointControls(robotState = state.robotState) {
+  const targets = jointControlAngles(robotState);
+  if (!targets) return;
+  const reported = normalizeJointAngles(robotState?.reported_angles_deg) || targets;
+  syncJointInputs(targets, reported);
+}
+
+function releaseJointControlIntent() {
+  window.clearTimeout(state.commandTimer);
+  state.commandTimer = null;
+  state.pendingAngles = null;
+  state.draftAngles = null;
+  state.commandedAngles = null;
+  state.lastSentAngles = null;
+  window.clearTimeout(state.liveTargetTimer);
+  state.liveTargetTimer = null;
+  state.pendingLiveTarget = null;
+  state.liveTargetQueued = false;
 }
 
 function syncJointInputs(targets, reported) {
@@ -1270,28 +1946,202 @@ function liveRealEnabled() {
   return Boolean(elements.liveRealToggle.checked && state.robotState?.live_motion_enabled);
 }
 
+function cartesianJogEnabled() {
+  return Boolean(elements.cartesianJogToggle?.checked);
+}
+
+function cartesianJogCanRun() {
+  if (!state.robotState || !isMoveEnabled()) return false;
+  return Boolean(state.robotState.simulation || liveRealEnabled());
+}
+
+function cartesianJogRateMs() {
+  const hz = clamp(Number(state.config?.motion?.command_rate_limit_hz || 20), 12, 30);
+  return Math.max(33, Math.round(1000 / hz));
+}
+
+function setCartesianJogStatus(text) {
+  if (!elements.cartesianJogStatus) return;
+  if (cartesianJogEnabled()) {
+    elements.cartesianJogStatus.textContent = `Velocity jog: ${text || "idle"}`;
+  } else {
+    elements.cartesianJogStatus.textContent = text && text !== "idle"
+      ? `IK preview only - ${text}`
+      : "IK preview only";
+  }
+}
+
+function zeroCartesianJogVelocity() {
+  state.cartesianJogVelocity = { vx_mm_s: 0, vy_mm_s: 0, vz_mm_s: 0, vphi_deg_s: 0 };
+  state.cartesianJogActiveAxes.clear();
+}
+
+function axisVelocityPayload(key, velocity) {
+  const field = {
+    x: "vx_mm_s",
+    y: "vy_mm_s",
+    z: "vz_mm_s",
+    phi: "vphi_deg_s",
+  }[key];
+  if (!field) return 0;
+  const previous = Number(state.cartesianJogVelocity[field] || 0);
+  state.cartesianJogVelocity[field] = velocity;
+  return previous;
+}
+
+function cartesianJogPayload(dtS = null) {
+  return {
+    ...state.cartesianJogVelocity,
+    dt_s: dtS,
+    tcp_speed_mm_s: readNumber(elements.cartesianJogSpeedInput, 60),
+    phi_speed_deg_s: readNumber(elements.cartesianJogPhiSpeedInput, 45),
+    settings: pathSettings(),
+  };
+}
+
+function scheduleCartesianJog(key, velocity) {
+  if (!cartesianJogEnabled()) return;
+  if (!cartesianJogCanRun()) {
+    elements.cartesianJogToggle.checked = false;
+    zeroCartesianJogVelocity();
+    showLocalError(state.robotState?.simulation ? "Cartesian jog is not available." : "Enable Live Real and Arm before hardware Cartesian jog.");
+    return;
+  }
+  const previousVelocity = axisVelocityPayload(key, velocity);
+  if (Math.abs(velocity) > 0.001) state.cartesianJogActiveAxes.add(key);
+  if (Math.abs(velocity) <= 0.001 && Math.abs(previousVelocity) <= 0.001) return;
+  if (state.cartesianJogStopPending || state.cartesianJogStopInFlight) {
+    state.cartesianJogQueued = true;
+    setCartesianJogStatus("starting");
+    return;
+  }
+  const delayMs = cartesianJogRateMs();
+  if (state.cartesianJogInFlight) {
+    state.cartesianJogQueued = true;
+    return;
+  }
+  if (state.cartesianJogTimer) return;
+  state.cartesianJogTimer = window.setTimeout(sendCartesianJog, delayMs);
+}
+
+async function sendCartesianJog() {
+  if (!cartesianJogEnabled() || !cartesianJogCanRun()) {
+    state.cartesianJogTimer = null;
+    return;
+  }
+  if (state.cartesianJogStopPending || state.cartesianJogStopInFlight) {
+    state.cartesianJogQueued = true;
+    state.cartesianJogTimer = null;
+    return;
+  }
+  state.cartesianJogTimer = null;
+  const requestEpoch = state.cartesianJogEpoch;
+  const now = performance.now();
+  const previous = state.cartesianJogLastSentMs || now;
+  const dtS = clamp((now - previous) / 1000, 0.01, 0.08);
+  state.cartesianJogLastSentMs = now;
+  state.cartesianJogInFlight = true;
+  state.cartesianJogQueued = false;
+  try {
+    const payload = await postJson("/api/cartesian-jog", cartesianJogPayload(dtS));
+    if (requestEpoch !== state.cartesianJogEpoch) return;
+    if (payload.ok) {
+      if (payload.state) renderState(payload.state);
+      const notes = payload.jog?.notes || [];
+      const blocked = payload.jog?.blocked;
+      const failureReason = payload.jog?.failure_reason || notes[0] || "blocked";
+      setCartesianJogStatus(blocked ? failureReason : "jogging");
+    } else {
+      elements.cartesianJogToggle.checked = false;
+      zeroCartesianJogVelocity();
+      setCartesianJogStatus(payload.error || "jog failed");
+      updateDisabledState();
+    }
+  } catch (error) {
+    if (requestEpoch !== state.cartesianJogEpoch) return;
+    elements.cartesianJogToggle.checked = false;
+    zeroCartesianJogVelocity();
+    showLocalError(error?.message || "Cartesian jog request failed.");
+    setCartesianJogStatus("jog failed");
+    updateDisabledState();
+  } finally {
+    state.cartesianJogInFlight = false;
+    if (state.cartesianJogStopPending) {
+      void flushCartesianJogStop();
+      return;
+    }
+    const moving = Object.values(state.cartesianJogVelocity).some((value) => Math.abs(value) > 0.001);
+    if ((state.cartesianJogQueued || moving) && cartesianJogEnabled()) {
+      state.cartesianJogQueued = false;
+      state.cartesianJogTimer = window.setTimeout(sendCartesianJog, cartesianJogRateMs());
+    }
+  }
+}
+
+async function flushCartesianJogStop() {
+  if (!state.cartesianJogStopPending || state.cartesianJogStopInFlight || state.cartesianJogInFlight) return;
+  state.cartesianJogStopInFlight = true;
+  try {
+    const payload = await postJson("/api/cartesian-jog/stop");
+    if (payload.state) renderState(payload.state);
+    if (!payload.ok) {
+      setCartesianJogStatus(payload.error || "stop failed");
+      return;
+    }
+  } catch (error) {
+    showLocalError(error?.message || "Cartesian jog stop failed.");
+    setCartesianJogStatus("stop failed");
+    return;
+  } finally {
+    state.cartesianJogStopInFlight = false;
+    state.cartesianJogStopPending = false;
+  }
+
+  const moving = Object.values(state.cartesianJogVelocity).some((value) => Math.abs(value) > 0.001);
+  if (moving && cartesianJogEnabled() && cartesianJogCanRun()) {
+    state.cartesianJogQueued = false;
+    state.cartesianJogLastSentMs = 0;
+    setCartesianJogStatus("starting");
+    state.cartesianJogTimer = window.setTimeout(sendCartesianJog, 0);
+  } else {
+    state.cartesianJogQueued = false;
+    setCartesianJogStatus("idle");
+  }
+}
+
+async function stopCartesianJog() {
+  state.cartesianJogEpoch += 1;
+  window.clearTimeout(state.cartesianJogTimer);
+  state.cartesianJogTimer = null;
+  state.cartesianJogQueued = false;
+  zeroCartesianJogVelocity();
+  state.cartesianJogLastSentMs = 0;
+  state.cartesianJogStopPending = true;
+  setCartesianJogStatus("stopping");
+  await flushCartesianJogStop();
+}
+
 async function setCurrentPoseKnown() {
-  const angles = (
-    state.draftAngles ||
-    state.robotState?.target_angles_deg ||
-    state.robotState?.reported_angles_deg ||
-    state.config?.joints?.map((joint) => joint.home_deg) ||
-    []
-  ).map(Number);
+  const angles =
+    normalizeJointAngles(state.draftAngles) ||
+    normalizeJointAngles(state.robotState?.target_angles_deg) ||
+    normalizeJointAngles(state.robotState?.reported_angles_deg) ||
+    normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg)) ||
+    [];
   if (angles.length !== 4 || angles.some((angle) => !Number.isFinite(angle))) {
     showLocalError("Cannot set pose: joint angles are incomplete.");
     return;
   }
   elements.statusPill.textContent = "Setting known pose...";
   const payload = await postJson("/api/hardware/setpose", { angles_deg: angles });
-  if (payload.state) renderState(payload.state);
   if (payload.ok) {
-    state.draftAngles = null;
-    state.commandedAngles = null;
-    state.pendingAngles = null;
+    invalidatePendingIkPreview();
+    releaseJointControlIntent();
     clearViewPreview();
+    state.ikUserEdited = false;
     elements.statusPill.textContent = "Pose marked known.";
   }
+  if (payload.state) renderState(payload.state);
 }
 
 function updateDisabledState() {
@@ -1302,11 +2152,22 @@ function updateDisabledState() {
   elements.applyJointPreviewBtn.disabled = !enabled || !state.draftAngles;
   elements.resetJointPreviewBtn.disabled = !state.draftAngles && !state.commandedAngles;
   elements.homeBtn.disabled = !enabled;
-  elements.setPoseBtn.disabled = !state.robotState || (!state.robotState.connected && !state.robotState.simulation);
+  elements.setPoseBtn.disabled =
+    !state.robotState ||
+    (!state.robotState.connected && !state.robotState.simulation) ||
+    Boolean(state.previewAngles);
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
   elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
   elements.executeProgramBtn.disabled = !state.previewId || !enabled || state.latestPreview?.mode !== "program";
+  if (elements.cartesianJogToggle) elements.cartesianJogToggle.disabled = !enabled;
+  if (elements.cartesianJogSpeedInput) elements.cartesianJogSpeedInput.disabled = !enabled;
+  if (elements.cartesianJogPhiSpeedInput) elements.cartesianJogPhiSpeedInput.disabled = !enabled;
+  document.querySelectorAll(".target-fader").forEach((fader) => {
+    const disabled = !enabled || (cartesianJogEnabled() && !cartesianJogCanRun()) || (fader.dataset.faderKey === "phi" && ikAutoPhiEnabled());
+    fader.classList.toggle("disabled", disabled);
+    fader.setAttribute("aria-disabled", disabled ? "true" : "false");
+  });
   if (elements.previewTaskBtn) elements.previewTaskBtn.disabled = !state.config;
   if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = !state.taskPreviewId || !enabled;
 }
@@ -1325,19 +2186,25 @@ function renderState(robotState) {
   renderToolControls();
 
   if (!robotState.live_motion_enabled) elements.liveRealToggle.checked = false;
+  if (!isMoveEnabled() || (!robotState.simulation && !liveRealEnabled())) {
+    if (elements.cartesianJogToggle?.checked) {
+      elements.cartesianJogToggle.checked = false;
+      zeroCartesianJogVelocity();
+      setCartesianJogStatus("idle");
+    }
+  }
   if (state.commandedAngles && anglesAlmostEqual(robotState.reported_angles_deg, state.commandedAngles, 0.15)) {
     state.commandedAngles = null;
     if (!state.draftAngles && state.viewPreviewSource === "joint") {
       clearViewPreview();
     }
   }
-  const previewAngles = state.draftAngles || state.commandedAngles || state.pendingAngles;
-  const targets = previewAngles || robotState.target_angles_deg;
-  syncJointInputs(targets, robotState.reported_angles_deg);
+  const jointIntentAngles = state.draftAngles || state.commandedAngles || state.pendingAngles;
+  syncJointControls(robotState);
   state.view.setAngles(robotState.reported_angles_deg);
-  if (state.activeTab === "joint" && previewAngles) {
+  if (state.activeTab === "joint" && jointIntentAngles) {
     state.viewPreviewSource = "joint";
-    state.view.setPreviewAngles(previewAngles);
+    state.view.setPreviewAngles(jointIntentAngles);
   } else if (state.viewPreviewSource === "joint" && !state.commandedAngles) {
     clearViewPreview();
   }
@@ -1356,13 +2223,17 @@ function renderState(robotState) {
   const hardwareSuffix = robotState.simulation ? "" : ` - ${robotState.hardware_mode}/${robotState.config_sync_status}`;
   elements.statusPill.textContent = robotState.last_error || `${robotState.motion_state}${robotState.live_motion_enabled ? " - live real" : ""}${hardwareSuffix}`;
   renderMotionExecution(robotState);
-  setIkTargetFromFk(fk);
+  if (state.cartesianJogActiveAxes.size === 0) setIkTargetFromFk(fk);
   updateDisabledState();
+  if (!state.settingsDirtyScopes.size) updateSettingsSaveBar();
 }
 
 function renderPreview(preview) {
+  releaseJointControlIntent();
+  state.taskPreviewId = null;
   state.previewId = preview.id;
   state.latestPreview = preview;
+  state.previewAngles = previewEndpointAngles(preview);
   state.viewPreviewSource = preview.mode === "program" ? "program" : "ik";
   const ik = preview.ik || {};
   const trajectory = preview.trajectory || {};
@@ -1414,18 +2285,14 @@ function renderPreview(preview) {
     <div class="log-line"><span>Segments</span><code>${segmentText}</code></div>
   `;
 
-  const lastWaypoint = trajectory.waypoints?.[trajectory.waypoints.length - 1];
-  if (ik.selected?.angles_deg) {
-    state.view.setPreviewAngles(ik.selected.angles_deg);
-  } else if (lastWaypoint) {
-    state.view.setPreviewAngles(lastWaypoint);
-  }
+  if (state.previewAngles) state.view.setPreviewAngles(state.previewAngles);
 
   const target = preview.target?.x_mm !== undefined ? preview.target : trajectory.cartesian_waypoints?.[trajectory.cartesian_waypoints.length - 1];
   state.view.setTargetPoint(target || null);
   state.view.setPathWaypoints(trajectory.waypoints || []);
   elements.targetHud.textContent = target ? `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}` : "none";
   elements.pathHud.textContent = `${trajectory.waypoint_count || 0} pts`;
+  syncJointControls();
   updateDisabledState();
 }
 
@@ -1506,6 +2373,13 @@ function scheduleIkPreview(delayMs = 0) {
   state.ikPreviewTimer = window.setTimeout(() => updateIkTargetMarker(), Math.max(0, delayMs));
 }
 
+function invalidatePendingIkPreview() {
+  state.ikPreviewWantedSeq += 1;
+  state.ikPreviewQueued = false;
+  window.clearTimeout(state.ikPreviewTimer);
+  state.ikPreviewTimer = null;
+}
+
 function scheduleLiveTarget(payload, delayMs = 90) {
   if (!liveRealEnabled()) return;
   state.pendingLiveTarget = payload;
@@ -1524,7 +2398,8 @@ async function sendLiveTarget() {
   state.liveTargetInFlight = true;
   state.liveTargetQueued = false;
   try {
-    await postJson("/api/live-target", { ...payload, settings: pathSettings() });
+    const response = await postJson("/api/live-target", { ...payload, settings: pathSettings() });
+    if (response.state) renderState(response.state);
   } finally {
     state.liveTargetInFlight = false;
     if (state.liveTargetQueued && state.pendingLiveTarget) scheduleLiveTarget(state.pendingLiveTarget, 0);
@@ -1533,7 +2408,18 @@ async function sendLiveTarget() {
 
 async function executePreview() {
   if (!state.previewId) return;
-  await postJson("/api/path/execute", { preview_id: state.previewId });
+  const previewId = state.previewId;
+  const payload = await postJson("/api/path/execute", { preview_id: previewId });
+  if (payload.ok) {
+    releaseJointControlIntent();
+    state.previewId = null;
+    state.previewAngles = null;
+    state.taskPreviewId = null;
+    state.ikUserEdited = false;
+  }
+  if (payload.state) renderState(payload.state);
+  else syncJointControls();
+  updateDisabledState();
 }
 
 function renderProgramList() {
@@ -1570,7 +2456,7 @@ function renderProgramList() {
 }
 
 function addCurrentJointWaypoint() {
-  const angles = (state.draftAngles || state.robotState?.target_angles_deg || state.robotState?.reported_angles_deg || []).map(Number);
+  const angles = jointControlAngles() || [];
   if (angles.length !== state.config.joints.length) return;
   state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: angles });
   renderProgramList();
@@ -1581,8 +2467,10 @@ function addIkWaypoint() {
   const mode = elements.programMoveMode.value;
   if (type === "joint") {
     const selected = state.latestPreview?.ik?.selected?.angles_deg;
-    const fallback = state.robotState?.target_angles_deg;
-    state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: (selected || fallback).map(Number) });
+    const fallback = jointControlAngles();
+    const angles = normalizeJointAngles(selected) || fallback;
+    if (!angles) return;
+    state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: angles });
   } else {
     state.programWaypoints.push({
       type: "cartesian",
@@ -1630,6 +2518,8 @@ function readHardwarePatch(index, actuator) {
 
 function readCalibrationPayload() {
   const links = readLinkPayload();
+  const jointValidation = validateJointCalibrationDraft();
+  if (!jointValidation.ok) return null;
   const joints = state.config.joints.map((joint, index) => {
     const minInput = $(`[data-joint-index="${index}"][data-calib-limit="min"]`);
     const maxInput = $(`[data-joint-index="${index}"][data-calib-limit="max"]`);
@@ -1657,7 +2547,9 @@ function readCalibrationPayload() {
       dh_rows: dhValidation.rows,
     },
     geometry: readGeometryPayload(),
+    tools: readToolsPayload(),
     joints,
+    path_defaults: pathSettings(),
     motion: {
       command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
       acceleration_deg_s2: readNumber(elements.globalAccelInput, state.config.motion.acceleration_deg_s2),
@@ -1667,11 +2559,17 @@ function readCalibrationPayload() {
 
 async function saveCalibration(options = {}) {
   const showStatus = options.showStatus !== false;
-  if (showStatus) elements.calibrationStatus.textContent = "Saving calibration...";
+  if (showStatus) updateSettingsSaveBar({ mode: "saving", title: "Saving robot settings", detail: "Validating and writing the current robot configuration…" });
   const calibrationPayload = readCalibrationPayload();
   if (!calibrationPayload) {
-    if (showStatus) elements.calibrationStatus.textContent = "Fix invalid DH values before saving.";
-    return { ok: false, error: "invalid DH draft" };
+    if (showStatus) {
+      updateSettingsSaveBar({
+        mode: "error",
+        title: "Settings could not be saved",
+        detail: "Fix the highlighted joint calibration or derived-model values, then try again.",
+      });
+    }
+    return { ok: false, error: "invalid settings draft" };
   }
   const payload = await postJson("/api/config/calibration", calibrationPayload);
   if (payload.ok) {
@@ -1679,15 +2577,75 @@ async function saveCalibration(options = {}) {
     applyConfig(payload.config);
     if (payload.state) renderState(payload.state);
     if (options.clearPreview !== false) clearViewPreview();
-    if (showStatus) {
-      elements.calibrationStatus.textContent = payload.state?.config_sync_status === "synced"
-        ? "Calibration saved and synced to ESP."
-        : "Calibration saved to robot.local.yaml.";
-    }
+    robotSettingsScopes.forEach((scope) => state.settingsDirtyScopes.delete(scope));
+    if (showStatus) updateSettingsSaveBar();
   } else {
-    elements.calibrationStatus.textContent = payload.error || "Calibration save failed.";
+    updateSettingsSaveBar({
+      mode: "error",
+      title: "Settings could not be saved",
+      detail: payload.error || "The robot configuration save failed.",
+    });
   }
   return payload;
+}
+
+async function saveAllSettings() {
+  if (!state.settingsDirtyScopes.size) return true;
+  let cameraDraft = null;
+  if (state.settingsDirtyScopes.has("camera")) {
+    try {
+      cameraDraft = cameraSettingsDraft();
+    } catch (error) {
+      updateSettingsSaveBar({
+        mode: "error",
+        title: "Camera settings are invalid",
+        detail: error?.message || String(error),
+      });
+      return false;
+    }
+  }
+  updateSettingsSaveBar({
+    mode: "saving",
+    title: "Saving all settings",
+    detail: "Writing the changed robot and camera settings…",
+  });
+  const hasRobotDraft = [...state.settingsDirtyScopes].some((scope) => robotSettingsScopes.has(scope));
+  if (hasRobotDraft) {
+    const robotPayload = await saveCalibration({ showStatus: false });
+    if (!robotPayload.ok) {
+      updateSettingsSaveBar({
+        mode: "error",
+        title: "Settings could not be saved",
+        detail: robotPayload.error || "The robot settings save failed.",
+      });
+      return false;
+    }
+  }
+  if (cameraDraft) {
+    const cameraPayload = await postJson("/api/vision/settings", { camera: cameraDraft });
+    if (!cameraPayload.ok) {
+      updateSettingsSaveBar({
+        mode: "error",
+        title: "Camera settings could not be saved",
+        detail: cameraPayload.error || "The camera settings save failed.",
+      });
+      return false;
+    }
+    if (cameraPayload.config) applyConfig(cameraPayload.config);
+  }
+  clearSettingsDirty();
+  return true;
+}
+
+async function discardSettingsChanges() {
+  updateSettingsSaveBar({
+    mode: "saving",
+    title: "Discarding draft changes",
+    detail: "Reloading the last saved configuration…",
+  });
+  await loadConfig();
+  state.hardwareDraftDirty = false;
+  clearSettingsDirty();
 }
 
 function applyConfig(config) {
@@ -1697,17 +2655,22 @@ function applyConfig(config) {
   state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
   elements.commandRate.textContent = `${format(state.config.motion.command_rate_limit_hz, 0)} Hz command limit`;
-  elements.globalSpeedInput.value = format(Math.min(...state.config.joints.map((joint) => joint.max_speed_deg_s)), 1);
-  elements.globalAccelInput.value = format(state.config.motion.acceleration_deg_s2, 1);
-  elements.waypointRateInput.value = format(state.config.motion.command_rate_limit_hz, 0);
-  elements.cartesianStepInput.value = "10";
-  elements.plannerTypeSelect.value = "s_curve";
-  elements.jerkPercentInput.value = "25";
-  elements.blendPercentInput.value = "0";
+  const pathDefaults = state.config.path_defaults || {};
+  elements.globalSpeedInput.value = format(
+    pathDefaults.global_speed_deg_s ?? Math.min(...state.config.joints.map((joint) => joint.max_speed_deg_s)),
+    1
+  );
+  elements.globalAccelInput.value = format(pathDefaults.global_accel_deg_s2 ?? state.config.motion.acceleration_deg_s2, 1);
+  elements.waypointRateInput.value = format(pathDefaults.waypoint_rate_hz ?? state.config.motion.command_rate_limit_hz, 0);
+  elements.cartesianStepInput.value = format(pathDefaults.cartesian_step_mm ?? 10, 0);
+  elements.plannerTypeSelect.value = pathDefaults.planner_type || "s_curve";
+  elements.jerkPercentInput.value = format(pathDefaults.jerk_percent ?? 25, 0);
+  elements.blendPercentInput.value = format(pathDefaults.blend_percent ?? 0, 0);
   buildJointControls();
   buildPerJointTuning();
   buildCalibrationEditors();
   buildHardwareIoEditors();
+  renderToolSelectOptions();
   if (state.robotState) renderHardwareStatus(state.robotState);
   renderOperatorPanels();
   buildIkTargetControls();
@@ -1715,15 +2678,21 @@ function applyConfig(config) {
   updatePhiControlState();
   renderProgramList();
   state.view.setConfig(state.config);
+  syncJointControls();
+  renderCameraIntrinsics(state.config.camera);
+  updateSettingsSaveBar();
 }
 
 function clearViewPreview() {
   state.previewId = null;
   state.latestPreview = null;
+  state.previewAngles = null;
+  state.taskPreviewId = null;
   state.viewPreviewSource = null;
   if (state.view) state.view.clearPreview();
   elements.targetHud.textContent = "none";
   elements.pathHud.textContent = "0 pts";
+  syncJointControls();
   updateDisabledState();
 }
 
@@ -1750,7 +2719,7 @@ function connectWebSocket() {
   });
 }
 
-function bindFader(element, onDelta) {
+function bindFader(element, onDelta, onStop = null, onStart = null) {
   let dragging = false;
   let offset = 0;
   let pointerId = null;
@@ -1781,7 +2750,8 @@ function bindFader(element, onDelta) {
     if (lastTime === null) lastTime = time;
     const dt = Math.min(0.05, (time - lastTime) / 1000);
     lastTime = time;
-    if (Math.abs(offset) > 0.001) onDelta(speed * offset * Math.abs(offset) * dt);
+    const velocity = Math.abs(offset) > 0.001 ? speed * offset * Math.abs(offset) : 0;
+    onDelta(velocity * dt, { velocity, dt, offset });
     raf = requestAnimationFrame(loop);
   };
 
@@ -1793,6 +2763,7 @@ function bindFader(element, onDelta) {
     element.classList.add("dragging");
     element.setPointerCapture(pointerId);
     updateOffset(event.clientX);
+    if (onStart) onStart();
     raf = requestAnimationFrame(loop);
   });
   element.addEventListener("pointermove", (event) => {
@@ -1809,53 +2780,114 @@ function bindFader(element, onDelta) {
       }
       pointerId = null;
       stop();
+      if (onStop) onStop();
     });
   });
 }
 
 function bindFaders() {
   document.querySelectorAll(".target-fader").forEach((fader) => {
-    bindFader(fader, (delta) => {
+    bindFader(fader, (delta, meta) => {
       const key = fader.dataset.faderKey;
       if (key === "phi" && ikAutoPhiEnabled()) return;
+      if (cartesianJogEnabled()) {
+        scheduleCartesianJog(key, meta.velocity);
+        return;
+      }
+      if (Math.abs(delta) <= 1e-9) return;
       const input = $(`#ik-${key}-input`);
       if (!input) return;
       setIkTargetValue(key, readNumber(input, 0) + delta);
       scheduleIkPreview();
+    }, () => {
+      const key = fader.dataset.faderKey;
+      if (!cartesianJogEnabled()) return;
+      axisVelocityPayload(key, 0);
+      state.cartesianJogActiveAxes.delete(key);
+      if (state.cartesianJogActiveAxes.size === 0) stopCartesianJog();
+    }, () => {
+      if (cartesianJogEnabled()) setCartesianJogStatus("starting");
     });
   });
 }
 
 function bindPanelChrome() {
   let resizing = false;
+  let resizePointerId = null;
   let startX = 0;
   let startWidth = 0;
+  const finishResize = () => {
+    if (!resizing) return;
+    resizing = false;
+    resizePointerId = null;
+    elements.appLayout.classList.remove("panel-resizing");
+    elements.panelResizer.setAttribute("aria-valuenow", String(Math.round(document.querySelector(".left-panel")?.getBoundingClientRect().width || 0)));
+    state.view.resize();
+  };
+  const resizePanel = (event) => {
+    if (!resizing || (resizePointerId != null && event.pointerId !== resizePointerId)) return;
+    const minimumWidth = window.innerWidth <= 760 ? 320 : 420;
+    const viewportReserve = window.innerWidth <= 1100 ? 260 : 340;
+    const maximumWidth = Math.max(minimumWidth, window.innerWidth - viewportReserve);
+    const width = clamp(startWidth + event.clientX - startX, minimumWidth, maximumWidth);
+    if (elements.appLayout.classList.contains("settings-active")) {
+      elements.appLayout.style.setProperty("--settings-panel-width", `${width}px`);
+    } else {
+      document.documentElement.style.setProperty("--left-panel-width", `${width}px`);
+    }
+    elements.panelResizer.setAttribute("aria-valuenow", String(Math.round(width)));
+    state.view.resize();
+  };
+  elements.panelResizer.setAttribute("aria-label", "Resize control panel");
+  elements.panelResizer.setAttribute("aria-valuemin", "320");
+  elements.panelResizer.setAttribute("aria-valuenow", "500");
   elements.panelResizer.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
     resizing = true;
+    resizePointerId = event.pointerId;
     startX = event.clientX;
-    startWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--left-panel-width"));
+    startWidth = document.querySelector(".left-panel")?.getBoundingClientRect().width || 500;
+    elements.appLayout.classList.add("panel-resizing");
     elements.panelResizer.setPointerCapture(event.pointerId);
   });
-  elements.panelResizer.addEventListener("pointermove", (event) => {
-    if (!resizing) return;
-    const width = clamp(startWidth + event.clientX - startX, 420, Math.max(420, window.innerWidth - 340));
-    document.documentElement.style.setProperty("--left-panel-width", `${width}px`);
-    state.view.resize();
-  });
+  window.addEventListener("pointermove", resizePanel);
   elements.panelResizer.addEventListener("pointerup", (event) => {
-    resizing = false;
-    elements.panelResizer.releasePointerCapture(event.pointerId);
+    if (elements.panelResizer.hasPointerCapture(event.pointerId)) {
+      elements.panelResizer.releasePointerCapture(event.pointerId);
+    }
+    finishResize();
   });
+  elements.panelResizer.addEventListener("pointercancel", finishResize);
+  elements.panelResizer.addEventListener("lostpointercapture", finishResize);
   elements.collapsePanelBtn.addEventListener("click", () => {
     elements.appLayout.classList.toggle("collapsed");
     window.setTimeout(() => state.view.resize(), 300);
   });
   document.querySelectorAll("[data-collapse-widget]").forEach((button) => {
+    const widget = $(`#${button.dataset.collapseWidget}`);
+    const widgetName = button.dataset.collapseWidget === "sceneHud" ? "HUD" : "faders";
+    const updateCollapseButton = () => {
+      const expanded = !widget.classList.contains("collapsed");
+      button.setAttribute("aria-controls", widget.id);
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${widgetName}`);
+      button.title = `${expanded ? "Collapse" : "Expand"} ${widgetName}`;
+    };
+    updateCollapseButton();
     button.addEventListener("click", () => {
-      const widget = $(`#${button.dataset.collapseWidget}`);
       widget.classList.toggle("collapsed");
+      updateCollapseButton();
     });
   });
+  const updateTabHeaderHeight = () => {
+    const height = Math.ceil(elements.tabHeader?.getBoundingClientRect().height || 146);
+    document.documentElement.style.setProperty("--tab-header-height", `${height}px`);
+  };
+  updateTabHeaderHeight();
+  if (window.ResizeObserver && elements.tabHeader) {
+    const observer = new ResizeObserver(updateTabHeaderHeight);
+    observer.observe(elements.tabHeader);
+  }
 }
 
 function bindActions() {
@@ -1863,14 +2895,23 @@ function bindActions() {
     tab.addEventListener("click", () => {
       const target = tab.dataset.appTab;
       state.activeTab = target;
+      elements.appLayout.classList.toggle("settings-active", target === "settings");
       elements.appTabs.forEach((candidate) => candidate.classList.toggle("active", candidate === tab));
       Object.entries(elements.appTabPanels).forEach(([key, panel]) => panel.classList.toggle("active", key === target));
-      if (target !== "joint" && state.viewPreviewSource === "joint") {
-        clearViewPreview();
+      if (target !== "ik") invalidatePendingIkPreview();
+      if (target !== "joint" && (state.viewPreviewSource === "joint" || state.draftAngles || state.pendingAngles || state.commandedAngles)) {
+        const hadJointPreview = state.viewPreviewSource === "joint";
+        releaseJointControlIntent();
+        if (hadJointPreview) clearViewPreview();
+        else syncJointControls();
       }
-      if (target === "joint" && state.draftAngles) {
-        state.viewPreviewSource = "joint";
-        state.view.setPreviewAngles(state.draftAngles);
+      if (target === "joint") {
+        syncJointControls();
+        const jointIntentAngles = state.draftAngles || state.commandedAngles || state.pendingAngles;
+        if (jointIntentAngles) {
+          state.viewPreviewSource = "joint";
+          state.view.setPreviewAngles(jointIntentAngles);
+        }
       }
       if (target === "ik") {
         scheduleIkPreview(0);
@@ -1878,7 +2919,12 @@ function bindActions() {
       if (target === "operate") {
         detectVision();
       }
+      if (target === "settings") {
+        loadAprilTagStatus();
+        updateSettingsSaveBar();
+      }
       state.view.resize();
+      window.setTimeout(() => state.view.resize(), 300);
     });
   });
 
@@ -1887,10 +2933,17 @@ function bindActions() {
     if (!input.matches("[data-index]") || !state.robotState) return;
     const index = Number(input.dataset.index);
     const value = Number(input.value);
-    const next = (state.draftAngles || state.pendingAngles || state.robotState.target_angles_deg).slice();
+    const current = jointControlAngles();
+    if (!current) return;
+    const next = current.slice();
+    invalidatePendingIkPreview();
+    if (state.viewPreviewSource !== "joint") clearViewPreview();
     next[index] = value;
+    state.commandedAngles = null;
+    state.previewAngles = null;
     state.draftAngles = next;
-    syncJointInputs(next, state.robotState.reported_angles_deg);
+    state.ikUserEdited = false;
+    syncJointControls();
     state.viewPreviewSource = "joint";
     state.view.setPreviewAngles(next);
     if (liveRealEnabled()) scheduleLiveTarget({ angles_deg: next });
@@ -1902,17 +2955,22 @@ function bindActions() {
     if (!angles) return;
     const payload = await postJson("/api/joints", { angles_deg: angles, settings: pathSettings() });
     if (payload.ok) {
-      state.pendingAngles = angles.slice();
-      state.commandedAngles = angles.slice();
-      state.draftAngles = null;
-      state.viewPreviewSource = "joint";
-      state.view.setPreviewAngles(state.commandedAngles);
+      if (state.activeTab === "joint") {
+        state.pendingAngles = angles.slice();
+        state.commandedAngles = angles.slice();
+        state.draftAngles = null;
+        state.previewAngles = null;
+        state.ikUserEdited = false;
+        state.viewPreviewSource = "joint";
+        state.view.setPreviewAngles(state.commandedAngles);
+      } else {
+        releaseJointControlIntent();
+      }
     }
+    if (payload.state) renderState(payload.state);
   });
   elements.resetJointPreviewBtn.addEventListener("click", () => {
-    state.draftAngles = null;
-    state.commandedAngles = null;
-    state.pendingAngles = null;
+    releaseJointControlIntent();
     if (state.viewPreviewSource === "joint") clearViewPreview();
     if (state.robotState) renderState(state.robotState);
   });
@@ -1946,9 +3004,30 @@ function bindActions() {
   });
   elements.connectSelectedSerialBtn.addEventListener("click", connectSelectedSerial);
   elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
-  elements.homeBtn.addEventListener("click", () => postJson("/api/home"));
+  elements.homeBtn.addEventListener("click", async () => {
+    const payload = await postJson("/api/home");
+    if (payload.ok) {
+      invalidatePendingIkPreview();
+      releaseJointControlIntent();
+      clearViewPreview();
+      state.ikUserEdited = false;
+    }
+    if (payload.state) renderState(payload.state);
+  });
   elements.setPoseBtn.addEventListener("click", setCurrentPoseKnown);
-  elements.stopBtn.addEventListener("click", () => postJson("/api/stop"));
+  elements.stopBtn.addEventListener("click", async () => {
+    elements.cartesianJogToggle.checked = false;
+    zeroCartesianJogVelocity();
+    setCartesianJogStatus("idle");
+    const payload = await postJson("/api/stop");
+    if (payload.ok) {
+      invalidatePendingIkPreview();
+      releaseJointControlIntent();
+      clearViewPreview();
+      state.ikUserEdited = false;
+    }
+    if (payload.state) renderState(payload.state);
+  });
   elements.diagnosticsBtn.addEventListener("click", async () => {
     elements.diagnosticsDrawer.hidden = false;
     await refreshDiagnostics();
@@ -1959,9 +3038,19 @@ function bindActions() {
   elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
   elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
   elements.hardwareIo.addEventListener("change", markHardwareDraftDirty);
+  elements.jointCalibration.addEventListener("input", markJointCalibrationDraftDirty);
+  elements.jointCalibration.addEventListener("change", markJointCalibrationDraftDirty);
+  elements.toolCalibration.addEventListener("input", markToolDraftDirty);
+  elements.toolCalibration.addEventListener("change", (event) => {
+    markToolDraftDirty();
+    if (event.target?.dataset?.toolField === "type") {
+      state.config.tools = readToolsPayload();
+      renderToolEditor();
+    }
+  });
   elements.geometryPresetEditor?.addEventListener("input", () => {
     refreshDerivedModelDraft();
-    if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry draft updated. Save to persist.";
+    markSettingsDirty("geometry", "Robot geometry changed. Preview it if needed, then save all settings.");
   });
   elements.geometryPresetEditor?.addEventListener("change", (event) => {
     if (event.target?.id === "geometryPresetSelect") {
@@ -1970,25 +3059,90 @@ function bindActions() {
       buildGeometryPresetEditor();
     }
     refreshDerivedModelDraft();
-    if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry draft updated. Save to persist.";
+    markSettingsDirty("geometry", "Robot geometry changed. Preview it if needed, then save all settings.");
   });
   elements.geometryPresetEditor?.addEventListener("click", (event) => {
     if (event.target?.id === "applyGeometryPresetBtn") applyGeometryPresetToDhDraft();
   });
   elements.syncHardwareBtn.addEventListener("click", async () => {
-    elements.calibrationStatus.textContent = "Saving Hardware IO draft...";
-    const savePayload = await saveCalibration({ showStatus: false, clearPreview: false });
-    if (!savePayload.ok) return;
-    elements.calibrationStatus.textContent = "Syncing saved hardware config...";
+    const saved = await saveAllSettings();
+    if (!saved) return;
+    updateSettingsSaveBar({ mode: "saving", title: "Syncing controller", detail: "Sending the saved hardware configuration to the ESP…" });
     const payload = await postJson("/api/hardware/sync");
     if (payload.state) renderState(payload.state);
-    elements.calibrationStatus.textContent = payload.ok
-      ? "Hardware IO saved and synced to ESP."
-      : payload.message || payload.error || "Hardware sync failed.";
+    updateSettingsSaveBar(
+      payload.ok
+        ? { title: "All settings saved", detail: "Saved locally and synced to the controller." }
+        : { mode: "error", title: "Controller sync failed", detail: payload.message || payload.error || "Hardware settings remain saved locally." }
+    );
+  });
+  [
+    elements.globalSpeedInput,
+    elements.globalAccelInput,
+    elements.waypointRateInput,
+    elements.cartesianStepInput,
+    elements.plannerTypeSelect,
+    elements.jerkPercentInput,
+    elements.blendPercentInput,
+  ].forEach((input) => {
+    input?.addEventListener("input", () => markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them."));
+    input?.addEventListener("change", () => markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them."));
+  });
+  elements.perJointTuning?.addEventListener("input", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
+  elements.perJointTuning?.addEventListener("change", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
+  [
+    elements.cameraSourceInput,
+    elements.cameraWidthInput,
+    elements.cameraHeightInput,
+    elements.cameraFxInput,
+    elements.cameraFyInput,
+    elements.cameraCxInput,
+    elements.cameraCyInput,
+    elements.cameraDistortionInput,
+  ].forEach((input) => {
+    input?.addEventListener("input", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
+    input?.addEventListener("change", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
+  });
+  elements.settingsSectionNav?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-settings-target]");
+    if (!button) return;
+    const section = $(`#${button.dataset.settingsTarget}`);
+    if (!section) return;
+    elements.settingsSectionNav.querySelectorAll("[data-settings-target]").forEach((item) => {
+      item.classList.toggle("active", item === button);
+    });
+    section.scrollIntoView({ behavior: "smooth", block: "start" });
   });
   elements.liveRealToggle.addEventListener("change", async () => {
+    const wasCartesianJogEnabled = cartesianJogEnabled();
+    const wasSimulation = Boolean(state.robotState?.simulation);
     const payload = await postJson("/api/live-motion", { enabled: elements.liveRealToggle.checked });
     elements.liveRealToggle.checked = Boolean(payload.ok && payload.state?.live_motion_enabled);
+    if (!elements.liveRealToggle.checked && wasCartesianJogEnabled && !wasSimulation) {
+      await stopCartesianJog();
+      elements.cartesianJogToggle.checked = false;
+    }
+    if (payload.state) renderState(payload.state);
+    updateDisabledState();
+  });
+  elements.cartesianJogToggle?.addEventListener("change", async () => {
+    if (elements.cartesianJogToggle.checked && !cartesianJogCanRun()) {
+      elements.cartesianJogToggle.checked = false;
+      showLocalError(state.robotState?.simulation ? "Cartesian jog is not available." : "Enable Live Real and Arm before hardware Cartesian jog.");
+      updateDisabledState();
+      return;
+    }
+    if (elements.cartesianJogToggle.checked) {
+      invalidatePendingIkPreview();
+      releaseJointControlIntent();
+      clearViewPreview();
+      state.ikUserEdited = false;
+      setIkTargetFromFk(state.robotState?.fk);
+      setCartesianJogStatus("ready");
+    } else {
+      await stopCartesianJog();
+    }
+    updateDisabledState();
   });
   elements.namedPositionsList?.addEventListener("click", (event) => {
     const previewButton = event.target.closest("[data-named-preview]");
@@ -1997,14 +3151,41 @@ function bindActions() {
     if (applyButton) moveNamedPosition(applyButton.dataset.namedApply);
   });
   elements.toolSelect.addEventListener("change", () => saveActiveTool(elements.toolSelect.value));
+  elements.toolValueSlider.addEventListener("pointerdown", beginToolSliderEdit);
+  elements.toolValueSlider.addEventListener("pointerup", () => {
+    endToolSliderEdit();
+    queueToolSliderLiveSet({ immediate: true });
+  });
+  elements.toolValueSlider.addEventListener("pointercancel", () => {
+    endToolSliderEdit();
+    queueToolSliderLiveSet({ immediate: true });
+  });
+  elements.toolValueSlider.addEventListener("focus", beginToolSliderEdit);
+  elements.toolValueSlider.addEventListener("blur", () => {
+    endToolSliderEdit();
+    queueToolSliderLiveSet({ immediate: true });
+  });
+  elements.toolValueSlider.addEventListener("input", () => {
+    state.toolSliderEditing = true;
+    queueToolSliderLiveSet();
+  });
+  elements.toolValueSlider.addEventListener("change", () => {
+    endToolSliderEdit();
+    queueToolSliderLiveSet({ immediate: true });
+  });
   elements.toolOpenBtn.addEventListener("click", () => sendTool("open"));
   elements.toolCloseBtn.addEventListener("click", () => sendTool("close"));
-  elements.toolSetBtn.addEventListener("click", () => sendTool("set", Number(elements.toolValueSlider.value || 0)));
   elements.toolOnBtn.addEventListener("click", () => sendTool("on"));
   elements.toolOffBtn.addEventListener("click", () => sendTool("off"));
   elements.previewTaskBtn.addEventListener("click", previewTask);
   elements.executeTaskBtn.addEventListener("click", executeTask);
   elements.detectVisionBtn.addEventListener("click", detectVision);
+  elements.saveCameraIntrinsicsBtn?.addEventListener("click", saveCameraIntrinsics);
+  elements.resetAprilTagBtn?.addEventListener("click", resetAprilTagCalibration);
+  elements.captureAprilTagBtn?.addEventListener("click", () => captureAprilTags(1, true));
+  elements.collectAprilTagBtn?.addEventListener("click", () => captureAprilTags(12, true));
+  elements.saveAprilTagBtn?.addEventListener("click", saveAprilTagCalibration);
+  elements.verifyAprilTagBtn?.addEventListener("click", verifyAprilTagCalibration);
 
   elements.sliderRangeControls.addEventListener("input", () => {
     state.ikUserEdited = true;
@@ -2057,7 +3238,8 @@ function bindActions() {
     renderProgramList();
   });
 
-  elements.saveCalibrationBtn.addEventListener("click", () => saveCalibration());
+  elements.saveCalibrationBtn.addEventListener("click", saveAllSettings);
+  elements.discardSettingsBtn?.addEventListener("click", discardSettingsChanges);
   bindFaders();
   bindPanelChrome();
 }
@@ -2068,6 +3250,7 @@ async function init() {
   bindActions();
   await postJson("/api/live-motion", { enabled: false });
   connectWebSocket();
+  await loadAprilTagStatus();
 }
 
 init();
