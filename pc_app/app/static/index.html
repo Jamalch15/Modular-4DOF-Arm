@@ -741,7 +741,7 @@
                       <p class="hint">Controller pins, drivers, servo ranges, and actuator mapping.</p>
                     </div>
                     <div class="button-row">
-                      <button id="syncHardwareBtn" class="ghost" type="button">Save and sync controller</button>
+                      <button id="syncHardwareBtn" class="ghost" type="button" title="Hardware must be disarmed before controller configuration is synced">Save and sync controller</button>
                     </div>
                   </div>
                   <div id="hardwareStatus" class="path-summary"></div>
@@ -859,8 +859,8 @@
             <button id="connectSimBtn" type="button">Sim</button>
             <button id="connectSerialBtn" type="button">Serial</button>
             <button id="disconnectBtn" type="button">Disconnect</button>
-            <button id="homeBtn" type="button">Home</button>
-            <button id="setPoseBtn" type="button" class="ghost" title="Mark the current slider pose as the known hardware pose while disarmed">Set Pose</button>
+            <button id="homeBtn" type="button" title="Move to the configured home pose; this does not establish an unknown physical pose">Go Home</button>
+            <button id="setPoseBtn" type="button" class="ghost" title="Operator assertion only: while disarmed, mark the displayed joint angles as the real hardware pose. This does not physically home or move the robot.">Set Pose</button>
             <button id="stopBtn" type="button" class="warn">Stop</button>
             <button id="diagnosticsBtn" type="button" class="ghost">Diagnostics</button>
             <label class="arm-toggle">

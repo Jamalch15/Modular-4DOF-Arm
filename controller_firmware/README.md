@@ -67,13 +67,14 @@ pio run -e esp32-s3-arm-controller-usb-jtag -t upload
 Working assumptions:
 
 - The PC dashboard is the source of truth for geometry, joint limits, pins, gear ratios, microstepping, and servo pulse mapping.
-- The PC sends `CONFIG` lines on serial connect and after Settings save.
+- The PC sends `CONFIG` lines on serial connect or explicit controller sync while hardware is disarmed.
 - The ESP stores config in RAM only; reset the ESP and the PC will resync.
 - Disabled axes are simulated internally.
 - Enabled invalid axes reject config and block arming.
 - Partial hardware is allowed and reported as `hw=mixed`.
 - Motion is open-loop. AS5048A feedback is staged as readback/pose verification first, not full closed-loop correction.
-- `SETPOSE` is used after manual positioning to establish the open-loop pose.
+- `SETPOSE` is an explicit operator assertion used after manual positioning or pose-invalidating actuator configuration changes to establish the open-loop pose. It does not perform physical homing.
+- Go Home is a normal move from a known pose. Physical homing remains deferred until switches/index hardware and safe directions are defined.
 - `ESTOP` disarms and blocks motion until the controller is reset.
 
 If upload fails with `No serial data received`, the ESP32-S3 did not enter the

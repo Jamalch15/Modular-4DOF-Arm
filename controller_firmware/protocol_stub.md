@@ -81,7 +81,7 @@ MOVEJ 0.0 25.0 -30.0 10.0 25.0 100.0
 
 `TRAJ` uploads a complete timed joint-space path before motion starts. Points must be sent in increasing `index` order, `t` is seconds from the start of the trajectory, the first point must be at `t=0`, and the last point must match the declared duration. The full-arm controller interpolates between uploaded points while the actuator loop runs; this avoids treating every Cartesian waypoint as an independent `MOVEJ`.
 
-Current implementation note: this is still open-loop target/velocity following, not final closed-loop motion control. The controller validates joint limits and clears the queue on `STOP`, `ESTOP`, `HOME`, `SETPOSE`, `MOVEJ`, disarm, and config changes. Low-level stepper pulse generation is still simple and should be validated on hardware.
+Current implementation note: this is still open-loop target/velocity following, not final closed-loop motion control. `HOME` is a legacy "move to configured home pose" command and requires an already-known pose; it is not physical homing. The PC dashboard normally implements Go Home through `MOVEJ`. The controller validates joint limits and clears the queue on `STOP`, `ESTOP`, `HOME`, `SETPOSE`, `MOVEJ`, disarm, and config changes. Low-level stepper pulse generation is still simple and should be validated on hardware.
 
 ## Responses
 
@@ -100,7 +100,7 @@ STATUS state=idle homed=0 armed=0 hw=mixed enabled=1000 j1=0.0 j2=20.0 j3=20.0 j
 Newer firmware may include optional readback and tool fields:
 
 ```text
-STATUS state=idle homed=1 known=1 pose_source=mixed armed=1 hw=mixed enabled=1100 enc=1100 e1=12.5 e2=-4.2 j1=12.4 j2=-4.1 j3=20.0 j4=0.0 closed_loop=readback tool_type=generic tool=open tool_value=0.000 fault=OK
+STATUS state=idle homed=0 known=1 pose_source=open_loop_estimate armed=1 hw=mixed enabled=1100 enc=1100 e1=12.5 e2=-4.2 j1=12.4 j2=-4.1 j3=20.0 j4=0.0 closed_loop=readback tool_type=generic tool=open tool_value=0.000 fault=OK
 ```
 
 Error:
@@ -121,7 +121,7 @@ OK command=TRAJ_BEGIN count=3 duration=1.000
 OK command=TRAJ_POINT index=0
 OK command=TRAJ_START count=3 duration=1.000
 OK command=TRAJ_CLEAR
-OK command=CONFIG axes=4 hw=mixed enabled=1000
+OK command=CONFIG axes=4 hw=mixed enabled=1000 pose_invalidated=0
 OK command=ARM armed=1
 OK command=SETPOSE
 OK command=TOOL state=open value=0.000
@@ -141,6 +141,9 @@ fault
 ## Hardware Config Rules
 
 - The PC dashboard is authoritative and sends config on serial connect/save.
+- `CONFIG` requires stopped, disarmed hardware.
+- Changes to actuator zero, sign, gearing, servo mapping, or home reference invalidate the controller's known pose and return `pose_invalidated=1`.
+- After a pose-invalidating config sync, the operator must verify the physical arm and issue `SETPOSE` while disarmed.
 - ESP config is RAM-only for now.
 - Unknown pins use `-1`.
 - Disabled axes are simulated in reported joint state.
@@ -172,7 +175,9 @@ fault
 - `STOP` must cancel active motion without requiring a reset.
 - Joint targets must be checked against configured limits.
 - Unknown commands must not move hardware.
-- Motion should not start until a known state or homed state exists.
+- Motion should not start until a known pose exists.
+- `SETPOSE` establishes an operator-asserted open-loop pose but does not set `homed=1`.
+- `homed=1` is reserved for a future physical switch/index homing procedure.
 - Hardware motion must require `ARM 1`.
 - Tool commands should fail safely during E-stop and should be treated like hardware motion when a physical tool is attached.
 - Servo pulses must stay inside measured safe ranges.

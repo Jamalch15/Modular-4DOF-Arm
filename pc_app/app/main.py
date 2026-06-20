@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import subprocess
 import shutil
 import tempfile
@@ -69,7 +70,6 @@ from .protocol import (
     format_config_lines,
     format_estop,
     format_hello,
-    format_home,
     format_jog_stop,
     format_jogj,
     format_jogv,
@@ -243,6 +243,7 @@ active_motion_run_id: str | None = None
 simulation_trajectory_active = False
 MAX_TRAJECTORY_UPLOAD_POINTS = 220
 TASK_PREVIEW_TTL_S = 600.0
+PREVIEW_START_TOLERANCE_DEG = 0.1
 CARTESIAN_JOG_STALE_S = 0.35
 cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
@@ -264,6 +265,66 @@ workspace_calibration_session = WorkspaceCalibrationSession(
 )
 camera_capture = CameraCapture()
 vision_pipeline = VisionPipeline()
+
+
+def robot_model_fingerprint(links: LinkConfig | None = None) -> str:
+    active_links = links or config.links
+    payload = {
+        "links": asdict(active_links),
+        "joints": [
+            {
+                "min_deg": joint.min_deg,
+                "max_deg": joint.max_deg,
+                "home_deg": joint.home_deg,
+                "zero_offset_deg": joint.zero_offset_deg,
+                "direction_sign": joint.direction_sign,
+            }
+            for joint in config.joints
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def pose_snapshot_fields(*, planning_links: LinkConfig | None = None) -> dict[str, Any]:
+    return {
+        "start_pose_revision": int(state.pose_revision),
+        "start_reported_angles_deg": [float(value) for value in state.reported_angles_deg],
+        "start_reported_at": float(state.reported_at),
+        "start_pose_source": state.pose_source,
+        "config_id": RUNNING_CONFIG_ID,
+        "model_fingerprint": robot_model_fingerprint(),
+        "planning_model_fingerprint": robot_model_fingerprint(planning_links),
+    }
+
+
+def preview_stale_reason(preview: dict[str, Any]) -> str | None:
+    if "start_pose_revision" not in preview or "start_reported_angles_deg" not in preview:
+        return "preview is missing an authoritative start pose; preview again"
+    if preview.get("config_id") != RUNNING_CONFIG_ID:
+        return "robot configuration changed after preview; preview again"
+    if preview.get("model_fingerprint") != robot_model_fingerprint():
+        return "robot model changed after preview; preview again"
+
+    start_angles = preview.get("start_reported_angles_deg")
+    if not isinstance(start_angles, list) or len(start_angles) != len(state.reported_angles_deg):
+        return "preview start pose is invalid; preview again"
+    deltas = [
+        abs(float(current) - float(start))
+        for current, start in zip(state.reported_angles_deg, start_angles, strict=True)
+    ]
+    max_delta = max(deltas, default=0.0)
+    if max_delta > PREVIEW_START_TOLERANCE_DEG:
+        return (
+            "preview start pose is stale: "
+            f"planned at revision {preview.get('start_pose_revision')} from "
+            f"{[round(float(value), 3) for value in start_angles]}, "
+            f"current revision {state.pose_revision} is "
+            f"{[round(float(value), 3) for value in state.reported_angles_deg]} "
+            f"(max delta {max_delta:.3f} deg); preview again"
+        )
+    return None
+
 
 app = FastAPI(title="4DOF Robot Arm Control Dashboard")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -672,6 +733,8 @@ def hardware_ready_for_motion() -> tuple[bool, str]:
         return False, "no hardware axes are enabled"
     if state.config_sync_status != "synced":
         return False, f"hardware config is not synced ({state.config_sync_status})"
+    if not state.known_pose:
+        return False, "hardware pose is unknown; use Set Pose while disarmed before arming or moving"
     return True, ""
 
 
@@ -756,6 +819,163 @@ def config_sync_ready() -> tuple[bool, str]:
         return False, "turn off live motion before saving or syncing config"
     if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
         return False, "wait for active motion or task execution to finish before syncing config"
+    if state.hardware_armed:
+        return False, "disarm hardware before syncing controller configuration"
+    return True, ""
+
+
+def _joint_pose_mapping_signature(robot_config: RobotConfig) -> list[dict[str, Any]]:
+    signatures: list[dict[str, Any]] = []
+    for joint in robot_config.joints:
+        hardware = joint.hardware
+        conversion: dict[str, Any] = {}
+        if joint.actuator == "stepper" and hardware.stepper:
+            conversion = {
+                "full_steps_per_rev": hardware.stepper.motor_full_steps_per_rev,
+                "microsteps": hardware.stepper.microsteps,
+                "gear_ratio": hardware.stepper.gear_ratio,
+            }
+        elif joint.actuator == "servo" and hardware.servo:
+            conversion = {
+                "pulse_min_us": hardware.servo.pulse_min_us,
+                "pulse_max_us": hardware.servo.pulse_max_us,
+                "servo_range_deg": hardware.servo.servo_range_deg,
+                "neutral_deg": hardware.servo.neutral_deg,
+                "gear_ratio": hardware.servo.gear_ratio,
+            }
+        signatures.append(
+            {
+                "actuator": joint.actuator,
+                "home_deg": joint.home_deg,
+                "zero_offset_deg": joint.zero_offset_deg,
+                "direction_sign": joint.direction_sign,
+                "conversion": conversion,
+            }
+        )
+    return signatures
+
+
+def _joint_controller_signature(robot_config: RobotConfig) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": joint.name,
+            "actuator": joint.actuator,
+            "min_deg": joint.min_deg,
+            "max_deg": joint.max_deg,
+            "home_deg": joint.home_deg,
+            "max_speed_deg_s": joint.max_speed_deg_s,
+            "max_accel_deg_s2": joint.max_accel_deg_s2,
+            "zero_offset_deg": joint.zero_offset_deg,
+            "direction_sign": joint.direction_sign,
+            "hardware": asdict(joint.hardware),
+        }
+        for joint in robot_config.joints
+    ]
+
+
+def _joint_io_signature(robot_config: RobotConfig) -> list[dict[str, Any]]:
+    signatures: list[dict[str, Any]] = []
+    for joint in robot_config.joints:
+        hardware = joint.hardware
+        io: dict[str, Any] = {"actuator": joint.actuator}
+        if joint.actuator == "stepper" and hardware.stepper:
+            io.update(
+                {
+                    "enabled": hardware.stepper.enabled,
+                    "step_pin": hardware.stepper.step_pin,
+                    "dir_pin": hardware.stepper.dir_pin,
+                    "enable_pin": hardware.stepper.enable_pin,
+                    "enable_active_low": hardware.stepper.enable_active_low,
+                    "driver_model": hardware.stepper.driver_model,
+                }
+            )
+        elif joint.actuator == "servo" and hardware.servo:
+            io.update(
+                {
+                    "enabled": hardware.servo.enabled,
+                    "pwm_pin": hardware.servo.pwm_pin,
+                    "pwm_frequency_hz": hardware.servo.pwm_frequency_hz,
+                }
+            )
+        signatures.append(io)
+    return signatures
+
+
+def _tool_controller_signature(robot_config: RobotConfig) -> dict[str, Any]:
+    settings = tools_settings(robot_config)
+    presets = settings.get("presets") if isinstance(settings.get("presets"), dict) else {}
+    return {
+        "active": settings.get("active"),
+        "presets": {
+            name: {
+                key: deepcopy(value)
+                for key, value in preset.items()
+                if key != "tcp_offset_mm"
+            }
+            for name, preset in presets.items()
+            if isinstance(preset, dict)
+        },
+    }
+
+
+def classify_config_change(previous: RobotConfig, current: RobotConfig) -> dict[str, Any]:
+    pose_mapping_changed = _joint_pose_mapping_signature(previous) != _joint_pose_mapping_signature(current)
+    joint_controller_changed = _joint_controller_signature(previous) != _joint_controller_signature(current)
+    io_changed = _joint_io_signature(previous) != _joint_io_signature(current)
+    tool_controller_changed = _tool_controller_signature(previous) != _tool_controller_signature(current)
+    planning_model_changed = (
+        previous.links != current.links
+        or previous.kinematics != current.kinematics
+        or [
+            (joint.min_deg, joint.max_deg)
+            for joint in previous.joints
+        ]
+        != [
+            (joint.min_deg, joint.max_deg)
+            for joint in current.joints
+        ]
+    )
+    sync_required = joint_controller_changed or tool_controller_changed
+
+    categories: list[str] = []
+    reasons: list[str] = []
+    if planning_model_changed:
+        categories.append("model")
+        reasons.append("geometry, TCP, kinematics, or planning limits changed")
+    if pose_mapping_changed:
+        categories.append("actuator_mapping")
+        reasons.append("actuator zero, sign, gearing, servo mapping, or home reference changed")
+    if io_changed or tool_controller_changed:
+        categories.append("io")
+        reasons.append("controller axis or tool IO configuration changed")
+    if joint_controller_changed and not pose_mapping_changed and not io_changed:
+        categories.append("controller_limits")
+        reasons.append("controller joint limits or motion caps changed")
+    if not categories and previous.raw != current.raw:
+        categories.append("runtime")
+        reasons.append("runtime-only settings changed")
+
+    return {
+        "changed": bool(categories),
+        "categories": categories,
+        "reasons": reasons,
+        "sync_required": sync_required,
+        "disarm_required": sync_required,
+        "pose_invalidated": pose_mapping_changed,
+        "pose_revalidation_required": pose_mapping_changed,
+        "previews_invalidated": planning_model_changed,
+    }
+
+
+def config_change_ready(change: dict[str, Any]) -> tuple[bool, str]:
+    if state.motion_state == MotionState.MOVING:
+        return False, "stop motion before applying configuration changes"
+    if state.live_motion_enabled:
+        return False, "turn off live motion before applying configuration changes"
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish before applying configuration changes"
+    if change.get("disarm_required") and state.hardware_armed:
+        return False, "disarm hardware before saving controller or actuator configuration"
     return True, ""
 
 
@@ -950,6 +1170,12 @@ def cancel_motion_tasks() -> None:
     cancel_task(live_task)
     cancel_task(task_task)
     reset_cartesian_jog_runtime()
+    if state.pending_motion.get("status") in {"queued", "accepted", "executing", "command_sent", "uploading"}:
+        state.pending_motion = {
+            **state.pending_motion,
+            "status": "cancelled",
+            "finished_at": time(),
+        }
     active_motion_run_id = None
 
 
@@ -1183,6 +1409,16 @@ def start_motion_diagnostics(
         "actual_duration_s": None,
         "result": "queued",
     }
+    state.pending_motion = {
+        "run_id": run_id,
+        "source": source,
+        "mode": mode,
+        "start_pose_revision": state.pose_revision,
+        "start_reported_angles_deg": [float(value) for value in state.reported_angles_deg],
+        "target_angles_deg": [float(value) for value in target_deg],
+        "status": "queued",
+        "started_at": time(),
+    }
     return run_id
 
 
@@ -1194,6 +1430,12 @@ def update_motion_diagnostics(run_id: str | None = None, **updates: Any) -> None
     state.motion_diagnostics = diagnostics
     if "execution_state" in updates:
         state.motion_execution_state = str(updates["execution_state"])
+        if state.pending_motion.get("run_id") == diagnostics.get("run_id"):
+            state.pending_motion = {
+                **state.pending_motion,
+                "status": str(updates["execution_state"]),
+                "updated_at": time(),
+            }
 
 
 def record_motion_sample(run_id: str | None = None) -> None:
@@ -1257,6 +1499,14 @@ def finish_motion_diagnostics(result: str, error: str | None = None, run_id: str
     )
     state.motion_diagnostics = diagnostics
     state.motion_execution_state = result
+    if state.pending_motion.get("run_id") == diagnostics.get("run_id"):
+        state.pending_motion = {
+            **state.pending_motion,
+            "status": result,
+            "error": error or "",
+            "final_reported_angles_deg": [float(value) for value in state.reported_angles_deg],
+            "finished_at": time(),
+        }
     if run_id is None or active_motion_run_id == run_id:
         active_motion_run_id = None
 
@@ -1453,6 +1703,7 @@ def sync_hardware_config() -> dict[str, Any]:
     if not ready:
         state.config_sync_status = "blocked"
         state.config_sync_message = reason
+        log_event("controller", "config sync blocked", reason=reason)
         return {"ok": False, "status": state.config_sync_status, "evaluation": evaluation, "message": reason}
     if not serial_client.is_connected:
         state.config_sync_status = "not_connected"
@@ -1475,11 +1726,29 @@ def sync_hardware_config() -> dict[str, Any]:
 
     if response.startswith("OK command=CONFIG"):
         state.config_sync_status = "synced"
-        state.config_sync_message = response
+        if state.config_change.get("pose_revalidation_required") and not state.known_pose:
+            state.config_sync_message = (
+                "controller configuration synced; current pose remains unknown. "
+                "Use Set Pose while disarmed before arming."
+            )
+        else:
+            state.config_sync_message = response
         state.last_command = response
         state.clear_error()
-        log_event("controller", response)
-        return {"ok": True, "status": state.config_sync_status, "evaluation": evaluation, "response": response}
+        log_event(
+            "controller",
+            response,
+            pose_revalidation_required=bool(state.config_change.get("pose_revalidation_required")),
+            known_pose=state.known_pose,
+        )
+        return {
+            "ok": True,
+            "status": state.config_sync_status,
+            "evaluation": evaluation,
+            "response": response,
+            "message": state.config_sync_message,
+            "pose_revalidation_required": bool(state.config_change.get("pose_revalidation_required")),
+        }
 
     if "UNKNOWN" in response or "unknown" in response:
         state.config_sync_status = "unsupported"
@@ -1636,6 +1905,7 @@ def build_preview(
         "id": preview_id,
         "created_at": time(),
         "source": source,
+        **pose_snapshot_fields(planning_links=links),
         "mode": preview_mode,
         "target": preview_target,
         "command_target": command_target,
@@ -1805,6 +2075,7 @@ async def start_joint_target_trajectory(
         "id": preview_id,
         "created_at": time(),
         "source": command_label,
+        **pose_snapshot_fields(),
         "mode": "joint",
         "target": {},
         "settings": settings,
@@ -1904,7 +2175,7 @@ async def execute_simulated_waypoint_trajectory(trajectory: dict[str, Any], run_
     if len(waypoints) == 1:
         final_target = waypoints[0]
         state.target_angles_deg = final_target.copy()
-        state.reported_angles_deg = final_target.copy()
+        state.update_reported_pose(final_target, source="simulation", known_pose=True)
         state.fk = forward_kinematics(final_target, config.links)
         limiter.reset(final_target)
         state.motion_state = MotionState.IDLE
@@ -1946,7 +2217,7 @@ async def execute_simulated_waypoint_trajectory(trajectory: dict[str, Any], run_
 
             elapsed_s = min(monotonic() - started, times_s[-1])
             current = _interpolate_timed_waypoint(waypoints, times_s, elapsed_s)
-            state.reported_angles_deg = current
+            state.update_reported_pose(current, source="simulation", known_pose=True)
             state.fk = forward_kinematics(current, config.links)
             limiter.reset(current)
             waypoint_index = 1
@@ -1965,7 +2236,7 @@ async def execute_simulated_waypoint_trajectory(trajectory: dict[str, Any], run_
             await broadcast_state()
 
             if elapsed_s >= times_s[-1]:
-                state.reported_angles_deg = final_target.copy()
+                state.update_reported_pose(final_target, source="simulation", known_pose=True)
                 state.target_angles_deg = final_target.copy()
                 state.fk = forward_kinematics(final_target, config.links)
                 limiter.reset(final_target)
@@ -2013,7 +2284,7 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
     ):
         final_target = [float(value) for value in waypoints[0]]
         state.target_angles_deg = final_target.copy()
-        state.reported_angles_deg = final_target.copy()
+        state.update_reported_pose(final_target, source="simulation", known_pose=True)
         state.fk = forward_kinematics(final_target, config.links)
         limiter.reset(final_target)
         state.motion_state = MotionState.IDLE
@@ -2664,9 +2935,15 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
         task_selection_choices.pop(run_id, None)
 
 
-def reload_runtime_config() -> None:
+def reload_runtime_config(
+    loaded_config: RobotConfig | None = None,
+    change: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     global config, limiter, serial_client, RUNNING_CONFIG_ID
-    config = load_config()
+    previous_config = config
+    next_config = loaded_config or load_config()
+    config_change = change or classify_config_change(previous_config, next_config)
+    config = next_config
     RUNNING_CONFIG_ID = config_fingerprint()
     limiter.config = config
     serial_client.config = config.serial
@@ -2687,10 +2964,38 @@ def reload_runtime_config() -> None:
     path_previews.clear()
     task_previews.clear()
     simulation_vision_queue.clear()
+    state.config_change = {
+        **config_change,
+        "applied_at": time(),
+    }
     if not state.simulation:
-        apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
+        if config_change.get("pose_invalidated"):
+            state.homed = False
+            state.update_reported_pose(
+                state.reported_angles_deg,
+                source="unknown",
+                known_pose=False,
+                force_revision=True,
+            )
+        if config_change.get("sync_required"):
+            reason = "; ".join(config_change.get("reasons") or ["controller configuration changed"])
+            message = f"{reason}; disarm, sync controller configuration"
+            if config_change.get("pose_revalidation_required"):
+                message += ", then use Set Pose to revalidate the current pose"
+            apply_hardware_evaluation("stale", message)
+        else:
+            apply_hardware_evaluation()
     else:
         apply_hardware_evaluation("simulation", "simulation mode")
+    log_event(
+        "config",
+        "runtime configuration reloaded",
+        categories=config_change.get("categories", []),
+        sync_required=bool(config_change.get("sync_required")),
+        pose_invalidated=bool(config_change.get("pose_invalidated")),
+        reasons=config_change.get("reasons", []),
+    )
+    return state.config_change
 
 
 def log_validation_warnings() -> None:
@@ -2703,10 +3008,10 @@ def log_validation_warnings() -> None:
 def apply_controller_status(status_line: str) -> None:
     state.last_status_line = status_line
     status = parse_status(status_line)
-    state.reported_angles_deg = status.joints_deg
     state.homed = status.homed
-    state.known_pose = status.known_pose
-    state.pose_source = status.pose_source
+    reported_angles = [float(value) for value in status.joints_deg]
+    known_pose = status.known_pose
+    pose_source = status.pose_source
     state.hardware_armed = status.armed
     if status.hardware_mode != "unknown":
         state.hardware_mode = status.hardware_mode
@@ -2714,12 +3019,17 @@ def apply_controller_status(status_line: str) -> None:
         state.hardware_enabled_axes = status.enabled_axes
     state.encoder_available = status.encoder_available
     state.encoder_angles_deg = status.encoder_angles_deg or [None] * len(config.joints)
-    for index, angle in enumerate(state.encoder_angles_deg[: len(state.reported_angles_deg)]):
+    for index, angle in enumerate(state.encoder_angles_deg[: len(reported_angles)]):
         if index < len(state.encoder_available) and state.encoder_available[index] == "1" and angle is not None:
-            state.reported_angles_deg[index] = float(angle)
-            state.known_pose = True
-            if state.pose_source in {"unknown", ""}:
-                state.pose_source = "encoder"
+            reported_angles[index] = float(angle)
+            known_pose = True
+            if pose_source in {"unknown", ""}:
+                pose_source = "encoder"
+    state.update_reported_pose(
+        reported_angles,
+        source=pose_source,
+        known_pose=known_pose,
+    )
     state.closed_loop_mode = status.closed_loop_mode
     if status.tool_type != "unknown":
         state.tool_type = status.tool_type
@@ -2817,6 +3127,12 @@ async def diagnostics(limit: int = 120) -> dict[str, Any]:
         "kinematics": asdict(config.kinematics),
         "kinematics_calibration": kinematics_calibration_summary(config),
         "motion": state.motion_diagnostics,
+        "pose_contract": {
+            "pose_revision": state.pose_revision,
+            "model_fingerprint": robot_model_fingerprint(),
+            "config_id": RUNNING_CONFIG_ID,
+            "preview_start_tolerance_deg": PREVIEW_START_TOLERANCE_DEG,
+        },
         "validation": {
             "model_warnings": model_validation_warnings(config),
             "named_position_errors": named_position_errors(config),
@@ -2886,8 +3202,21 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
     try:
         calibration = calibration_settings(config)
         calibration["tool_dimensions_validated"] = False
-        save_calibration_updates(ensure_local_config(), {"tools": tools, "calibration": calibration})
-        reload_runtime_config()
+        config_path = ensure_local_config()
+        updates = {"tools": tools, "calibration": calibration}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            draft_path = Path(tmp_dir) / "robot.local.yaml"
+            shutil.copyfile(config_path, draft_path)
+            save_calibration_updates(draft_path, updates)
+            draft_config = load_config(draft_path)
+            change = classify_config_change(config, draft_config)
+            ready, reason = config_change_ready(change)
+            if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {"ok": False, "error": reason, "config_change": change, "state": state.to_dict()}
+        save_calibration_updates(config_path, updates)
+        reload_runtime_config(load_config(config_path), change)
         log_validation_warnings()
     except Exception as exc:
         state.set_error(f"could not save tool settings: {exc}")
@@ -2895,7 +3224,13 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     log_event("config", "tool settings saved", active=request.active)
     await broadcast_state()
-    return {"ok": True, "tools": tools_settings(config), "config": public_config(), "state": state.to_dict()}
+    return {
+        "ok": True,
+        "tools": tools_settings(config),
+        "config": public_config(),
+        "config_change": state.config_change,
+        "state": state.to_dict(),
+    }
 
 
 @app.get("/api/vision/config")
@@ -3569,16 +3904,24 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         await broadcast_state()
         return {"ok": False, "error": result.reason, "state": state.to_dict()}
     if state.simulation:
-        state.reported_angles_deg = [float(value) for value in request.angles_deg]
+        state.update_reported_pose(
+            [float(value) for value in request.angles_deg],
+            source="setpose",
+            known_pose=True,
+            force_revision=True,
+        )
         state.target_angles_deg = state.reported_angles_deg.copy()
         limiter.current_deg = state.reported_angles_deg.copy()
         limiter.set_target(state.target_angles_deg)
         state.fk = forward_kinematics(state.reported_angles_deg, config.links)
-        state.homed = True
-        state.known_pose = True
-        state.pose_source = "setpose"
+        state.homed = False
+        if state.config_change.get("pose_revalidation_required"):
+            state.config_change = {
+                **state.config_change,
+                "pose_revalidation_required": False,
+                "pose_revalidated_at": time(),
+            }
         state.last_command = "SETPOSE_SIM"
-        state.updated_at = time()
         log_event("safety", "simulation pose set", angles_deg=state.reported_angles_deg)
         await broadcast_state()
         return {"ok": True, "state": state.to_dict()}
@@ -3586,6 +3929,7 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         state.set_error("SETPOSE requires hardware to be disarmed")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    pose_revision_before = state.pose_revision
     try:
         serial_client.clear_input()
         serial_client.send_line(format_setpose([float(value) for value in request.angles_deg]))
@@ -3596,8 +3940,20 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
             return {"ok": False, "error": response, "state": state.to_dict()}
         refresh_serial_status()
         align_target_to_reported()
-        state.known_pose = True
-        state.pose_source = "setpose"
+        state.update_reported_pose(
+            state.reported_angles_deg,
+            source="setpose",
+            known_pose=True,
+            force_revision=state.pose_revision == pose_revision_before,
+        )
+        state.homed = False
+        if state.config_change.get("pose_revalidation_required"):
+            state.config_change = {
+                **state.config_change,
+                "pose_revalidation_required": False,
+                "pose_revalidated_at": time(),
+            }
+            state.config_sync_message = "controller configuration synced; pose revalidated by operator Set Pose"
         log_event("safety", "hardware pose set", angles_deg=state.reported_angles_deg)
     except SerialClientError as exc:
         state.set_error(str(exc), fault=True)
@@ -3937,6 +4293,19 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
         state.set_error("program changed since preview; preview the current sequence again")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    stale_reason = preview_stale_reason(preview)
+    if stale_reason:
+        state.set_error(stale_reason)
+        log_event(
+            "motion",
+            "preview execution rejected",
+            preview_id=request.preview_id,
+            start_pose_revision=preview.get("start_pose_revision"),
+            current_pose_revision=state.pose_revision,
+            reason=stale_reason,
+        )
+        await broadcast_state()
+        return {"ok": False, "error": stale_reason, "state": state.to_dict()}
     if not state.simulation and not state.hardware_armed:
         state.set_error("hardware moves require the Armed toggle")
         await broadcast_state()
@@ -4085,6 +4454,11 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
     task_previews[preview_id] = {
         "id": preview_id,
         "created_at": time(),
+        "start_pose_revision": preview_result["preview"]["start_pose_revision"],
+        "start_reported_angles_deg": preview_result["preview"]["start_reported_angles_deg"],
+        "start_reported_at": preview_result["preview"]["start_reported_at"],
+        "start_pose_source": preview_result["preview"]["start_pose_source"],
+        "model_fingerprint": preview_result["preview"]["model_fingerprint"],
         "sequence": sequence,
         "task": sequence.get("task", request.task),
         "strategy": sequence.get("strategy") or task_preview.get("strategy", "batch_once"),
@@ -4123,6 +4497,19 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if preview.get("config_id") != RUNNING_CONFIG_ID:
         state.set_error("robot configuration changed after preview; preview the task again")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    stale_reason = preview_stale_reason(preview)
+    if stale_reason:
+        state.set_error(stale_reason.replace("preview again", "preview the task again"))
+        log_event(
+            "task",
+            "task preview execution rejected",
+            preview_id=request.preview_id,
+            start_pose_revision=preview.get("start_pose_revision"),
+            current_pose_revision=state.pose_revision,
+            reason=state.last_error,
+        )
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     gate_reason = task_motion_gate_reason()
@@ -4305,6 +4692,7 @@ async def live_target(request: LiveTargetRequest) -> dict[str, Any]:
             "id": preview_id,
             "created_at": time(),
             "source": "live",
+            **pose_snapshot_fields(),
             "mode": "jog",
             "target": {},
             "settings": settings,
@@ -4380,7 +4768,11 @@ async def _apply_cartesian_servo_target(
     state.motion_execution_state = "cartesian_jog"
     state.clear_error()
     if state.simulation:
-        state.reported_angles_deg = state.target_angles_deg.copy()
+        state.update_reported_pose(
+            state.target_angles_deg,
+            source="simulation",
+            known_pose=True,
+        )
         state.fk = forward_kinematics(state.reported_angles_deg, config.links)
         limiter.reset(state.reported_angles_deg)
         state.last_controller_response = "SIMULATION"
@@ -4675,24 +5067,28 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
         calibration = calibration_settings(config)
         calibration["tool_dimensions_validated"] = False
         updates["calibration"] = calibration
-    if serial_client.is_connected and not state.simulation:
-        ready, reason = config_sync_ready()
-        if not ready:
-            state.set_error(reason)
-            await broadcast_state()
-            return {"ok": False, "error": reason, "state": state.to_dict()}
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             draft_path = Path(tmp_dir) / "robot.local.yaml"
             shutil.copyfile(config_path, draft_path)
             save_calibration_updates(draft_path, updates)
-            load_config(draft_path)
+            draft_config = load_config(draft_path)
+            change = classify_config_change(config, draft_config)
+            ready, reason = config_change_ready(change)
+            if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {
+                    "ok": False,
+                    "error": reason,
+                    "config_change": change,
+                    "state": state.to_dict(),
+                }
 
         save_calibration_updates(config_path, updates)
-        reload_runtime_config()
+        saved_config = load_config(config_path)
+        reload_runtime_config(saved_config, change)
         log_validation_warnings()
-        if serial_client.is_connected and not state.simulation:
-            sync_hardware_config()
     except Exception as exc:
         state.set_error(f"could not save calibration: {exc}")
         await broadcast_state()
@@ -4700,9 +5096,21 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
 
     state.last_command = "SAVE_CALIBRATION"
     state.clear_error()
-    log_event("config", "calibration saved", path=str(config.source_path))
+    log_event(
+        "config",
+        "calibration saved",
+        path=str(config.source_path),
+        categories=change.get("categories", []),
+        sync_required=bool(change.get("sync_required")),
+        pose_invalidated=bool(change.get("pose_invalidated")),
+    )
     await broadcast_state()
-    return {"ok": True, "config": public_config(), "state": state.to_dict()}
+    return {
+        "ok": True,
+        "config": public_config(),
+        "config_change": state.config_change,
+        "state": state.to_dict(),
+    }
 
 
 @app.post("/api/connect")
@@ -4714,8 +5122,11 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.connected = True
         state.serial_port = None
         state.hardware_armed = False
-        state.known_pose = True
-        state.pose_source = "simulation"
+        state.update_reported_pose(
+            state.reported_angles_deg,
+            source="simulation",
+            known_pose=True,
+        )
         apply_hardware_evaluation("simulation", "simulation mode")
         state.motion_state = MotionState.IDLE
         state.last_command = "SIMULATION CONNECT"
@@ -4736,8 +5147,11 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.connected = False
         state.simulation = False
         state.hardware_armed = False
-        state.known_pose = False
-        state.pose_source = "unknown"
+        state.update_reported_pose(
+            state.reported_angles_deg,
+            source="unknown",
+            known_pose=False,
+        )
         state.set_error(str(exc))
         await broadcast_state()
         return {"ok": False, "error": str(exc), "state": state.to_dict()}
@@ -4777,8 +5191,11 @@ async def disconnect() -> dict[str, Any]:
     state.simulation = False
     state.hardware_armed = False
     state.live_motion_enabled = False
-    state.known_pose = False
-    state.pose_source = "unknown"
+    state.update_reported_pose(
+        state.reported_angles_deg,
+        source="unknown",
+        known_pose=False,
+    )
     state.config_sync_status = "not_connected"
     state.config_sync_message = "serial hardware is disconnected"
     apply_hardware_evaluation()
@@ -4807,23 +5224,16 @@ async def set_all_joint_targets(request: AllTargetsRequest) -> dict[str, Any]:
 
 @app.post("/api/home")
 async def home() -> dict[str, Any]:
-    response = set_targets(config.home_pose, "home")
-    state.last_command = format_home() if response["ok"] else state.last_command
-    state.homed = response["ok"]
+    response = await start_joint_target_trajectory(config.home_pose, "home")
     if response["ok"]:
-        state.known_pose = True
-        state.pose_source = "home"
-        log_event("motion", "home accepted")
-    if not state.simulation and serial_client.is_connected and response["ok"]:
-        serial_client.send_line(format_home())
-        refresh_serial_status()
-    await broadcast_state()
+        log_event("motion", "go home accepted", preview_id=response.get("preview_id"))
     return response
 
 
 @app.post("/api/stop")
 async def stop() -> dict[str, Any]:
     cancel_motion_tasks()
+    pose_revision_before = state.pose_revision
     state.live_motion_enabled = False
     state.target_angles_deg = state.reported_angles_deg.copy()
     limiter.set_target(state.target_angles_deg)
@@ -4836,6 +5246,12 @@ async def stop() -> dict[str, Any]:
         serial_client.send_line(format_stop())
         refresh_serial_status()
         align_target_to_reported()
+    state.update_reported_pose(
+        state.reported_angles_deg,
+        source=state.pose_source,
+        known_pose=state.known_pose,
+        force_revision=state.pose_revision == pose_revision_before,
+    )
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
 
@@ -4843,6 +5259,7 @@ async def stop() -> dict[str, Any]:
 @app.post("/api/estop")
 async def estop() -> dict[str, Any]:
     cancel_motion_tasks()
+    pose_revision_before = state.pose_revision
     state.target_angles_deg = state.reported_angles_deg.copy()
     limiter.set_target(state.target_angles_deg)
     state.motion_state = MotionState.ESTOP
@@ -4856,6 +5273,12 @@ async def estop() -> dict[str, Any]:
         serial_client.send_line(format_estop())
         refresh_serial_status()
         align_target_to_reported()
+    state.update_reported_pose(
+        state.reported_angles_deg,
+        source=state.pose_source,
+        known_pose=state.known_pose,
+        force_revision=state.pose_revision == pose_revision_before,
+    )
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
 

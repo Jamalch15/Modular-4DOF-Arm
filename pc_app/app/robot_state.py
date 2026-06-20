@@ -19,6 +19,9 @@ class RobotState:
     joint_names: list[str]
     target_angles_deg: list[float]
     reported_angles_deg: list[float]
+    pose_revision: int = 0
+    reported_at: float = field(default_factory=time)
+    pose_known_mask: str = ""
     connected: bool = False
     simulation: bool = True
     serial_port: str | None = None
@@ -48,15 +51,60 @@ class RobotState:
     last_controller_response: str = ""
     motion_execution_state: str = "idle"
     motion_diagnostics: dict[str, Any] = field(default_factory=dict)
+    pending_motion: dict[str, Any] = field(default_factory=dict)
+    config_change: dict[str, Any] = field(default_factory=dict)
     task_execution: dict[str, Any] = field(default_factory=dict)
     fk: dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time)
+
+    def __post_init__(self) -> None:
+        if not self.pose_known_mask:
+            self.pose_known_mask = ("1" if self.known_pose else "0") * len(self.joint_names)
+
+    def update_reported_pose(
+        self,
+        angles_deg: list[float],
+        *,
+        source: str | None = None,
+        known_pose: bool | None = None,
+        known_mask: str | None = None,
+        force_revision: bool = False,
+        tolerance_deg: float = 1e-9,
+    ) -> bool:
+        next_angles = [float(value) for value in angles_deg]
+        angles_changed = len(next_angles) != len(self.reported_angles_deg) or any(
+            abs(current - previous) > tolerance_deg
+            for current, previous in zip(next_angles, self.reported_angles_deg)
+        )
+        source_changed = source is not None and source != self.pose_source
+        known_changed = known_pose is not None and bool(known_pose) != self.known_pose
+
+        self.reported_angles_deg = next_angles
+        if source is not None:
+            self.pose_source = source
+        if known_pose is not None:
+            self.known_pose = bool(known_pose)
+        self.pose_known_mask = known_mask or (
+            ("1" if self.known_pose else "0") * len(self.joint_names)
+        )
+
+        revised = force_revision or angles_changed or source_changed or known_changed
+        if revised:
+            self.pose_revision += 1
+        now = time()
+        self.reported_at = now
+        self.updated_at = now
+        return revised
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "joint_names": self.joint_names,
             "target_angles_deg": self.target_angles_deg,
+            "commanded_target_deg": self.target_angles_deg,
             "reported_angles_deg": self.reported_angles_deg,
+            "pose_revision": self.pose_revision,
+            "reported_at": self.reported_at,
+            "pose_known_mask": self.pose_known_mask,
             "connected": self.connected,
             "simulation": self.simulation,
             "serial_port": self.serial_port,
@@ -86,6 +134,8 @@ class RobotState:
             "last_controller_response": self.last_controller_response,
             "motion_execution_state": self.motion_execution_state,
             "motion_diagnostics": self.motion_diagnostics,
+            "pending_motion": self.pending_motion,
+            "config_change": self.config_change,
             "task_execution": self.task_execution,
             "fk": self.fk,
             "updated_at": self.updated_at,

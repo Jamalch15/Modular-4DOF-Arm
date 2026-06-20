@@ -10,7 +10,7 @@ def apply_simulation_step(state: RobotState, limiter: RateLimitedMotion, dt_s: f
         return
 
     reported = limiter.step(dt_s)
-    state.reported_angles_deg = reported.copy()
+    state.update_reported_pose(reported, source="simulation", known_pose=True)
     if has_reached_target(reported, state.target_angles_deg):
         state.motion_state = MotionState.IDLE
     else:

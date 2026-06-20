@@ -11,11 +11,13 @@ const state = {
   draftAngles: null,
   commandedAngles: null,
   lastSentAngles: null,
+  intentBasePoseRevision: null,
   view: null,
   activeTab: "joint",
   previewId: null,
   latestPreview: null,
   previewAngles: null,
+  previewBasePoseRevision: null,
   viewPreviewSource: null,
   ikPreviewTimer: null,
   ikPreviewInFlight: false,
@@ -593,6 +595,12 @@ const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", 
 function savedSettingsDetail() {
   if (state.robotState?.simulation) return "Saved locally. Controller sync is not required in simulation.";
   if (!state.robotState?.connected) return "Saved locally. Connect the controller to sync hardware settings.";
+  const change = state.robotState?.config_change || {};
+  if (change.pose_revalidation_required) {
+    return state.robotState?.config_sync_status === "synced"
+      ? "Controller synced. Use Set Pose while disarmed to revalidate the current physical pose."
+      : "Saved locally. Disarm, sync the controller, then use Set Pose to revalidate the current physical pose.";
+  }
   const syncStatus = state.robotState?.config_sync_status || "unknown";
   if (syncStatus === "synced") return "Saved locally and synced to the controller.";
   return `Saved locally. Controller sync: ${syncStatus}.`;
@@ -1182,11 +1190,15 @@ function buildHardwareIoEditors() {
 function renderHardwareStatus(robotState = state.robotState) {
   if (!elements.hardwareStatus || !robotState) return;
   const axisText = (robotState.hardware_axis_states || []).map((value, index) => `J${index + 1}:${value}`).join(" ");
+  const change = robotState.config_change || {};
+  const categories = Array.isArray(change.categories) ? change.categories.join(", ") : "";
   elements.hardwareStatus.innerHTML = `
     <div class="log-line"><span>Coverage</span><code>${robotState.hardware_mode || "simulated"} (${robotState.hardware_enabled_axes || "0000"})</code></div>
     <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
     <div class="log-line"><span>Axes</span><code>${axisText || "-"}</code></div>
     <div class="log-line"><span>Message</span><code>${robotState.config_sync_message || "-"}</code></div>
+    <div class="log-line"><span>Last config impact</span><code>${categories || "none"}</code></div>
+    <div class="log-line"><span>Pose revalidation</span><code>${change.pose_revalidation_required ? "required - use Set Pose while disarmed" : "not required"}</code></div>
   `;
   if (state.hardwareDraftDirty) {
     renderHardwareDraftBadges();
@@ -1864,8 +1876,20 @@ async function refreshDiagnostics() {
   const robotState = payload.state || {};
   const enc = robotState.encoder_angles_deg || [];
   const err = robotState.encoder_errors_deg || [];
+  const pending = robotState.pending_motion || {};
+  const configChange = robotState.config_change || {};
+  const angleText = (values) => Array.isArray(values) ? values.map((value) => format(value, 2)).join(", ") : "-";
+  const previewRevision = state.latestPreview?.start_pose_revision;
   elements.diagnosticsSummary.innerHTML = `
     <div class="log-line"><span>Pose source</span><code>${robotState.pose_source || "unknown"}</code></div>
+    <div class="log-line"><span>Pose revision</span><code>${robotState.pose_revision ?? 0} (${robotState.pose_known_mask || "0000"})</code></div>
+    <div class="log-line"><span>Reported</span><code>${angleText(robotState.reported_angles_deg)}</code></div>
+    <div class="log-line"><span>Commanded</span><code>${angleText(robotState.commanded_target_deg || robotState.target_angles_deg)}</code></div>
+    <div class="log-line"><span>Pending motion</span><code>${pending.run_id ? `${pending.source}/${pending.mode} - ${pending.status}` : "none"}</code></div>
+    <div class="log-line"><span>Draft</span><code>${angleText(state.draftAngles)}</code></div>
+    <div class="log-line"><span>Preview start</span><code>${previewRevision == null ? "none" : `revision ${previewRevision}: ${angleText(state.latestPreview?.start_reported_angles_deg)}`}</code></div>
+    <div class="log-line"><span>Last rejection/error</span><code>${robotState.last_error || "-"}</code></div>
+    <div class="log-line"><span>Config impact</span><code>${(configChange.categories || []).join(", ") || "none"}; pose invalidated=${Boolean(configChange.pose_invalidated)}</code></div>
     <div class="log-line"><span>Encoders</span><code>${robotState.encoder_available || "0000"}</code></div>
     <div class="log-line"><span>Encoder angles</span><code>${enc.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
     <div class="log-line"><span>Encoder errors</span><code>${err.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
@@ -2161,6 +2185,10 @@ async function executeTask() {
     state.selectedDetectionIds.clear();
     state.view?.setObjectDetections([]);
     state.ikUserEdited = false;
+  } else if (/preview|configuration|model|start pose/i.test(payload.error || "")) {
+    clearViewPreview();
+    state.taskPreviewId = null;
+    state.taskPreviewCreatedAt = null;
   }
   if (payload.state) renderState(payload.state);
   else syncJointControls();
@@ -3103,7 +3131,12 @@ function setIkTargetValue(key, value, userEdited = true) {
   const next = clamp(Number(value), Number(slider.min), Number(slider.max));
   slider.value = String(next);
   input.value = format(next, decimals);
-  if (userEdited) state.ikUserEdited = true;
+  if (userEdited) {
+    state.ikUserEdited = true;
+    if (state.intentBasePoseRevision == null) {
+      state.intentBasePoseRevision = Number(state.robotState?.pose_revision ?? 0);
+    }
+  }
 }
 
 function setIkTargetFromFk(fk) {
@@ -3156,6 +3189,7 @@ function clearIkSolutionPreview() {
   state.previewId = null;
   state.latestPreview = null;
   state.previewAngles = null;
+  state.previewBasePoseRevision = null;
   state.taskPreviewId = null;
   if (state.view) {
     state.view.setPreviewAngles(null);
@@ -3254,6 +3288,7 @@ function releaseJointControlIntent() {
   state.draftAngles = null;
   state.commandedAngles = null;
   state.lastSentAngles = null;
+  state.intentBasePoseRevision = null;
   window.clearTimeout(state.liveTargetTimer);
   state.liveTargetTimer = null;
   state.pendingLiveTarget = null;
@@ -3570,6 +3605,9 @@ async function setCurrentPoseKnown() {
     showLocalError("Cannot set pose: joint angles are incomplete.");
     return;
   }
+  if (!window.confirm(
+    "Set Pose does not move or physically home the robot. It asserts that the displayed joint angles match the real arm. Continue only after checking every joint while hardware is disarmed?"
+  )) return;
   elements.statusPill.textContent = "Setting known pose...";
   const payload = await postJson("/api/hardware/setpose", { angles_deg: angles });
   if (payload.ok) {
@@ -3626,7 +3664,23 @@ function updateDisabledState() {
     (!state.robotState.connected && !state.robotState.simulation) ||
     Boolean(state.previewAngles);
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
-  elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
+  if (elements.hardwareArmToggle) {
+    elements.hardwareArmToggle.disabled =
+      !state.robotState?.connected ||
+      state.robotState?.simulation ||
+      !state.robotState?.known_pose ||
+      state.robotState?.config_sync_status !== "synced";
+  }
+  if (elements.syncHardwareBtn) {
+    elements.syncHardwareBtn.disabled =
+      !state.robotState?.connected ||
+      state.robotState?.simulation ||
+      Boolean(state.robotState?.hardware_armed) ||
+      state.robotState?.motion_state === "moving";
+    elements.syncHardwareBtn.title = state.robotState?.hardware_armed
+      ? "Disarm hardware before syncing controller configuration"
+      : "";
+  }
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
   const enabledProgramSteps = state.programWaypoints.filter((step) => step.enabled !== false).length;
   const programGateReason = programMotionGateReason();
@@ -3666,8 +3720,38 @@ function updateDisabledState() {
 function renderState(robotState) {
   const incomingUpdatedAt = Number(robotState?.updated_at || 0);
   if (incomingUpdatedAt && incomingUpdatedAt < state.lastRobotStateUpdatedAt) return;
+  const previousPoseRevision = Number(state.robotState?.pose_revision ?? robotState?.pose_revision ?? 0);
+  const incomingPoseRevision = Number(robotState?.pose_revision ?? 0);
   state.lastRobotStateUpdatedAt = Math.max(state.lastRobotStateUpdatedAt, incomingUpdatedAt);
   state.robotState = robotState;
+  const poseRevisionChanged = incomingPoseRevision !== previousPoseRevision;
+  const previewStart = normalizeJointAngles(state.latestPreview?.start_reported_angles_deg);
+  const reported = normalizeJointAngles(robotState.reported_angles_deg);
+  const previewPoseDelta = previewStart && reported
+    ? Math.max(...reported.map((value, index) => Math.abs(value - previewStart[index])))
+    : 0;
+  const previewIsStale = Boolean(
+    state.latestPreview &&
+    poseRevisionChanged &&
+    previewPoseDelta > 0.1
+  );
+  const localIntentIsStale = Boolean(
+    !state.latestPreview &&
+    poseRevisionChanged &&
+    state.intentBasePoseRevision != null &&
+    state.intentBasePoseRevision !== incomingPoseRevision
+  );
+  if (previewIsStale || localIntentIsStale) {
+    const staleProgramPreview = state.latestPreview?.mode === "program" && state.latestPreview?.source !== "task";
+    invalidatePendingIkPreview();
+    releaseJointControlIntent();
+    clearViewPreview();
+    state.ikUserEdited = false;
+    if (staleProgramPreview) {
+      state.programPreviewRevision = null;
+      state.programLastEditReason = "The robot pose changed after preview";
+    }
+  }
   setBadge(elements.connectionBadge, robotState.connected ? "Connected" : "Disconnected", robotState.connected ? "badge-ok" : "badge-danger");
   setBadge(elements.modeBadge, robotState.simulation ? "Simulation" : "Hardware", robotState.simulation ? "badge-warn" : "badge-ok");
   setBadge(
@@ -3733,6 +3817,8 @@ function renderPreview(preview) {
   state.previewId = preview.id;
   state.latestPreview = preview;
   state.previewAngles = previewEndpointAngles(preview);
+  state.previewBasePoseRevision = Number(preview.start_pose_revision ?? state.robotState?.pose_revision ?? 0);
+  state.intentBasePoseRevision = state.previewBasePoseRevision;
   state.viewPreviewSource = preview.mode === "program" ? "program" : "ik";
   const ik = preview.ik || {};
   const trajectory = preview.trajectory || {};
@@ -3923,6 +4009,9 @@ async function executePreview() {
     state.previewAngles = null;
     state.taskPreviewId = null;
     state.ikUserEdited = false;
+  } else if (/preview|configuration|model|start pose/i.test(payload.error || "")) {
+    clearViewPreview();
+    elements.previewStatus.textContent = payload.error || "Preview is stale";
   }
   if (payload.state) renderState(payload.state);
   else syncJointControls();
@@ -4613,6 +4702,11 @@ async function executeProgram() {
     state.programExecutionAwaitingStart = false;
     state.programExecutionFailed = true;
     state.programExecutionError = payload.error || "Program execution failed.";
+    if (/preview|configuration|model|start pose/i.test(payload.error || "")) {
+      clearViewPreview();
+      state.programPreviewRevision = null;
+      state.programLastEditReason = "The robot pose or model changed after preview";
+    }
   }
   if (payload.state) renderState(payload.state);
   renderProgramBuilder({ inspector: false });
@@ -4857,6 +4951,8 @@ function clearViewPreview() {
   state.previewId = null;
   state.latestPreview = null;
   state.previewAngles = null;
+  state.previewBasePoseRevision = null;
+  state.intentBasePoseRevision = null;
   state.taskPreviewId = null;
   state.viewPreviewSource = null;
   if (state.view) state.view.clearPreview();
@@ -5162,6 +5258,9 @@ function bindActions() {
     invalidatePendingIkPreview();
     if (state.viewPreviewSource !== "joint") clearViewPreview();
     next[index] = value;
+    if (state.intentBasePoseRevision == null) {
+      state.intentBasePoseRevision = Number(state.robotState?.pose_revision ?? 0);
+    }
     state.commandedAngles = null;
     state.previewAngles = null;
     state.draftAngles = next;
@@ -5295,7 +5394,7 @@ function bindActions() {
     if (payload.state) renderState(payload.state);
     updateSettingsSaveBar(
       payload.ok
-        ? { title: "All settings saved", detail: "Saved locally and synced to the controller." }
+        ? { title: "All settings saved", detail: payload.message || "Saved locally and synced to the controller." }
         : { mode: "error", title: "Controller sync failed", detail: payload.message || payload.error || "Hardware settings remain saved locally." }
     );
   });

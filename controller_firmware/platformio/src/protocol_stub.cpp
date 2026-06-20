@@ -37,6 +37,7 @@ enum class ControllerState {
 
 ControllerState controllerState = ControllerState::Idle;
 bool homed = false;
+bool knownPose = false;
 bool armed = false;
 bool configInProgress = false;
 bool jogActive = false;
@@ -56,7 +57,7 @@ float trajectoryDurationS = 0.0f;
 float trajectoryLastJointsDeg[4] = {kHomePose[0], kHomePose[1], kHomePose[2], kHomePose[3]};
 char faultText[32] = "OK";
 char toolState[12] = "unknown";
-char poseSourceText[12] = "unknown";
+char poseSourceText[24] = "unknown";
 float toolValue = 0.0f;
 String commandLine;
 uint32_t lastStatusMs = 0;
@@ -84,6 +85,12 @@ void setFault(const char* message) {
 
 void clearFaultText() {
   strlcpy(faultText, "OK", sizeof(faultText));
+}
+
+void markOpenLoopEstimate() {
+  if (knownPose) {
+    strlcpy(poseSourceText, "open_loop_estimate", sizeof(poseSourceText));
+  }
 }
 
 void clearTrajectory() {
@@ -117,7 +124,7 @@ void printStatus() {
   ARM_SERIAL.printf(
       "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=simulated enabled=0000 enc=0000 e1=0.00 e2=0.00 "
       "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=off tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
-      stateName(), homed ? 1 : 0, homed ? 1 : 0, poseSourceText, armed ? 1 : 0, currentJointsDeg[0],
+      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, poseSourceText, armed ? 1 : 0, currentJointsDeg[0],
       currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, toolValue, faultText);
 }
 
@@ -138,6 +145,10 @@ bool validateJoints(const float joints[4]) {
 void handleMoveJ(const char* buffer) {
   if (controllerState == ControllerState::Estop) {
     printError("ESTOP", "emergency_stop_active");
+    return;
+  }
+  if (!knownPose) {
+    printError("POSE", "motion_requires_known_pose");
     return;
   }
 
@@ -169,6 +180,7 @@ void handleMoveJ(const char* buffer) {
   lastAccelDegS2 = accel;
   clearTrajectory();
   clearJogMotion(false);
+  markOpenLoopEstimate();
   controllerState = ControllerState::Idle;
   clearFaultText();
   ARM_SERIAL.println("OK command=MOVEJ");
@@ -209,6 +221,7 @@ void handleJog(const String& upperCommand, const char* buffer) {
       targetJointsDeg[i] = requested[i];
       currentJointsDeg[i] = requested[i];
     }
+    markOpenLoopEstimate();
     controllerState = ControllerState::Idle;
     clearFaultText();
     ARM_SERIAL.println("OK command=SERVOJ hw=simulated");
@@ -245,6 +258,7 @@ void handleJog(const String& upperCommand, const char* buffer) {
     jogActive = true;
     jogVelocityMode = true;
     lastJogMs = millis();
+    markOpenLoopEstimate();
     controllerState = ControllerState::Idle;
     clearFaultText();
     ARM_SERIAL.println("OK command=JOGV hw=simulated");
@@ -279,6 +293,7 @@ void handleJog(const String& upperCommand, const char* buffer) {
   jogActive = true;
   jogVelocityMode = false;
   lastJogMs = millis();
+  markOpenLoopEstimate();
   controllerState = ControllerState::Idle;
   clearFaultText();
   ARM_SERIAL.println("OK command=JOGJ hw=simulated");
@@ -288,6 +303,10 @@ void handleArm(const char* buffer) {
   const int requested = String(buffer).substring(String(buffer).indexOf(' ') + 1).toInt();
   if (requested != 0 && controllerState == ControllerState::Estop) {
     printError("ESTOP", "emergency_stop_active");
+    return;
+  }
+  if (requested != 0 && !knownPose) {
+    printError("POSE", "setpose_required_before_arming");
     return;
   }
   armed = requested != 0;
@@ -320,7 +339,8 @@ void handleSetPose(const char* buffer) {
   }
   clearTrajectory();
   clearJogMotion(false);
-  homed = true;
+  homed = false;
+  knownPose = true;
   strlcpy(poseSourceText, "setpose", sizeof(poseSourceText));
   controllerState = ControllerState::Stopped;
   clearFaultText();
@@ -431,6 +451,7 @@ void handleTrajectory(const String& rawCommand, const String& upperCommand) {
     }
     trajectoryReceiving = false;
     trajectoryReady = false;
+    markOpenLoopEstimate();
     controllerState = ControllerState::Idle;
     clearFaultText();
     ARM_SERIAL.printf("OK command=TRAJ_START count=%d duration=%.3f\r\n", trajectoryPointCount, trajectoryDurationS);
@@ -469,6 +490,10 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
 
 void handleConfig(const String& upperCommand) {
   if (upperCommand.startsWith("CONFIG BEGIN")) {
+    if (armed) {
+      printError("CONFIG", "config_requires_disarmed");
+      return;
+    }
     if (controllerState == ControllerState::Moving) {
       printError("CONFIG", "stop_motion_before_config");
       return;
@@ -495,8 +520,13 @@ void handleConfig(const String& upperCommand) {
       printError("CONFIG", "begin_required");
       return;
     }
+    if (armed) {
+      configInProgress = false;
+      printError("CONFIG", "config_requires_disarmed");
+      return;
+    }
     configInProgress = false;
-    ARM_SERIAL.println("OK command=CONFIG axes=4 hw=simulated enabled=0000");
+    ARM_SERIAL.println("OK command=CONFIG axes=4 hw=simulated enabled=0000 pose_invalidated=0");
     printStatus();
     return;
   }
@@ -508,6 +538,14 @@ void handleHome() {
     printError("ESTOP", "emergency_stop_active");
     return;
   }
+  if (!armed) {
+    printError("ARM", "not_armed");
+    return;
+  }
+  if (!knownPose) {
+    printError("POSE", "home_requires_known_pose");
+    return;
+  }
 
   for (int i = 0; i < 4; i++) {
     targetJointsDeg[i] = kHomePose[i];
@@ -515,8 +553,8 @@ void handleHome() {
   }
   clearTrajectory();
   clearJogMotion(false);
-  homed = true;
-  strlcpy(poseSourceText, "home", sizeof(poseSourceText));
+  homed = false;
+  markOpenLoopEstimate();
   controllerState = ControllerState::Idle;
   clearFaultText();
   ARM_SERIAL.println("OK command=HOME");

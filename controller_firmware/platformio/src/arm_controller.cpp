@@ -199,6 +199,7 @@ float lastSpeedDegS = 25.0f;
 float lastAccelDegS2 = 120.0f;
 bool armed = false;
 bool homed = false;
+bool knownPose = false;
 bool configInProgress = false;
 bool jogActive = false;
 bool jogVelocityMode = false;
@@ -210,7 +211,7 @@ float jogCurrentVelocityDegS[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
 float jogStepperRemainderSteps[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
 char faultText[40] = "OK";
 char toolState[12] = "unknown";
-char poseSourceText[12] = "unknown";
+char poseSourceText[24] = "unknown";
 float toolValue = 0.0f;
 bool encoderAvailable[kJointCount] = {false, false, false, false};
 float encoderAnglesDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -522,13 +523,23 @@ String encoderBits() {
 
 const char* poseSourceName() {
   const bool encoderPose = encoderAvailable[0] || encoderAvailable[1];
-  if (encoderPose && homed) {
+  if (encoderPose && knownPose) {
     return "mixed";
   }
   if (encoderPose) {
     return "encoder";
   }
   return poseSourceText;
+}
+
+void markOpenLoopEstimate() {
+  if (knownPose) {
+    strlcpy(poseSourceText, "open_loop_estimate", sizeof(poseSourceText));
+  }
+}
+
+bool hasKnownPoseAuthority() {
+  return knownPose || encoderAvailable[0] || encoderAvailable[1];
 }
 
 const char* closedLoopModeName() {
@@ -726,6 +737,26 @@ void syncRuntimeFromCurrentPose() {
   }
 }
 
+bool poseMappingChanged(const JointConfig& previous, const JointConfig& next) {
+  if (previous.actuator != next.actuator || previous.zeroOffsetDeg != next.zeroOffsetDeg ||
+      previous.directionSign != next.directionSign || previous.homeDeg != next.homeDeg) {
+    return true;
+  }
+  if (next.actuator == ActuatorType::Stepper) {
+    return previous.stepper.fullStepsPerRev != next.stepper.fullStepsPerRev ||
+           previous.stepper.microsteps != next.stepper.microsteps ||
+           previous.stepper.gearRatio != next.stepper.gearRatio;
+  }
+  if (next.actuator == ActuatorType::Servo) {
+    return previous.servo.pulseMinUs != next.servo.pulseMinUs ||
+           previous.servo.pulseMaxUs != next.servo.pulseMaxUs ||
+           previous.servo.rangeDeg != next.servo.rangeDeg ||
+           previous.servo.neutralDeg != next.servo.neutralDeg ||
+           previous.servo.gearRatio != next.servo.gearRatio;
+  }
+  return false;
+}
+
 #if defined(ARM_CONTROLLER_ENABLE_AS5048A)
 uint16_t encoderTransfer16(int csPin, uint16_t value) {
   SPI.beginTransaction(encoderSpiSettings);
@@ -827,6 +858,7 @@ void setTargetPose(const float requested[kJointCount]) {
       }
     }
   }
+  markOpenLoopEstimate();
   controllerState = hasHardwareMotionPending() ? ControllerState::Moving : ControllerState::Idle;
   clearFaultText();
 }
@@ -1143,11 +1175,11 @@ void printHello() {
 
 void printStatus() {
   updateEncoderReadback();
-  const bool knownPose = homed || encoderAvailable[0] || encoderAvailable[1];
+  const bool statusKnownPose = hasKnownPoseAuthority();
   ARM_SERIAL.printf(
       "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
       "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=%s tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
-      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(),
+      stateName(), homed ? 1 : 0, statusKnownPose ? 1 : 0, poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(),
       enabledBits().c_str(), encoderBits().c_str(), encoderAnglesDeg[0], encoderAnglesDeg[1], currentJointsDeg[0],
       currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), toolTypeName(activeTool.type),
       toolState, toolValue, faultText);
@@ -1159,6 +1191,10 @@ void printError(const char* code, const String& message) {
 
 void handleConfig(const String& rawCommand, const String& upperCommand) {
   if (upperCommand.startsWith("CONFIG BEGIN")) {
+    if (armed) {
+      printError("CONFIG", "config_requires_disarmed");
+      return;
+    }
     if (controllerState == ControllerState::Moving) {
       printError("CONFIG", "stop_motion_before_config");
       return;
@@ -1250,6 +1286,11 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       printError("CONFIG", "begin_required");
       return;
     }
+    if (armed) {
+      configInProgress = false;
+      printError("CONFIG", "config_requires_disarmed");
+      return;
+    }
     configInProgress = false;
     for (int i = 0; i < kJointCount; i++) {
       if (!draftJoints[i].received) {
@@ -1275,6 +1316,10 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       printError("CONFIG", toolError);
       return;
     }
+    bool invalidatesKnownPose = false;
+    for (int i = 0; i < kJointCount; i++) {
+      invalidatesKnownPose = invalidatesKnownPose || poseMappingChanged(joints[i], draftJoints[i]);
+    }
     disableHardwareOutputs();
     for (int i = 0; i < kJointCount; i++) {
       joints[i] = draftJoints[i];
@@ -1283,17 +1328,15 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
     configurePins();
     configureToolPins();
     syncRuntimeFromCurrentPose();
-    if (armed) {
-      for (int i = 0; i < kJointCount; i++) {
-        if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
-          writeStepperEnable(i, true);
-        } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
-          writeServoPwm(i, true);
-        }
-      }
+    if (invalidatesKnownPose) {
+      knownPose = false;
+      homed = false;
+      strlcpy(poseSourceText, "unknown", sizeof(poseSourceText));
     }
     clearFaultText();
-    ARM_SERIAL.printf("OK command=CONFIG axes=4 hw=%s enabled=%s\r\n", hardwareMode().c_str(), enabledBits().c_str());
+    ARM_SERIAL.printf(
+        "OK command=CONFIG axes=4 hw=%s enabled=%s pose_invalidated=%d\r\n",
+        hardwareMode().c_str(), enabledBits().c_str(), invalidatesKnownPose ? 1 : 0);
     printStatus();
     return;
   }
@@ -1310,6 +1353,10 @@ void handleArm(const String& rawCommand) {
     }
     if (configHasInvalidAxis()) {
       printError("CONFIG", "hardware_config_invalid");
+      return;
+    }
+    if (!hasKnownPoseAuthority()) {
+      printError("POSE", "setpose_required_before_arming");
       return;
     }
     armed = true;
@@ -1352,6 +1399,10 @@ void handleMoveJ(const char* buffer) {
   }
   if (!armed) {
     printError("ARM", "not_armed");
+    return;
+  }
+  if (!hasKnownPoseAuthority()) {
+    printError("POSE", "motion_requires_known_pose");
     return;
   }
   if (configHasInvalidAxis()) {
@@ -1444,6 +1495,7 @@ void handleJog(const String& rawCommand, const String& upperCommand, const char*
       lastSpeedDegS = max(lastSpeedDegS, requiredSpeed);
     }
     controllerState = ControllerState::Moving;
+    markOpenLoopEstimate();
     clearFaultText();
     ARM_SERIAL.printf("OK command=SERVOJ hw=%s\r\n", hardwareMode().c_str());
     return;
@@ -1487,6 +1539,7 @@ void handleJog(const String& rawCommand, const String& upperCommand, const char*
     lastJogMs = millis();
     jogLastUpdateUs = micros();
     controllerState = moving || anyJogVelocityPending() ? ControllerState::Moving : ControllerState::Idle;
+    markOpenLoopEstimate();
     clearFaultText();
     ARM_SERIAL.printf("OK command=JOGV hw=%s\r\n", hardwareMode().c_str());
     return;
@@ -1625,6 +1678,7 @@ void handleTrajectory(const String& rawCommand, const String& upperCommand) {
     trajectoryRuntime.active = true;
     trajectoryRuntime.startUs = micros();
     controllerState = ControllerState::Moving;
+    markOpenLoopEstimate();
     clearFaultText();
     ARM_SERIAL.printf(
         "OK command=TRAJ_START count=%d duration=%.3f\r\n", trajectoryRuntime.count, trajectoryRuntime.durationS);
@@ -1643,6 +1697,10 @@ void handleHome() {
     printError("ARM", "not_armed");
     return;
   }
+  if (!hasKnownPoseAuthority()) {
+    printError("POSE", "home_requires_known_pose");
+    return;
+  }
   float requested[kJointCount] = {};
   for (int i = 0; i < kJointCount; i++) {
     requested[i] = joints[i].homeDeg;
@@ -1650,8 +1708,7 @@ void handleHome() {
   clearTrajectory();
   clearJogMotion(false);
   setTargetPose(requested);
-  homed = true;
-  strlcpy(poseSourceText, "home", sizeof(poseSourceText));
+  homed = false;
   ARM_SERIAL.println("OK command=HOME");
   printStatus();
 }
@@ -1681,7 +1738,8 @@ void handleSetPose(const char* buffer) {
   clearTrajectory();
   clearJogMotion(false);
   syncRuntimeFromCurrentPose();
-  homed = true;
+  homed = false;
+  knownPose = true;
   strlcpy(poseSourceText, "setpose", sizeof(poseSourceText));
   controllerState = ControllerState::Stopped;
   clearFaultText();

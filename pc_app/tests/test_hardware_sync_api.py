@@ -1,4 +1,5 @@
 from dataclasses import replace
+from copy import deepcopy
 
 from fastapi.testclient import TestClient
 
@@ -69,6 +70,28 @@ def config_with_only_first_axis_enabled(config):
     return replace(config, joints=[first_joint, *joints[1:]])
 
 
+def config_with_first_joint_mapping_change(config):
+    first_joint = replace(
+        config.joints[0],
+        zero_offset_deg=config.joints[0].zero_offset_deg + 1.0,
+    )
+    return replace(config, joints=[first_joint, *config.joints[1:]])
+
+
+def config_with_first_joint_io_change(config):
+    first_joint = replace(
+        config.joints[0],
+        hardware=replace(
+            config.joints[0].hardware,
+            stepper=replace(
+                config.joints[0].hardware.stepper,
+                step_pin=config.joints[0].hardware.stepper.step_pin + 1,
+            ),
+        ),
+    )
+    return replace(config, joints=[first_joint, *config.joints[1:]])
+
+
 def test_hardware_sync_reports_synced(monkeypatch):
     reset_runtime_state()
     fake = FakeSerial(["OK command=CONFIG axes=4 hw=simulated enabled=0000"])
@@ -82,6 +105,21 @@ def test_hardware_sync_reports_synced(monkeypatch):
     assert payload["status"] == "synced"
     assert fake.sent[0] == "CONFIG BEGIN axes=4"
     assert fake.sent[-1] == "CONFIG END"
+
+
+def test_hardware_sync_requires_disarmed_hardware(monkeypatch):
+    reset_runtime_state()
+    main.state.hardware_armed = True
+    fake = FakeSerial([])
+    monkeypatch.setattr(main, "serial_client", fake)
+    client = TestClient(main.app)
+
+    payload = client.post("/api/hardware/sync").json()
+
+    assert payload["ok"] is False
+    assert payload["status"] == "blocked"
+    assert "disarm" in payload["message"]
+    assert fake.sent == []
 
 
 def test_hardware_sync_reports_unsupported(monkeypatch):
@@ -106,7 +144,8 @@ def test_partial_hardware_sync_allows_arm_as_mixed(monkeypatch):
             [
                 "OK command=CONFIG axes=4 hw=mixed enabled=1000",
                 "OK command=ARM armed=1",
-                "STATUS state=idle homed=0 armed=1 hw=mixed enabled=1000 j1=0.0 j2=20.0 j3=20.0 j4=0.0 fault=OK",
+                "STATUS state=idle homed=0 known=1 pose_source=setpose armed=1 hw=mixed enabled=1000 "
+                "j1=0.0 j2=20.0 j3=20.0 j4=0.0 fault=OK",
             ]
         )
         monkeypatch.setattr(main, "serial_client", fake)
@@ -187,3 +226,111 @@ def test_enabled_axis_with_missing_pins_is_invalid(monkeypatch):
         assert payload["evaluation"]["mode"] == "invalid"
     finally:
         monkeypatch.setattr(main, "config", original_config)
+
+
+def test_config_change_classification_separates_model_mapping_and_io():
+    original = main.config
+    model_change = replace(
+        original,
+        links=replace(original.links, base_height_mm=original.links.base_height_mm + 1.0),
+    )
+    mapping_change = config_with_first_joint_mapping_change(original)
+    io_change = config_with_first_joint_io_change(original)
+
+    model = main.classify_config_change(original, model_change)
+    mapping = main.classify_config_change(original, mapping_change)
+    io = main.classify_config_change(original, io_change)
+
+    assert model["categories"] == ["model"]
+    assert model["previews_invalidated"] is True
+    assert model["sync_required"] is False
+    assert model["pose_invalidated"] is False
+
+    assert "actuator_mapping" in mapping["categories"]
+    assert mapping["sync_required"] is True
+    assert mapping["disarm_required"] is True
+    assert mapping["pose_invalidated"] is True
+
+    assert "io" in io["categories"]
+    assert io["sync_required"] is True
+    assert io["pose_invalidated"] is False
+
+
+def test_pose_invalidating_config_reload_requires_sync_and_setpose(monkeypatch):
+    original_config = main.config
+    original_state = deepcopy(main.state.__dict__)
+    changed = config_with_first_joint_mapping_change(original_config)
+    change = main.classify_config_change(original_config, changed)
+    try:
+        main.state.simulation = False
+        main.state.connected = True
+        main.state.hardware_armed = False
+        main.state.known_pose = True
+        main.state.pose_source = "setpose"
+        main.state.config_sync_status = "synced"
+        main.reload_runtime_config(changed, change)
+
+        assert main.state.known_pose is False
+        assert main.state.homed is False
+        assert main.state.pose_source == "unknown"
+        assert main.state.config_sync_status == "stale"
+        assert main.state.config_change["pose_revalidation_required"] is True
+        assert "Set Pose" in main.state.config_sync_message
+    finally:
+        main.config = original_config
+        main.limiter.config = original_config
+        main.serial_client.config = original_config.serial
+        main.cartesian_servo.reconfigure(original_config.links, original_config.joints)
+        main.state.__dict__.clear()
+        main.state.__dict__.update(original_state)
+
+
+def test_model_only_reload_preserves_controller_sync_and_known_pose():
+    original_config = main.config
+    original_state = deepcopy(main.state.__dict__)
+    changed = replace(
+        original_config,
+        links=replace(original_config.links, base_height_mm=original_config.links.base_height_mm + 1.0),
+    )
+    change = main.classify_config_change(original_config, changed)
+    try:
+        main.state.simulation = False
+        main.state.connected = True
+        main.state.hardware_armed = True
+        main.state.known_pose = True
+        main.state.pose_source = "open_loop_estimate"
+        main.state.config_sync_status = "synced"
+        main.reload_runtime_config(changed, change)
+
+        assert main.state.known_pose is True
+        assert main.state.pose_source == "open_loop_estimate"
+        assert main.state.config_sync_status == "synced"
+        assert main.state.config_change["previews_invalidated"] is True
+        assert main.state.config_change["sync_required"] is False
+    finally:
+        main.config = original_config
+        main.limiter.config = original_config
+        main.serial_client.config = original_config.serial
+        main.cartesian_servo.reconfigure(original_config.links, original_config.joints)
+        main.state.__dict__.clear()
+        main.state.__dict__.update(original_state)
+
+
+def test_synced_mapping_change_does_not_restore_pose_knowledge(monkeypatch):
+    reset_runtime_state()
+    main.state.known_pose = False
+    main.state.pose_source = "unknown"
+    main.state.config_change = {
+        "pose_invalidated": True,
+        "pose_revalidation_required": True,
+    }
+    fake = FakeSerial(["OK command=CONFIG axes=4 hw=simulated enabled=0000 pose_invalidated=1"])
+    monkeypatch.setattr(main, "serial_client", fake)
+    client = TestClient(main.app)
+
+    payload = client.post("/api/hardware/sync").json()
+
+    assert payload["ok"] is True
+    assert payload["pose_revalidation_required"] is True
+    assert payload["state"]["known_pose"] is False
+    assert "Set Pose" in payload["message"]
