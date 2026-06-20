@@ -66,6 +66,23 @@ from .motion import (
     build_program_trajectory,
     has_reached_target,
 )
+from .position_library import (
+    POSITION_LIBRARY_SCHEMA_VERSION,
+    PositionLibraryError,
+    position_library_errors,
+    position_library_records,
+    position_record_to_legacy_position,
+    validate_position_record,
+    normalize_position_record,
+)
+from .task_destinations import (
+    TASK_DESTINATIONS_SCHEMA_VERSION,
+    TaskDestinationError,
+    legacy_drop_zones_from_task_destinations,
+    task_destination_errors,
+    task_destination_payload,
+    task_destinations as resolve_task_destinations,
+)
 from .protocol import (
     format_arm,
     format_config_lines,
@@ -429,9 +446,11 @@ class CalibrationRequest(BaseModel):
     joints: list[dict[str, Any]] | None = None
     motion: dict[str, Any] | None = None
     serial: dict[str, Any] | None = None
+    position_library: dict[str, Any] | None = None
     named_positions: dict[str, dict[str, Any]] | None = None
     camera: dict[str, Any] | None = None
     color_profiles: dict[str, dict[str, Any]] | None = None
+    task_destinations: dict[str, Any] | None = None
     drop_zones: dict[str, dict[str, Any]] | None = None
     task_defaults: dict[str, Any] | None = None
     tasks: dict[str, Any] | None = None
@@ -463,9 +482,19 @@ class NamedPositionsRequest(BaseModel):
     positions: dict[str, dict[str, Any]]
 
 
+class PositionLibraryRequest(BaseModel):
+    positions: dict[str, dict[str, Any]]
+
+
+class TaskMappingsRequest(BaseModel):
+    color_profiles: dict[str, dict[str, Any]]
+    task_destinations: dict[str, Any]
+
+
 class VisionSettingsRequest(BaseModel):
     camera: dict[str, Any] | None = None
     color_profiles: dict[str, dict[str, Any]] | None = None
+    task_destinations: dict[str, Any] | None = None
     drop_zones: dict[str, dict[str, Any]] | None = None
 
 
@@ -555,6 +584,13 @@ class KinematicsCalibrationEnableRequest(BaseModel):
 
 
 def public_config() -> dict[str, Any]:
+    positions = named_positions(config)
+    library = position_library_records(config, positions)
+    destination_errors = task_destination_errors(config, positions)
+    try:
+        destinations = drop_zones(config)
+    except TaskDestinationError:
+        destinations = {}
     return {
         "app_version": running_version_payload(),
         "joints": [asdict(joint) for joint in config.joints],
@@ -566,10 +602,18 @@ def public_config() -> dict[str, Any]:
         "coordinate_frame": COORDINATE_FRAME,
         "coordinate_frame_notes": config.coordinate_frame_notes,
         "config_source": str(config.source_path),
-        "named_positions": named_positions(config),
+        "position_library": {
+            "schema_version": POSITION_LIBRARY_SCHEMA_VERSION,
+            "positions": library,
+        },
+        "named_positions": positions,
         "camera": camera_settings(config),
         "color_profiles": color_profiles(config),
-        "drop_zones": drop_zones(config),
+        "drop_zones": legacy_drop_zones_from_task_destinations(destinations),
+        "task_destinations": {
+            "schema_version": TASK_DESTINATIONS_SCHEMA_VERSION,
+            "destinations": destinations,
+        },
         "task_defaults": task_defaults(config),
         "tasks": {
             "color_sorting": color_sorting_task_defaults(config),
@@ -585,6 +629,8 @@ def public_config() -> dict[str, Any]:
         "validation": {
             "model_warnings": model_validation_warnings(config),
             "named_position_errors": named_position_errors(config),
+            "position_library_errors": position_library_errors(config, library),
+            "task_destination_errors": destination_errors,
         },
     }
 
@@ -3345,28 +3391,213 @@ async def get_named_positions() -> dict[str, Any]:
     return {"ok": True, "positions": positions, "errors": errors}
 
 
-@app.post("/api/named-positions")
-async def save_named_positions(request: NamedPositionsRequest) -> dict[str, Any]:
-    errors = {
-        name: messages
-        for name, position in request.positions.items()
-        if (messages := validate_named_position(config, name, position))
+@app.get("/api/position-library")
+async def get_position_library() -> dict[str, Any]:
+    positions = named_positions(config)
+    library = position_library_records(config, positions)
+    return {
+        "ok": True,
+        "schema_version": POSITION_LIBRARY_SCHEMA_VERSION,
+        "positions": library,
+        "errors": position_library_errors(config, library),
     }
+
+
+@app.post("/api/position-library")
+async def save_position_library(request: PositionLibraryRequest) -> dict[str, Any]:
+    normalized: dict[str, dict[str, Any]] = {}
+    errors: dict[str, list[str]] = {}
+    existing_records = position_library_records(config, include_legacy=False)
+    saved_at = datetime.now(timezone.utc).isoformat()
+    for position_id, raw_position in request.positions.items():
+        try:
+            record = normalize_position_record(config, str(position_id), raw_position)
+        except PositionLibraryError as exc:
+            errors[str(position_id)] = [str(exc)]
+            continue
+        if record["id"] != str(position_id):
+            errors[str(position_id)] = [
+                f"position id {record['id']} must match its stable library key {position_id}"
+            ]
+            continue
+        if record["id"] in normalized:
+            errors[str(position_id)] = [f"duplicate position id {record['id']}"]
+            continue
+        validation = validate_position_record(config, str(position_id), record)
+        if validation:
+            errors[str(position_id)] = validation
+            continue
+        existing = existing_records.get(record["id"], {})
+        record["created_at"] = str(existing.get("created_at") or saved_at)
+        record["updated_at"] = saved_at
+        normalized[record["id"]] = record
+
     if errors:
-        state.set_error("one or more named positions are invalid")
+        state.set_error("one or more position-library records are invalid")
         await broadcast_state()
         return {"ok": False, "errors": errors, "state": state.to_dict()}
+
+    library_payload = {
+        "schema_version": POSITION_LIBRARY_SCHEMA_VERSION,
+        "positions": normalized,
+    }
+    legacy_positions = {
+        position_id: position_record_to_legacy_position(record)
+        for position_id, record in normalized.items()
+    }
+    updates = {
+        "position_library": library_payload,
+        "named_positions": legacy_positions,
+    }
     try:
-        save_calibration_updates(ensure_local_config(), {"named_positions": request.positions})
-        reload_runtime_config()
+        config_path = ensure_local_config()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            draft_path = Path(tmp_dir) / "robot.local.yaml"
+            shutil.copyfile(config_path, draft_path)
+            save_calibration_updates(draft_path, updates)
+            draft_config = load_config(draft_path)
+            destination_errors = task_destination_errors(draft_config, named_positions(draft_config))
+            if destination_errors:
+                state.set_error("position library changes would break task destination references")
+                await broadcast_state()
+                return {
+                    "ok": False,
+                    "errors": {"task_destinations": destination_errors},
+                    "error": state.last_error,
+                    "state": state.to_dict(),
+                }
+            change = classify_config_change(config, draft_config)
+            ready, reason = config_change_ready(change)
+            if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {"ok": False, "error": reason, "config_change": change, "state": state.to_dict()}
+
+        save_calibration_updates(config_path, updates)
+        reload_runtime_config(load_config(config_path), change)
         log_validation_warnings()
     except Exception as exc:
-        state.set_error(f"could not save named positions: {exc}")
+        state.set_error(f"could not save position library: {exc}")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    log_event("config", "named positions saved", count=len(request.positions))
+
+    positions = named_positions(config)
+    library = position_library_records(config, positions)
+    log_event("config", "position library saved", count=len(library))
     await broadcast_state()
-    return {"ok": True, "positions": named_positions(config), "config": public_config(), "state": state.to_dict()}
+    return {
+        "ok": True,
+        "schema_version": POSITION_LIBRARY_SCHEMA_VERSION,
+        "positions": library,
+        "errors": position_library_errors(config, library),
+        "config": public_config(),
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/named-positions")
+async def save_named_positions(request: NamedPositionsRequest) -> dict[str, Any]:
+    result = await save_position_library(PositionLibraryRequest(positions=request.positions))
+    if not result.get("ok"):
+        return result
+    log_event("config", "legacy named positions saved through position library", count=len(request.positions))
+    return {
+        "ok": True,
+        "positions": named_positions(config),
+        "config": result["config"],
+        "state": result["state"],
+    }
+
+
+def _task_destinations_from_request(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    nested = raw.get("destinations")
+    if "destinations" in raw and not isinstance(nested, dict):
+        raise ValueError("task_destinations.destinations must be an object")
+    source = nested if isinstance(nested, dict) else raw
+    destinations: dict[str, dict[str, Any]] = {}
+    for destination_id, destination in source.items():
+        if destination_id in {"schema_version", "updated_at"}:
+            continue
+        if not isinstance(destination, dict):
+            raise ValueError(f"task destination {destination_id} must be an object")
+        destinations[str(destination_id)] = deepcopy(destination)
+    return destinations
+
+
+def _persisted_color_profiles(profiles: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(name): {
+            key: deepcopy(value)
+            for key, value in profile.items()
+            if key != "draft"
+        }
+        for name, profile in profiles.items()
+    }
+
+
+@app.post("/api/task-mappings")
+async def save_task_mappings(request: TaskMappingsRequest) -> dict[str, Any]:
+    config_path = ensure_local_config()
+    try:
+        destinations = _task_destinations_from_request(request.task_destinations)
+    except ValueError as exc:
+        state.set_error(str(exc))
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    profiles = _persisted_color_profiles(request.color_profiles)
+    initial_updates = {
+        "color_profiles": profiles,
+        "task_destinations": task_destination_payload(destinations),
+        "drop_zones": legacy_drop_zones_from_task_destinations(destinations),
+    }
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            draft_path = Path(tmp_dir) / "robot.local.yaml"
+            shutil.copyfile(config_path, draft_path)
+            save_calibration_updates(draft_path, initial_updates)
+            draft_config = load_config(draft_path)
+            destination_errors = task_destination_errors(draft_config, named_positions(draft_config))
+            if destination_errors:
+                state.set_error("one or more task destinations are invalid")
+                await broadcast_state()
+                return {
+                    "ok": False,
+                    "errors": destination_errors,
+                    "error": state.last_error,
+                    "state": state.to_dict(),
+                }
+            resolved_destinations = resolve_task_destinations(draft_config, named_positions(draft_config))
+            final_updates = {
+                **initial_updates,
+                "drop_zones": legacy_drop_zones_from_task_destinations(resolved_destinations),
+            }
+            save_calibration_updates(draft_path, final_updates)
+            draft_config = load_config(draft_path)
+            change = classify_config_change(config, draft_config)
+            ready, reason = config_change_ready(change)
+            if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {"ok": False, "error": reason, "config_change": change, "state": state.to_dict()}
+
+        save_calibration_updates(config_path, final_updates)
+        reload_runtime_config(load_config(config_path), change)
+        log_validation_warnings()
+    except Exception as exc:
+        state.set_error(f"could not save task mappings: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    state.last_command = "SAVE_TASK_MAPPINGS"
+    state.clear_error()
+    log_event("config", "task mappings saved", destinations=len(destinations), colors=len(profiles))
+    await broadcast_state()
+    return {
+        "ok": True,
+        "config": public_config(),
+        "config_change": state.config_change,
+        "state": state.to_dict(),
+    }
 
 
 @app.post("/api/tool")
@@ -3430,11 +3661,18 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
 
 @app.get("/api/vision/config")
 async def get_vision_config() -> dict[str, Any]:
+    destination_errors = task_destination_errors(config, named_positions(config))
+    try:
+        destinations = drop_zones(config)
+    except TaskDestinationError:
+        destinations = {}
     return {
         "ok": True,
         "camera": camera_settings(config),
         "color_profiles": color_profiles(config),
-        "drop_zones": drop_zones(config),
+        "drop_zones": legacy_drop_zones_from_task_destinations(destinations),
+        "task_destinations": task_destination_payload(destinations),
+        "task_destination_errors": destination_errors,
         "detection_contract": {
             "required": ["id", "label", "confidence", "center_px", "bbox_px", "timestamp"],
             "optional": ["robot", "coordinate_source", "projection_quality", "drop_zone"],
@@ -3557,8 +3795,31 @@ def persist_workspace_calibration_result(result: dict[str, Any]) -> dict[str, An
 async def save_vision_settings(request: VisionSettingsRequest) -> dict[str, Any]:
     updates = request.__dict__
     try:
+        if isinstance(updates.get("color_profiles"), dict):
+            updates["color_profiles"] = _persisted_color_profiles(updates["color_profiles"])
+        task_destinations_changed = _coerce_task_destination_updates(updates)
+        if task_destinations_changed:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                draft_path = Path(tmp_dir) / "robot.local.yaml"
+                shutil.copyfile(ensure_local_config(), draft_path)
+                save_calibration_updates(draft_path, updates)
+                draft_config = load_config(draft_path)
+                destination_errors = task_destination_errors(draft_config, named_positions(draft_config))
+                if destination_errors:
+                    state.set_error("one or more task destinations are invalid")
+                    await broadcast_state()
+                    return {
+                        "ok": False,
+                        "errors": destination_errors,
+                        "error": state.last_error,
+                        "state": state.to_dict(),
+                    }
         save_calibration_updates(ensure_local_config(), updates)
         reload_runtime_config()
+    except ValueError as exc:
+        state.set_error(str(exc))
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     except Exception as exc:
         state.set_error(f"could not save vision settings: {exc}")
         await broadcast_state()
@@ -4720,7 +4981,7 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
     strategy = str(preview.get("strategy") or preview.get("task_preview", {}).get("strategy") or "batch_once")
     task_settings = preview.get("task_settings", {})
     if isinstance(task_settings, dict) and task_settings.get("_has_unsaved_color_profiles"):
-        state.set_error("save draft color profiles and drop preset mappings before starting the task")
+        state.set_error("save draft color profiles and task destination mappings before starting the task")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if strategy == "closed_loop" and state.simulation and not simulation_vision_queue:
@@ -5262,10 +5523,34 @@ async def stop_cartesian_jog() -> dict[str, Any]:
     return await stop_cartesian_jog_internal()
 
 
+def _coerce_task_destination_updates(updates: dict[str, Any]) -> bool:
+    raw_task_destinations = updates.get("task_destinations")
+    raw_drop_zones = updates.get("drop_zones")
+    destinations: dict[str, dict[str, Any]] | None = None
+    if isinstance(raw_task_destinations, dict):
+        destinations = _task_destinations_from_request(raw_task_destinations)
+    elif isinstance(raw_drop_zones, dict):
+        destinations = _task_destinations_from_request(raw_drop_zones)
+
+    if destinations is None:
+        return False
+    updates["task_destinations"] = task_destination_payload(destinations)
+    updates["drop_zones"] = legacy_drop_zones_from_task_destinations(destinations)
+    return True
+
+
 @app.post("/api/config/calibration")
 async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
     config_path = ensure_local_config()
     updates = request.__dict__
+    if isinstance(updates.get("color_profiles"), dict):
+        updates["color_profiles"] = _persisted_color_profiles(updates["color_profiles"])
+    try:
+        task_destinations_changed = _coerce_task_destination_updates(updates)
+    except ValueError as exc:
+        state.set_error(str(exc))
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if isinstance(updates.get("tools"), dict):
         tool_errors = validate_tools_payload(updates["tools"])
         if tool_errors:
@@ -5281,6 +5566,17 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
             shutil.copyfile(config_path, draft_path)
             save_calibration_updates(draft_path, updates)
             draft_config = load_config(draft_path)
+            if task_destinations_changed:
+                destination_errors = task_destination_errors(draft_config, named_positions(draft_config))
+                if destination_errors:
+                    state.set_error("one or more task destinations are invalid")
+                    await broadcast_state()
+                    return {
+                        "ok": False,
+                        "errors": destination_errors,
+                        "error": state.last_error,
+                        "state": state.to_dict(),
+                    }
             change = classify_config_change(config, draft_config)
             ready, reason = config_change_ready(change)
             if not ready:

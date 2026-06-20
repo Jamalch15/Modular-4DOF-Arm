@@ -211,35 +211,43 @@ serial:
   baud_rate: 115200
   timeout_s: 0.2
 
-named_positions:
+position_library:
   # Working demo placeholders. Save measured values into robot.local.yaml.
-  home:
-    type: joint
-    angles_deg: [0.0, 20.0, 20.0, 0.0]
-  safe:
-    type: joint
-    angles_deg: [0.0, 35.0, 15.0, 0.0]
-  pickup_test:
-    type: cartesian
-    target:
-      x_mm: -120.0
-      y_mm: 150.0
-      z_mm: 45.0
-      phi_deg: 0.0
-  dropoff_a:
-    type: cartesian
-    target:
-      x_mm: -160.0
-      y_mm: 180.0
-      z_mm: 45.0
-      phi_deg: 0.0
-  dropoff_b:
-    type: cartesian
-    target:
-      x_mm: 120.0
-      y_mm: 180.0
-      z_mm: 45.0
-      phi_deg: 0.0
+  # IDs are stable references; display names may be changed independently.
+  schema_version: 1
+  positions:
+    home:
+      display_name: Home
+      type: joint
+      angles_deg: [0.0, 20.0, 20.0, 0.0]
+    safe:
+      display_name: Safe
+      type: joint
+      angles_deg: [0.0, 35.0, 15.0, 0.0]
+    pickup_test:
+      display_name: Pickup Test
+      type: cartesian
+      target:
+        x_mm: -120.0
+        y_mm: 150.0
+        z_mm: 45.0
+        phi_deg: 0.0
+    dropoff_a:
+      display_name: Dropoff A
+      type: cartesian
+      target:
+        x_mm: -160.0
+        y_mm: 180.0
+        z_mm: 45.0
+        phi_deg: 0.0
+    dropoff_b:
+      display_name: Dropoff B
+      type: cartesian
+      target:
+        x_mm: 120.0
+        y_mm: 180.0
+        z_mm: 45.0
+        phi_deg: 0.0
 
 camera:
   # Working setup imported from vision_robot_project.zip. Recalibrate if the
@@ -376,29 +384,35 @@ color_profiles:
     min_area_px: 250
     drop_zone: dropoff_b
 
-drop_zones:
-  dropoff_a:
-    x_mm: -160.0
-    y_mm: 180.0
-    z_mm: 45.0
-    phi_deg: 0.0
-    grid:
-      rows: 2
-      columns: 3
-      x_spacing_mm: 24.0
-      y_spacing_mm: 24.0
-      order: row_major
-  dropoff_b:
-    x_mm: 120.0
-    y_mm: 180.0
-    z_mm: 45.0
-    phi_deg: 0.0
-    grid:
-      rows: 2
-      columns: 3
-      x_spacing_mm: 24.0
-      y_spacing_mm: 24.0
-      order: row_major
+task_destinations:
+  # Task-owned destinations are separate from the general Position Library.
+  # A destination may instead use position_id to reference a saved position.
+  schema_version: 1
+  destinations:
+    dropoff_a:
+      label: Dropoff A
+      x_mm: -160.0
+      y_mm: 180.0
+      z_mm: 45.0
+      phi_deg: 0.0
+      grid:
+        rows: 2
+        columns: 3
+        x_spacing_mm: 24.0
+        y_spacing_mm: 24.0
+        order: row_major
+    dropoff_b:
+      label: Dropoff B
+      x_mm: 120.0
+      y_mm: 180.0
+      z_mm: 45.0
+      phi_deg: 0.0
+      grid:
+        rows: 2
+        columns: 3
+        x_spacing_mm: 24.0
+        y_spacing_mm: 24.0
+        order: row_major
 
 task_defaults:
   safe_position: safe

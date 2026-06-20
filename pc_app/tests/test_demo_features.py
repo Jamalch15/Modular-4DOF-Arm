@@ -56,13 +56,15 @@ def test_named_position_validation_accepts_auto_phi_cartesian_target():
 
 
 def test_drop_zones_preserve_auto_phi_targets():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     raw = {
         **config.raw,
+        "task_destinations": None,
         "drop_zones": {
             "dropoff_a": {"x_mm": -120.0, "y_mm": 180.0, "z_mm": 45.0, "phi_auto": True},
         },
     }
+    raw.pop("task_destinations")
     patched = replace(config, raw=raw)
 
     zones = drop_zones(patched)

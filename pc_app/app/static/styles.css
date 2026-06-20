@@ -397,15 +397,19 @@ code {
   grid-column: 1 / -1;
 }
 
+.task-mapping-actions {
+  margin-top: 8px;
+}
+
 .color-preset-mapping,
-.drop-preset-editor,
+.task-destination-editor,
 .color-profile-editor {
   display: grid;
   gap: 8px;
 }
 
 .color-map-row,
-.drop-preset-row,
+.task-destination-row,
 .color-profile-row {
   display: grid;
   gap: 8px;
@@ -420,45 +424,32 @@ code {
   grid-template-columns: minmax(105px, 1fr) minmax(130px, 1fr) minmax(110px, auto);
 }
 
-.drop-preset-row {
-  grid-template-columns: minmax(105px, 1fr) repeat(3, minmax(72px, 0.75fr)) auto;
-  grid-template-areas:
-    "title x y z delete"
-    "title grid grid grid grid";
+.task-destination-row {
+  grid-template-columns: minmax(130px, 0.8fr) minmax(130px, 0.8fr) minmax(180px, 1.2fr) auto;
   align-items: end;
 }
 
-.drop-preset-row > .drop-preset-title {
-  grid-area: title;
+.task-destination-row > .task-destination-title {
   align-self: center;
 }
 
-.drop-preset-row > label:nth-of-type(1) {
-  grid-area: x;
-}
-
-.drop-preset-row > label:nth-of-type(2) {
-  grid-area: y;
-}
-
-.drop-preset-row > label:nth-of-type(3) {
-  grid-area: z;
-}
-
-.drop-preset-row > .drop-grid-fields {
-  grid-area: grid;
+.task-destination-coordinates {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
-.drop-preset-row > button {
-  grid-area: delete;
-  align-self: end;
+.task-destination-row > .drop-grid-fields {
+  grid-column: 1 / -2;
 }
 
-.drop-preset-row label,
-.drop-preset-row input {
+.task-destination-reference-help {
+  grid-column: 1 / -1;
+}
+
+.task-destination-row label,
+.task-destination-row input,
+.task-destination-row select {
   min-width: 0;
   width: 100%;
 }
@@ -467,22 +458,87 @@ code {
   grid-template-columns: minmax(120px, 1fr) minmax(145px, 1fr) minmax(90px, auto);
 }
 
+.position-library-list {
+  display: grid;
+  gap: 8px;
+}
+
+.position-library-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.1fr) minmax(110px, 0.9fr);
+  gap: 8px;
+  align-items: center;
+  padding: 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(13, 19, 29, 0.72);
+}
+
+.position-library-row.core-position {
+  border-color: rgba(106, 167, 255, 0.2);
+}
+
+.position-library-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.position-library-title strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.position-library-title small {
+  color: var(--muted);
+  font-size: 0.64rem;
+  overflow-wrap: anywhere;
+}
+
+.position-library-row code {
+  grid-column: 1 / -1;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(6, 10, 16, 0.62);
+}
+
+.position-library-fields {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.position-library-fields label,
+.position-library-fields input {
+  min-width: 0;
+  width: 100%;
+}
+
+.position-library-actions {
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
 .color-map-title,
-.drop-preset-title,
+.task-destination-title,
 .color-profile-title {
   display: grid;
   gap: 2px;
 }
 
 .color-map-title strong,
-.drop-preset-title strong,
+.task-destination-title strong,
 .color-profile-title strong {
   color: var(--text);
   font-size: 0.78rem;
 }
 
 .color-map-title small,
-.drop-preset-title small,
+.task-destination-title small,
 .color-profile-title small {
   color: var(--muted);
   font-size: 0.64rem;
@@ -1005,6 +1061,14 @@ code {
   font-size: 0.72rem;
   line-height: 1.3;
   text-align: right;
+}
+
+.status-chip.warn {
+  color: var(--warn);
+}
+
+.status-chip.error {
+  color: var(--danger);
 }
 
 .control-grid,
@@ -2901,9 +2965,19 @@ label {
   .setup-checklist,
   .task-preview-grid,
   .color-map-row,
-  .drop-preset-row,
-  .color-profile-row {
+  .task-destination-row,
+  .color-profile-row,
+  .position-library-row {
     grid-template-columns: 1fr;
+  }
+
+  .task-destination-row > .drop-grid-fields,
+  .position-library-fields {
+    grid-column: 1;
+  }
+
+  .task-destination-coordinates {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .drop-grid-fields {

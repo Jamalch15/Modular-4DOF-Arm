@@ -19,7 +19,7 @@ Current scope:
 - Persistent Hardware IO settings for pins, TB6600 microstep value, gear ratios, servo pulse mapping, tools, and encoders
 - ESP hardware-config sync on serial connect and Settings save
 - Safety checks for joint limits, known pose, stop, armed hardware mode, live-motion gating, and rate-limited motion
-- Named-position, task, tool, vision, diagnostics, and encoder-readback APIs for the demo path
+- Position Library, task-destination, task, tool, vision, diagnostics, and encoder-readback APIs for the demo path
 - AprilTag workspace calibration with multi-frame accumulation, camera-pose quality metrics, saved planar fallback, and 3D camera/tag overlays
 - Working inverted `DICT_4X4_50` ArUco homography integration from `vision_robot_project.zip`
 - Detector-neutral vision contract plus `/api/vision/project` for future YOLO/AI detections
@@ -85,6 +85,12 @@ http://127.0.0.1:8000
 ```
 
 Simulation mode is enabled by default in `config/robot.example.yaml`, so the dashboard should work without an ESP32-S3 connected. Machine-specific values are saved to `config/robot.local.yaml` when present.
+
+General robot poses are stored in the Position Library. Color-sorting
+destinations are stored separately under `task_destinations` and may either
+contain inline Cartesian coordinates or reference a Position Library ID.
+Legacy `named_positions` and `drop_zones` values are still loaded and mirrored
+when saving so existing local configurations remain usable during migration.
 
 ## Startup Troubleshooting
 
