@@ -1119,6 +1119,33 @@ drop zones are labelled as presets, and color mappings are stored in Settings.
 **Dependencies:** WP-01 and WP-04  
 **Risk:** medium
 
+**Implementation status - June 20, 2026**
+
+Code complete in the current working tree:
+
+- `position_library` is the primary committed schema, with stable IDs,
+  editable display names, joint/Cartesian records, metadata, validation, and
+  compatibility mirroring to legacy `named_positions`.
+- Control includes create, save-current, edit, rename, duplicate, delete,
+  Preview, and Go To actions for Position Library records.
+- `task_destinations` is separate from general positions and supports inline
+  Cartesian anchors or Position Library references with optional grids.
+- color-to-destination assignment is edited and saved from Tasks, not from
+  general robot Settings.
+- legacy `named_positions`, `drop_zones`, and their APIs remain supported
+  during migration.
+- task destinations no longer derive implicitly from named dropoff positions.
+- `draft` is treated as unsaved task/color UI state and is removed on save.
+- automated migration, stable-ID, reference-integrity, persistence, safety,
+  and task-planning tests are present.
+
+Remaining verification:
+
+- rendered browser interaction QA for rename/Preview/Go To/delete and
+  responsive layout still needs a working browser-control session. The
+  in-app Browser invocation was blocked by missing sandbox metadata on
+  June 20, 2026; this is a verification gap, not an unfinished code path.
+
 ### WP-06 — Kinematics Pane as Cartesian Control and Diagnostic Surface
 
 **Problem**

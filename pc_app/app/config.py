@@ -702,9 +702,11 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
             data["serial"]["timeout_s"] = float(serial["timeout_s"])
 
     for key in [
+        "position_library",
         "named_positions",
         "camera",
         "color_profiles",
+        "task_destinations",
         "drop_zones",
         "task_defaults",
         "tasks",

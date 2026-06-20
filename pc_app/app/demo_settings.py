@@ -5,6 +5,8 @@ from typing import Any
 
 from .config import DEFAULT_GEOMETRY_CONFIG, RobotConfig, matlab_geometry_to_dh_rows
 from .kinematics import forward_kinematics, inverse_kinematics
+from .position_library import legacy_named_positions_from_position_library
+from .task_destinations import task_destinations
 from .safety import validate_joint_targets
 
 
@@ -60,9 +62,13 @@ def named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
     if isinstance(raw, dict) and raw:
         merged = deepcopy(defaults)
         merged.update(deepcopy(raw))
+        merged.update(legacy_named_positions_from_position_library(config))
         merged["home"] = defaults["home"]
         return merged
-    return defaults
+    merged = deepcopy(defaults)
+    merged.update(legacy_named_positions_from_position_library(config))
+    merged["home"] = defaults["home"]
+    return merged
 
 
 def camera_settings(config: RobotConfig) -> dict[str, Any]:
@@ -216,42 +222,8 @@ def color_profiles(config: RobotConfig) -> dict[str, dict[str, Any]]:
     return deepcopy(DEFAULT_COLOR_PROFILES)
 
 
-def _pose_from_config_target(target: dict[str, Any], default_z_mm: float = 45.0) -> dict[str, Any]:
-    pose: dict[str, Any] = {
-        "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
-        "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
-        "z_mm": float(target.get("z_mm", target.get("z", default_z_mm))),
-    }
-    raw_phi = target.get("phi_deg", target.get("phi"))
-    if bool(target.get("phi_auto", False)) or raw_phi is None:
-        pose["phi_auto"] = True
-    else:
-        pose["phi_deg"] = float(raw_phi)
-    for key in ["label", "description", "grid", "placement"]:
-        if key in target:
-            pose[key] = deepcopy(target[key])
-    return pose
-
-
 def drop_zones(config: RobotConfig) -> dict[str, dict[str, Any]]:
-    positions = named_positions(config)
-    zones: dict[str, dict[str, Any]] = {}
-    for name in ["dropoff_a", "dropoff_b"]:
-        value = positions.get(name, {})
-        target = value.get("target") if isinstance(value.get("target"), dict) else value
-        if isinstance(target, dict):
-            zones[name] = _pose_from_config_target(target)
-    raw = config.raw.get("drop_zones")
-    if isinstance(raw, dict):
-        for name, value in raw.items():
-            if isinstance(value, dict):
-                target = value.get("target") if isinstance(value.get("target"), dict) else value
-                zone = _pose_from_config_target(target)
-                for key in ["label", "description", "grid", "placement"]:
-                    if key in value:
-                        zone[key] = deepcopy(value[key])
-                zones[name] = zone
-    return zones
+    return task_destinations(config, named_positions(config))
 
 
 def tool_settings(config: RobotConfig) -> dict[str, Any]:

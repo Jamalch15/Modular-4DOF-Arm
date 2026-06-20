@@ -58,8 +58,10 @@ const state = {
   activeTaskStep: "setup",
   taskProgressStep: "setup",
   taskColorProfilesDraft: null,
-  taskDropZonesDraft: null,
+  taskDestinationsDraft: null,
   unsavedColorProfiles: new Set(),
+  positionLibraryDraft: null,
+  positionLibrarySaving: false,
   cameraTimer: null,
   cameraInFlight: false,
   cameraLive: false,
@@ -199,9 +201,17 @@ const elements = {
   hardwareIo: $("#hardwareIo"),
   hardwareStatus: $("#hardwareStatus"),
   syncHardwareBtn: $("#syncHardwareBtn"),
-  addDropPresetBtn: $("#addDropPresetBtn"),
-  dropPresetEditor: $("#dropPresetEditor"),
-  colorProfileEditor: $("#colorProfileEditor"),
+  addTaskDestinationBtn: $("#addTaskDestinationBtn"),
+  taskDestinationEditor: $("#taskDestinationEditor"),
+  positionLibraryStatus: $("#positionLibraryStatus"),
+  positionLibraryList: $("#positionLibraryList"),
+  addJointPositionBtn: $("#addJointPositionBtn"),
+  addCartesianPositionBtn: $("#addCartesianPositionBtn"),
+  saveCurrentPositionBtn: $("#saveCurrentPositionBtn"),
+  savePositionLibraryBtn: $("#savePositionLibraryBtn"),
+  resetPositionLibraryBtn: $("#resetPositionLibraryBtn"),
+  saveTaskMappingsBtn: $("#saveTaskMappingsBtn"),
+  discardTaskMappingsBtn: $("#discardTaskMappingsBtn"),
   saveCalibrationBtn: $("#saveCalibrationBtn"),
   discardSettingsBtn: $("#discardSettingsBtn"),
   settingsSaveStatus: $("#settingsSaveStatus"),
@@ -595,7 +605,8 @@ function clonePlain(value) {
   return JSON.parse(JSON.stringify(value || {}));
 }
 
-const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_presets"]);
+const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_destinations"]);
+const CORE_POSITION_IDS = new Set(["home", "safe", "pickup_test", "dropoff_a", "dropoff_b"]);
 
 function savedSettingsDetail() {
   if (state.robotState?.simulation) return "Saved locally. Controller sync is not required in simulation.";
@@ -652,6 +663,313 @@ function clearSettingsDirty(scope = null) {
   if (scope) state.settingsDirtyScopes.delete(scope);
   else state.settingsDirtyScopes.clear();
   updateSettingsSaveBar();
+}
+
+function savedPositionLibraryRecords() {
+  return clonePlain(state.config?.position_library?.positions || {});
+}
+
+function ensurePositionLibraryDraft() {
+  if (!state.positionLibraryDraft) {
+    state.positionLibraryDraft = savedPositionLibraryRecords();
+  }
+  return state.positionLibraryDraft;
+}
+
+function positionLibraryDirty() {
+  if (!state.config) return false;
+  return JSON.stringify(state.positionLibraryDraft || savedPositionLibraryRecords()) !== JSON.stringify(savedPositionLibraryRecords());
+}
+
+function setPositionLibraryStatus(text = null, mode = "") {
+  if (!elements.positionLibraryStatus) return;
+  const dirty = positionLibraryDirty();
+  elements.positionLibraryStatus.textContent = text || (dirty ? "Unsaved edits" : "Saved");
+  elements.positionLibraryStatus.classList.toggle("warn", mode === "warn" || dirty);
+  elements.positionLibraryStatus.classList.toggle("error", mode === "error");
+}
+
+function updatePositionLibraryControls() {
+  const dirty = positionLibraryDirty();
+  if (elements.savePositionLibraryBtn) {
+    elements.savePositionLibraryBtn.disabled = !dirty || state.positionLibrarySaving;
+  }
+  if (elements.resetPositionLibraryBtn) {
+    elements.resetPositionLibraryBtn.disabled = !dirty || state.positionLibrarySaving;
+  }
+  setPositionLibraryStatus(state.positionLibrarySaving ? "Saving..." : null, dirty ? "warn" : "");
+}
+
+function positionDisplayName(positionId, record = {}) {
+  return String(record.display_name || record.label || record.name || positionId);
+}
+
+function positionRecordKind(record = {}) {
+  return String(record.type || record.kind || "joint").toLowerCase() === "cartesian" ? "cartesian" : "joint";
+}
+
+function formatPositionRecord(record = {}) {
+  if (positionRecordKind(record) === "joint") {
+    return (record.angles_deg || []).map((value, index) => `J${index + 1} ${format(value, 1)}`).join(", ");
+  }
+  return formatCartesianTarget(record.target || record);
+}
+
+function positionLibraryFieldsHtml(positionId, record = {}) {
+  if (positionRecordKind(record) === "joint") {
+    const angles = record.angles_deg || [];
+    const count = Math.max(state.config?.joints?.length || 4, angles.length);
+    return `
+      <div class="position-library-fields">
+        ${Array.from({ length: count }, (_, index) => `
+          <label>J${index + 1}
+            <input type="number" step="0.1" data-position-field="angles_deg.${index}" data-position-id="${escapeHtml(positionId)}" value="${format(angles[index] ?? 0, 1)}" />
+          </label>
+        `).join("")}
+      </div>
+    `;
+  }
+  const target = record.target || record;
+  return `
+    <div class="position-library-fields">
+      <label>X <input type="number" step="1" data-position-field="target.x_mm" data-position-id="${escapeHtml(positionId)}" value="${format(target.x_mm ?? 0, 1)}" /></label>
+      <label>Y <input type="number" step="1" data-position-field="target.y_mm" data-position-id="${escapeHtml(positionId)}" value="${format(target.y_mm ?? 0, 1)}" /></label>
+      <label>Z <input type="number" step="1" data-position-field="target.z_mm" data-position-id="${escapeHtml(positionId)}" value="${format(target.z_mm ?? 45, 1)}" /></label>
+      <label>Phi <input type="number" step="1" data-position-field="target.phi_deg" data-position-id="${escapeHtml(positionId)}" value="${format(target.phi_deg ?? 0, 1)}" /></label>
+    </div>
+  `;
+}
+
+function sortedPositionEntries(records) {
+  return Object.entries(records).sort(([leftId], [rightId]) => {
+    const leftCore = CORE_POSITION_IDS.has(leftId) ? 0 : 1;
+    const rightCore = CORE_POSITION_IDS.has(rightId) ? 0 : 1;
+    if (leftCore !== rightCore) return leftCore - rightCore;
+    return leftId.localeCompare(rightId);
+  });
+}
+
+function renderPositionLibrary() {
+  if (!elements.positionLibraryList || !state.config) return;
+  const records = ensurePositionLibraryDraft();
+  const entries = sortedPositionEntries(records);
+  elements.positionLibraryList.innerHTML = entries.length
+    ? entries.map(([positionId, record]) => {
+        const kind = positionRecordKind(record);
+        const core = CORE_POSITION_IDS.has(positionId);
+        const source = record.source || (core ? "core" : "saved");
+        return `
+          <div class="position-library-row ${core ? "core-position" : ""}" data-position-id="${escapeHtml(positionId)}">
+            <div class="position-library-title">
+              <strong>${escapeHtml(positionDisplayName(positionId, record))}</strong>
+              <small>${escapeHtml(positionId)} | ${kind} | ${escapeHtml(source)}</small>
+            </div>
+            <label>Name
+              <input type="text" data-position-field="display_name" data-position-id="${escapeHtml(positionId)}" value="${escapeHtml(positionDisplayName(positionId, record))}" />
+            </label>
+            ${positionLibraryFieldsHtml(positionId, record)}
+            <code>${escapeHtml(formatPositionRecord(record))}</code>
+            <div class="button-row position-library-actions">
+              <button type="button" class="ghost" data-position-preview="${escapeHtml(positionId)}">Preview</button>
+              <button type="button" data-position-go="${escapeHtml(positionId)}">Go To</button>
+              <button type="button" class="ghost" data-position-duplicate="${escapeHtml(positionId)}">Duplicate</button>
+              <button type="button" class="danger ghost" data-position-delete="${escapeHtml(positionId)}" ${core ? "disabled title=\"Core positions are kept for compatibility\"" : ""}>Delete</button>
+            </div>
+          </div>
+        `;
+      }).join("")
+    : `<div class="empty-state">No saved positions yet.</div>`;
+  updatePositionLibraryControls();
+}
+
+function markPositionLibraryDirty(message = "Unsaved position-library edits") {
+  setPositionLibraryStatus(message, "warn");
+  updatePositionLibraryControls();
+}
+
+function updatePositionLibraryDraft(positionId, field, value) {
+  const records = ensurePositionLibraryDraft();
+  if (!records[positionId]) return;
+  if (field === "display_name") {
+    records[positionId].display_name = String(value || "").trim() || positionId;
+  } else if (field.startsWith("angles_deg.")) {
+    const index = Number(field.slice("angles_deg.".length));
+    if (!Number.isInteger(index) || index < 0) return;
+    const angles = Array.isArray(records[positionId].angles_deg) ? records[positionId].angles_deg : [];
+    const numeric = Number(value);
+    angles[index] = Number.isFinite(numeric) ? numeric : 0;
+    records[positionId].type = "joint";
+    records[positionId].angles_deg = angles;
+  } else if (field.startsWith("target.")) {
+    const key = field.slice("target.".length);
+    if (!["x_mm", "y_mm", "z_mm", "phi_deg"].includes(key)) return;
+    const numeric = Number(value);
+    records[positionId].type = "cartesian";
+    records[positionId].target = records[positionId].target || {};
+    records[positionId].target[key] = Number.isFinite(numeric) ? numeric : 0;
+  }
+  markPositionLibraryDirty();
+}
+
+function addPositionLibraryRecord(kind) {
+  const records = ensurePositionLibraryDraft();
+  const displayName = kind === "cartesian" ? "New Cartesian Position" : "New Joint Position";
+  const positionId = uniquePositionId(displayName);
+  if (kind === "cartesian") {
+    const fk = state.robotState?.fk || {};
+    records[positionId] = {
+      schema_version: 1,
+      id: positionId,
+      display_name: displayName,
+      type: "cartesian",
+      units: { length: "mm", angle: "deg" },
+      source: "operator",
+      target: {
+        x_mm: Number(fk.x_mm ?? 0),
+        y_mm: Number(fk.y_mm ?? 180),
+        z_mm: Number(fk.z_mm ?? 45),
+        phi_deg: Number(fk.tool_phi_deg ?? fk.phi_deg ?? 0),
+      },
+    };
+  } else {
+    const angles = normalizeJointAngles(state.robotState?.reported_angles_deg)
+      || normalizeJointAngles(jointControlAngles())
+      || normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg))
+      || [];
+    records[positionId] = {
+      schema_version: 1,
+      id: positionId,
+      display_name: displayName,
+      type: "joint",
+      units: { length: "mm", angle: "deg" },
+      source: "operator",
+      angles_deg: angles,
+    };
+  }
+  markPositionLibraryDirty(`Added ${displayName}. Save Library to persist.`);
+  renderPositionLibrary();
+}
+
+function duplicatePositionLibraryRecord(positionId) {
+  const records = ensurePositionLibraryDraft();
+  const source = records[positionId];
+  if (!source) return;
+  const baseName = `${positionDisplayName(positionId, source)} Copy`;
+  const copyId = uniquePositionId(baseName);
+  records[copyId] = {
+    ...clonePlain(source),
+    id: copyId,
+    display_name: baseName,
+    source: "operator",
+  };
+  delete records[copyId].created_at;
+  delete records[copyId].updated_at;
+  markPositionLibraryDirty(`Duplicated ${positionDisplayName(positionId, source)}. Save Library to persist.`);
+  renderPositionLibrary();
+}
+
+function resetPositionLibraryDraft() {
+  state.positionLibraryDraft = savedPositionLibraryRecords();
+  renderPositionLibrary();
+}
+
+function positionIdFromName(name) {
+  const base = String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return base || "position";
+}
+
+function uniquePositionId(displayName) {
+  const records = ensurePositionLibraryDraft();
+  const base = positionIdFromName(displayName);
+  let candidate = base;
+  let index = 2;
+  while (records[candidate]) {
+    candidate = `${base}_${index}`;
+    index += 1;
+  }
+  return candidate;
+}
+
+function positionLibraryErrorText(payload) {
+  if (payload.error) return payload.error;
+  const errors = payload.errors || {};
+  const first = Object.entries(errors)[0];
+  if (!first) return "Position library could not be saved.";
+  const formatErrorValue = (value) => {
+    if (Array.isArray(value)) return value.join("; ");
+    if (value && typeof value === "object") {
+      return Object.entries(value)
+        .map(([key, nested]) => `${key}: ${formatErrorValue(nested)}`)
+        .join("; ");
+    }
+    return String(value || "invalid value");
+  };
+  return `${first[0]}: ${formatErrorValue(first[1])}`;
+}
+
+async function savePositionLibrary(options = {}) {
+  if (!state.config) return { ok: false, error: "configuration not loaded" };
+  state.positionLibrarySaving = true;
+  updatePositionLibraryControls();
+  const payload = await postJson("/api/position-library", {
+    positions: ensurePositionLibraryDraft(),
+  });
+  state.positionLibrarySaving = false;
+  if (payload.ok) {
+    if (payload.config) applyConfig(payload.config);
+    if (payload.state) renderState(payload.state);
+    setPositionLibraryStatus(options.message || "Saved", "");
+  } else {
+    setPositionLibraryStatus(positionLibraryErrorText(payload), "error");
+  }
+  updatePositionLibraryControls();
+  return payload;
+}
+
+async function saveCurrentReportedPosition() {
+  const angles = normalizeJointAngles(state.robotState?.reported_angles_deg);
+  if (!angles) {
+    showLocalError("No reported pose is available to save.");
+    return;
+  }
+  const displayName = window.prompt("Position name", "Current pose");
+  if (displayName === null) return;
+  const trimmed = displayName.trim();
+  if (!trimmed) {
+    showLocalError("Position name is required.");
+    return;
+  }
+  const records = ensurePositionLibraryDraft();
+  const positionId = uniquePositionId(trimmed);
+  records[positionId] = {
+    schema_version: 1,
+    id: positionId,
+    display_name: trimmed,
+    type: "joint",
+    units: { length: "mm", angle: "deg" },
+    source: "operator",
+    angles_deg: angles,
+  };
+  renderPositionLibrary();
+  await savePositionLibrary({ message: `Saved ${trimmed}` });
+}
+
+function positionLibraryRecord(positionId) {
+  return (state.positionLibraryDraft && state.positionLibraryDraft[positionId])
+    || state.config?.position_library?.positions?.[positionId]
+    || null;
+}
+
+function waypointFromPositionRecord(record) {
+  if (!record) return null;
+  if (positionRecordKind(record) === "joint") {
+    return { type: "joint", mode: "joint", angles_deg: (record.angles_deg || []).map(Number) };
+  }
+  return { type: "cartesian", mode: record.preferred_motion_mode || record.motion_mode || "joint", target: record.target || record };
 }
 
 function activeGeometryPreset() {
@@ -1304,42 +1622,49 @@ function detectionColor(detection) {
   return normalizedColorName(detection?.label || detection?.color);
 }
 
-function ensureTaskPresetDrafts() {
+function savedTaskDestinations() {
+  const wrapped = state.config?.task_destinations;
+  if (wrapped?.destinations && typeof wrapped.destinations === "object") return clonePlain(wrapped.destinations);
+  if (wrapped && typeof wrapped === "object") {
+    return clonePlain(Object.fromEntries(
+      Object.entries(wrapped).filter(([key, value]) => !["schema_version", "updated_at"].includes(key) && value && typeof value === "object")
+    ));
+  }
+  return clonePlain(state.config?.drop_zones || {});
+}
+
+function ensureTaskDrafts() {
   if (!state.config) return;
   if (!state.taskColorProfilesDraft) {
     state.taskColorProfilesDraft = clonePlain(state.config.color_profiles || {});
   }
-  if (!state.taskDropZonesDraft) {
-    state.taskDropZonesDraft = clonePlain(state.config.drop_zones || {});
+  if (!state.taskDestinationsDraft) {
+    state.taskDestinationsDraft = savedTaskDestinations();
   }
 }
 
 function taskColorProfiles() {
-  ensureTaskPresetDrafts();
+  ensureTaskDrafts();
   return state.taskColorProfilesDraft || {};
 }
 
-function taskDropZones() {
-  ensureTaskPresetDrafts();
-  return state.taskDropZonesDraft || {};
+function taskDestinations() {
+  ensureTaskDrafts();
+  return state.taskDestinationsDraft || {};
 }
 
-function defaultDropZoneName() {
-  const zones = taskDropZones();
-  return Object.keys(zones)[0] || "";
-}
-
-function taskPresetDraftChanged() {
+function taskDestinationDraftChanged() {
   if (!state.config) return false;
+  const savedDestinations = savedTaskDestinations();
   return (
     JSON.stringify(state.taskColorProfilesDraft || state.config.color_profiles || {}) !== JSON.stringify(state.config.color_profiles || {})
-    || JSON.stringify(state.taskDropZonesDraft || state.config.drop_zones || {}) !== JSON.stringify(state.config.drop_zones || {})
+    || JSON.stringify(state.taskDestinationsDraft || savedDestinations) !== JSON.stringify(savedDestinations)
     || state.unsavedColorProfiles.size > 0
   );
 }
 
 function ensureDetectedColorDrafts(detections = state.latestDetections, options = {}) {
-  ensureTaskPresetDrafts();
+  ensureTaskDrafts();
   const profiles = taskColorProfiles();
   let changed = false;
   (detections || []).forEach((detection) => {
@@ -1355,10 +1680,10 @@ function ensureDetectedColorDrafts(detections = state.latestDetections, options 
   });
   if (changed) {
     if (options.markDirty) {
-      markSettingsDirty("task_presets", "Detected new colors. Assign drop presets and save before running.");
+      markSettingsDirty("task_destinations", "Detected new colors. Assign task destinations and save before running.");
     }
     renderColorPresetMapping();
-    renderTaskPresetEditors();
+    renderTaskDestinationEditor();
   }
   return changed;
 }
@@ -1378,8 +1703,8 @@ function colorProfileOverridesPayload() {
 }
 
 function taskDraftBlocksRun() {
-  if (taskPresetDraftChanged()) return true;
-  const zones = taskDropZones();
+  if (taskDestinationDraftChanged()) return true;
+  const zones = taskDestinations();
   return Object.entries(taskColorProfiles()).some(([, profile]) => {
     if (profile.enabled === false) return false;
     return !profile.drop_zone || !zones[profile.drop_zone];
@@ -1511,7 +1836,7 @@ function renderSetupChecklist() {
     ["Camera", Boolean(camera.enabled), camera.enabled ? `enabled index ${camera.source_index}` : "disabled"],
     ["Tool/TCP dimensions", Boolean(calibration.tool_dimensions_validated), calibration.tool_dimensions_validated ? "validated" : "not validated"],
     ["Safe pose", !state.config?.validation?.named_position_errors?.safe, state.config?.validation?.named_position_errors?.safe?.join("; ") || "valid"],
-    ["Drop zones", missingZones.length === 0, missingZones.length ? `missing ${missingZones.join(", ")}` : `${Object.keys(zones).length} configured`],
+    ["Task destinations", missingZones.length === 0, missingZones.length ? `missing ${missingZones.join(", ")}` : `${Object.keys(zones).length} configured`],
   ];
   elements.taskSetupChecklist.innerHTML = checks.map(([label, ok, detail]) => `
     <div class="setup-check ${ok ? "ok" : "warn"}">
@@ -1526,16 +1851,29 @@ function colorStatusBadge(color, profile, zones) {
   const draft = profile?.draft || state.unsavedColorProfiles.has(color)
     || JSON.stringify(savedProfile || null) !== JSON.stringify(profile || null);
   if (!profile?.drop_zone || !zones[profile.drop_zone]) {
-    return `<span class="missing-badge">Needs preset</span>`;
+    return `<span class="missing-badge">Needs destination</span>`;
   }
   return draft ? `<span class="draft-badge">Draft</span>` : `<span class="saved-badge">Saved</span>`;
 }
 
 function zoneOptionsHtml(selected = "") {
-  const zones = taskDropZones();
-  const options = [`<option value="">Choose preset</option>`];
+  const zones = taskDestinations();
+  const options = [`<option value="">Choose destination</option>`];
   Object.keys(zones).sort().forEach((name) => {
-    options.push(`<option value="${name}" ${name === selected ? "selected" : ""}>${name}</option>`);
+    const label = zones[name]?.label || name;
+    options.push(`<option value="${escapeHtml(name)}" ${name === selected ? "selected" : ""}>${escapeHtml(label)}</option>`);
+  });
+  return options.join("");
+}
+
+function positionReferenceOptionsHtml(selected = "") {
+  const records = state.config?.position_library?.positions || {};
+  const options = [`<option value="">Inline coordinates</option>`];
+  sortedPositionEntries(records).forEach(([positionId, record]) => {
+    const label = positionDisplayName(positionId, record);
+    options.push(
+      `<option value="${escapeHtml(positionId)}" ${positionId === selected ? "selected" : ""}>${escapeHtml(label)} (${escapeHtml(positionId)})</option>`
+    );
   });
   return options.join("");
 }
@@ -1544,7 +1882,7 @@ function renderColorPresetMapping() {
   if (!elements.colorPresetMapping || !state.config) return;
   ensureDetectedColorDrafts(state.latestDetections);
   const profiles = taskColorProfiles();
-  const zones = taskDropZones();
+  const zones = taskDestinations();
   const colors = new Set(Object.keys(profiles));
   state.latestDetections.forEach((detection) => {
     const color = detectionColor(detection);
@@ -1582,7 +1920,7 @@ function renderColorPresetMapping() {
         </select>
         <div class="color-map-title">
           <strong>${detectedCount ? `${detectedCount} detected` : "Configured"}</strong>
-          <small>${profile.drop_zone || "no preset assigned"}</small>
+          <small>${profile.drop_zone || "no destination assigned"}</small>
         </div>
         ${colorStatusBadge(color, profile, zones)}
       </div>
@@ -1590,69 +1928,104 @@ function renderColorPresetMapping() {
   }).join("");
 }
 
-function renderTaskPresetEditors() {
+function renderTaskDestinationEditor() {
   if (!state.config) return;
-  ensureTaskPresetDrafts();
-  const zones = taskDropZones();
-  if (elements.dropPresetEditor) {
+  ensureTaskDrafts();
+  const zones = taskDestinations();
+  if (elements.taskDestinationEditor) {
     const names = Object.keys(zones).sort();
-    elements.dropPresetEditor.innerHTML = names.length
+    elements.taskDestinationEditor.innerHTML = names.length
       ? names.map((name) => {
           const zone = zones[name] || {};
           const grid = zone.grid || {};
+          const referenced = Boolean(zone.position_id);
           return `
-            <div class="drop-preset-row" data-drop-preset="${name}">
-              <div class="drop-preset-title">
-                <strong>${name}</strong>
-                <small>${grid.rows && grid.columns ? `${grid.rows}x${grid.columns} grid` : "fixed anchor"}</small>
+            <div class="task-destination-row" data-task-destination="${escapeHtml(name)}">
+              <div class="task-destination-title">
+                <strong>${escapeHtml(zone.label || name)}</strong>
+                <small>${escapeHtml(name)} | ${referenced ? `position ${zone.position_id}` : "inline"} | ${grid.rows && grid.columns ? `${grid.rows}x${grid.columns} grid` : "fixed anchor"}</small>
               </div>
-              <label>X <input type="number" step="1" data-drop-zone-field="x_mm" data-drop-zone="${name}" value="${format(zone.x_mm ?? 0, 1)}" /></label>
-              <label>Y <input type="number" step="1" data-drop-zone-field="y_mm" data-drop-zone="${name}" value="${format(zone.y_mm ?? 0, 1)}" /></label>
-              <label>Z <input type="number" step="1" data-drop-zone-field="z_mm" data-drop-zone="${name}" value="${format(zone.z_mm ?? 0, 1)}" /></label>
-              <div class="drop-grid-fields">
-                <label>Rows <input type="number" min="0" step="1" data-drop-zone-field="grid.rows" data-drop-zone="${name}" value="${grid.rows ?? ""}" /></label>
-                <label>Cols <input type="number" min="0" step="1" data-drop-zone-field="grid.columns" data-drop-zone="${name}" value="${grid.columns ?? ""}" /></label>
-                <label>dX <input type="number" step="1" data-drop-zone-field="grid.x_spacing_mm" data-drop-zone="${name}" value="${grid.x_spacing_mm ?? ""}" /></label>
-                <label>dY <input type="number" step="1" data-drop-zone-field="grid.y_spacing_mm" data-drop-zone="${name}" value="${grid.y_spacing_mm ?? ""}" /></label>
-              </div>
-              <button class="danger ghost" type="button" data-drop-zone-delete="${name}">Delete</button>
-            </div>
-          `;
-        }).join("")
-      : `<div class="empty-state">No drop presets configured.</div>`;
-  }
-
-  if (elements.colorProfileEditor) {
-    const profiles = taskColorProfiles();
-    const colors = Object.keys(profiles).sort();
-    elements.colorProfileEditor.innerHTML = colors.length
-      ? colors.map((color) => {
-          const profile = profiles[color] || {};
-          return `
-            <div class="color-profile-row" data-color-profile="${color}">
-              <label class="toggle-label compact-toggle">
-                <input type="checkbox" data-settings-color-enabled="${color}" ${profile.enabled === false ? "" : "checked"} />
-                <span class="toggle-text">${color}</span>
+              <label>Name
+                <input type="text" data-task-destination-field="label" data-task-destination="${escapeHtml(name)}" value="${escapeHtml(zone.label || name)}" />
               </label>
-              <select data-settings-color-drop-zone="${color}">
-                ${zoneOptionsHtml(profile.drop_zone || "")}
-              </select>
-              ${colorStatusBadge(color, profile, taskDropZones())}
+              <label>Saved position
+                <select data-task-destination-field="position_id" data-task-destination="${escapeHtml(name)}">
+                  ${positionReferenceOptionsHtml(zone.position_id || "")}
+                </select>
+              </label>
+              <div class="task-destination-coordinates">
+                <label>X <input type="number" step="1" data-task-destination-field="x_mm" data-task-destination="${escapeHtml(name)}" value="${zone.x_mm == null ? "" : format(zone.x_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
+                <label>Y <input type="number" step="1" data-task-destination-field="y_mm" data-task-destination="${escapeHtml(name)}" value="${zone.y_mm == null ? "" : format(zone.y_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
+                <label>Z <input type="number" step="1" data-task-destination-field="z_mm" data-task-destination="${escapeHtml(name)}" value="${zone.z_mm == null ? "" : format(zone.z_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
+              </div>
+              ${referenced ? `<small class="field-help task-destination-reference-help">Coordinates resolve from the selected Position Library record.</small>` : ""}
+              <div class="drop-grid-fields">
+                <label>Rows <input type="number" min="0" step="1" data-task-destination-field="grid.rows" data-task-destination="${escapeHtml(name)}" value="${grid.rows ?? ""}" /></label>
+                <label>Cols <input type="number" min="0" step="1" data-task-destination-field="grid.columns" data-task-destination="${escapeHtml(name)}" value="${grid.columns ?? ""}" /></label>
+                <label>dX <input type="number" step="1" data-task-destination-field="grid.x_spacing_mm" data-task-destination="${escapeHtml(name)}" value="${grid.x_spacing_mm ?? ""}" /></label>
+                <label>dY <input type="number" step="1" data-task-destination-field="grid.y_spacing_mm" data-task-destination="${escapeHtml(name)}" value="${grid.y_spacing_mm ?? ""}" /></label>
+              </div>
+              <button class="danger ghost" type="button" data-task-destination-delete="${escapeHtml(name)}">Delete</button>
             </div>
           `;
         }).join("")
-      : `<div class="empty-state">No color profiles yet. Run detection to create drafts.</div>`;
+      : `<div class="empty-state">No task destinations configured.</div>`;
   }
+  updateTaskMappingControls();
 }
 
-function markTaskPresetDraftDirty(detail = "Task presets changed. Save all settings before running.") {
-  markSettingsDirty("task_presets", detail);
-  invalidateTaskDetections("Task presets changed - refresh detections");
+function updateTaskMappingControls() {
+  const dirty = taskDestinationDraftChanged();
+  if (elements.saveTaskMappingsBtn) elements.saveTaskMappingsBtn.disabled = !dirty;
+  if (elements.discardTaskMappingsBtn) elements.discardTaskMappingsBtn.disabled = !dirty;
+}
+
+async function saveTaskMappingEdits() {
+  if (!state.config) return { ok: false, error: "configuration not loaded" };
+  const payload = await postJson("/api/task-mappings", {
+    color_profiles: taskColorProfiles(),
+    task_destinations: {
+      schema_version: 1,
+      destinations: taskDestinations(),
+    },
+  });
+  if (payload.ok) {
+    if (payload.config) applyConfig(payload.config);
+    if (payload.state) renderState(payload.state);
+    clearSettingsDirty("task_destinations");
+    invalidateTaskDetections("Task mappings saved - refresh detections");
+  } else {
+    updateSettingsSaveBar({
+      mode: "error",
+      title: "Task mappings could not be saved",
+      detail: payload.error || "Review the task destinations and color assignments.",
+    });
+  }
+  updateTaskMappingControls();
+  return payload;
+}
+
+function discardTaskMappingEdits() {
+  if (!state.config) return;
+  state.taskColorProfilesDraft = clonePlain(state.config.color_profiles || {});
+  state.taskDestinationsDraft = savedTaskDestinations();
+  state.unsavedColorProfiles.clear();
+  clearSettingsDirty("task_destinations");
+  invalidateTaskDetections("Task mappings reverted - refresh detections");
   renderColorPresetMapping();
-  renderTaskPresetEditors();
+  renderTaskDestinationEditor();
+  updateTaskMappingControls();
 }
 
-function updateColorProfileDraft(color, patch, detail = "Color preset mapping changed. Save all settings before running.") {
+function markTaskDestinationDraftDirty(detail = "Task destinations changed. Save task mappings before running.") {
+  markSettingsDirty("task_destinations", detail);
+  invalidateTaskDetections("Task destinations changed - refresh detections");
+  renderColorPresetMapping();
+  renderTaskDestinationEditor();
+  updateTaskMappingControls();
+}
+
+function updateColorProfileDraft(color, patch, detail = "Color destination mapping changed. Save all settings before running.") {
   const name = normalizedColorName(color);
   if (!name) return;
   const profiles = taskColorProfiles();
@@ -1664,13 +2037,39 @@ function updateColorProfileDraft(color, patch, detail = "Color preset mapping ch
     profiles[name].draft = true;
     state.unsavedColorProfiles.add(name);
   }
-  markTaskPresetDraftDirty(detail);
+  markTaskDestinationDraftDirty(detail);
 }
 
-function updateDropZoneDraft(name, field, rawValue) {
-  const zones = taskDropZones();
+function updateTaskDestinationDraft(name, field, rawValue) {
+  const zones = taskDestinations();
   if (!zones[name]) return;
-  if (field.startsWith("grid.")) {
+  if (field === "label") {
+    zones[name].label = String(rawValue || "").trim() || name;
+  } else if (field === "position_id") {
+    const positionId = String(rawValue || "").trim();
+    if (positionId) {
+      zones[name].position_id = positionId;
+      zones[name].type = "position_ref";
+      const record = positionLibraryRecord(positionId);
+      if (positionRecordKind(record || {}) === "cartesian") {
+        const target = record?.target || {};
+        zones[name].x_mm = Number(target.x_mm);
+        zones[name].y_mm = Number(target.y_mm);
+        zones[name].z_mm = Number(target.z_mm);
+        if (target.phi_deg != null) zones[name].phi_deg = Number(target.phi_deg);
+      } else {
+        delete zones[name].x_mm;
+        delete zones[name].y_mm;
+        delete zones[name].z_mm;
+        delete zones[name].phi_deg;
+      }
+    } else {
+      delete zones[name].position_id;
+      delete zones[name].position_display_name;
+      delete zones[name].position_type;
+      zones[name].type = "cartesian";
+    }
+  } else if (field.startsWith("grid.")) {
     const key = field.slice("grid.".length);
     const value = String(rawValue || "").trim() === "" ? null : Number(rawValue);
     if (value === null || !Number.isFinite(value) || value <= 0) {
@@ -1686,35 +2085,40 @@ function updateDropZoneDraft(name, field, rawValue) {
     const value = Number(rawValue);
     zones[name][field] = Number.isFinite(value) ? value : 0;
   }
-  markSettingsDirty("task_presets", "Drop preset changed. Save all settings before running.");
-  invalidateTaskDetections("Drop presets changed - refresh detections");
+  markSettingsDirty("task_destinations", "Task destination changed. Save task mappings before running.");
+  invalidateTaskDetections("Task destinations changed - refresh detections");
   renderColorPresetMapping();
+  if (field === "position_id") renderTaskDestinationEditor();
+  updateTaskMappingControls();
 }
 
-function addDropPreset() {
-  const zones = taskDropZones();
+function addTaskDestination() {
+  const zones = taskDestinations();
   let index = Object.keys(zones).length + 1;
-  let name = `preset_${index}`;
+  let name = `destination_${index}`;
   while (zones[name]) {
     index += 1;
-    name = `preset_${index}`;
+    name = `destination_${index}`;
   }
   const fk = state.robotState?.fk || {};
   zones[name] = {
+    id: name,
+    label: `Destination ${index}`,
+    type: "cartesian",
     x_mm: Number(fk.x_mm ?? 0),
     y_mm: Number(fk.y_mm ?? 180),
     z_mm: Number(fk.z_mm ?? 45),
   };
-  markTaskPresetDraftDirty("Added a drop preset. Set coordinates and save all settings before running.");
+  markTaskDestinationDraftDirty("Added a task destination. Set coordinates and save task mappings before running.");
 }
 
-function deleteDropPreset(name) {
-  const zones = taskDropZones();
+function deleteTaskDestination(name) {
+  const zones = taskDestinations();
   delete zones[name];
   Object.values(taskColorProfiles()).forEach((profile) => {
     if (profile.drop_zone === name) profile.drop_zone = "";
   });
-  markTaskPresetDraftDirty("Deleted a drop preset. Review color mappings and save before running.");
+  markTaskDestinationDraftDirty("Deleted a task destination. Review color mappings and save before running.");
 }
 
 function renderWorkflowStepper(phase = "setup") {
@@ -1751,7 +2155,8 @@ function renderWorkflowStepper(phase = "setup") {
 
 function renderOperatorPanels() {
   if (!state.config) return;
-  ensureTaskPresetDrafts();
+  ensureTaskDrafts();
+  renderPositionLibrary();
   const positions = state.config.named_positions || {};
   if (elements.namedPositionsList) {
     elements.namedPositionsList.innerHTML = "";
@@ -1778,7 +2183,7 @@ function renderOperatorPanels() {
 
   if (elements.dropZoneSelect) {
     elements.dropZoneSelect.innerHTML = "";
-    Object.keys(taskDropZones()).forEach((name) => {
+    Object.keys(taskDestinations()).forEach((name) => {
       const option = document.createElement("option");
       option.value = name;
       option.textContent = name;
@@ -1823,7 +2228,7 @@ function renderOperatorPanels() {
     }
   });
   renderColorPresetMapping();
-  renderTaskPresetEditors();
+  renderTaskDestinationEditor();
   applyTaskSettingsControls();
   renderSetupChecklist();
   renderToolControls();
@@ -2001,6 +2406,9 @@ async function refreshEvents() {
 }
 
 function namedPositionWaypoint(name) {
+  const record = positionLibraryRecord(name);
+  const waypoint = waypointFromPositionRecord(record);
+  if (waypoint) return waypoint;
   const position = state.config?.named_positions?.[name];
   if (!position) return null;
   if ((position.type || "joint") === "joint") {
@@ -2415,7 +2823,7 @@ async function detectVision() {
     }
     renderDetectionList(payload.detections || []);
     renderColorPresetMapping();
-    renderTaskPresetEditors();
+    renderTaskDestinationEditor();
     if (state.view) {
       state.view.setObjectDetections(state.latestDetections.filter((detection) => detection.ok && detection.robot));
     }
@@ -4228,7 +4636,12 @@ function programDetectionEntries() {
 
 function programSourceOptions(source = elements.programStepSource.value) {
   if (source === "named_position") {
-    return Object.keys(state.config?.named_positions || {}).sort().map((name) => ({ value: name, label: name }));
+    const records = state.config?.position_library?.positions || {};
+    const entries = Object.keys(records).length ? sortedPositionEntries(records) : Object.entries(state.config?.named_positions || {});
+    return entries.map(([name, record]) => ({
+      value: name,
+      label: record?.display_name && record.display_name !== name ? `${record.display_name} (${name})` : name,
+    }));
   }
   if (source === "vision_detection") {
     return programDetectionEntries().map(({ id, detection }) => ({
@@ -4237,18 +4650,18 @@ function programSourceOptions(source = elements.programStepSource.value) {
     }));
   }
   if (source === "drop_zone") {
-    return Object.keys(taskDropZones()).sort().map((name) => ({ value: name, label: name }));
+    return Object.keys(taskDestinations()).sort().map((name) => ({ value: name, label: name }));
   }
   return [];
 }
 
 function programSourceHint(source = elements.programStepSource.value, optionCount = null) {
   const count = optionCount ?? programSourceOptions(source).length;
-  if (source === "named_position") return count ? "Adds a saved joint or Cartesian named position." : "No named positions are configured.";
+  if (source === "named_position") return count ? "Adds a saved joint or Cartesian Position Library record." : "No Position Library records are configured.";
   if (source === "manual_cartesian") return "Starts from the current IK target. Edit X, Y, Z, phi, and move mode after adding.";
   if (source === "manual_joint") return "Starts from the reported joint pose. Edit each joint after adding.";
   if (source === "vision_detection") return count ? "Uses the selected detection's robot-frame coordinates." : "Refresh detections in Tasks before adding a vision target.";
-  if (source === "drop_zone") return count ? "Adds a configured Cartesian drop-zone anchor." : "No drop zones are configured.";
+  if (source === "drop_zone") return count ? "Adds a configured Cartesian task destination." : "No task destinations are configured.";
   return "";
 }
 
@@ -4313,7 +4726,7 @@ function createProgramStep(source, sourceItem = "") {
     return {
       ...base,
       ...clonePlain(waypoint),
-      label: uniqueProgramLabel(sourceItem),
+      label: uniqueProgramLabel(positionDisplayName(sourceItem, state.config?.position_library?.positions?.[sourceItem] || {})),
       mode: waypoint.type === "joint" ? "joint" : (waypoint.mode || "joint"),
     };
   }
@@ -4337,7 +4750,7 @@ function createProgramStep(source, sourceItem = "") {
     };
   }
   if (source === "drop_zone") {
-    const zone = taskDropZones()[sourceItem];
+    const zone = taskDestinations()[sourceItem];
     if (!zone) return null;
     return {
       ...base,
@@ -4965,7 +5378,11 @@ function readCalibrationPayload() {
     tools: readToolsPayload(),
     joints,
     color_profiles: taskColorProfiles(),
-    drop_zones: taskDropZones(),
+    task_destinations: {
+      schema_version: 1,
+      destinations: taskDestinations(),
+    },
+    drop_zones: taskDestinations(),
     tasks: {
       ...(state.config.tasks || {}),
       color_sorting: {
@@ -5080,7 +5497,8 @@ function applyConfig(config) {
   state.linkDraft = null;
   state.dhDraftRows = null;
   state.taskColorProfilesDraft = clonePlain(config.color_profiles || {});
-  state.taskDropZonesDraft = clonePlain(config.drop_zones || {});
+  state.taskDestinationsDraft = savedTaskDestinations();
+  state.positionLibraryDraft = savedPositionLibraryRecords();
   state.unsavedColorProfiles.clear();
   state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
@@ -5692,6 +6110,42 @@ function bindActions() {
     if (previewButton) previewNamedPosition(previewButton.dataset.namedPreview);
     if (applyButton) moveNamedPosition(applyButton.dataset.namedApply);
   });
+  elements.positionLibraryList?.addEventListener("input", (event) => {
+    const input = event.target.closest("[data-position-field]");
+    if (!input) return;
+    updatePositionLibraryDraft(input.dataset.positionId, input.dataset.positionField, input.value);
+  });
+  elements.positionLibraryList?.addEventListener("click", (event) => {
+    const previewButton = event.target.closest("[data-position-preview]");
+    const goButton = event.target.closest("[data-position-go]");
+    const duplicateButton = event.target.closest("[data-position-duplicate]");
+    const deleteButton = event.target.closest("[data-position-delete]");
+    if (previewButton) {
+      previewNamedPosition(previewButton.dataset.positionPreview);
+      return;
+    }
+    if (goButton) {
+      moveNamedPosition(goButton.dataset.positionGo);
+      return;
+    }
+    if (duplicateButton) {
+      duplicatePositionLibraryRecord(duplicateButton.dataset.positionDuplicate);
+      return;
+    }
+    if (deleteButton) {
+      const positionId = deleteButton.dataset.positionDelete;
+      if (CORE_POSITION_IDS.has(positionId)) return;
+      const records = ensurePositionLibraryDraft();
+      delete records[positionId];
+      markPositionLibraryDirty("Position removed. Save Library to persist.");
+      renderPositionLibrary();
+    }
+  });
+  elements.addJointPositionBtn?.addEventListener("click", () => addPositionLibraryRecord("joint"));
+  elements.addCartesianPositionBtn?.addEventListener("click", () => addPositionLibraryRecord("cartesian"));
+  elements.saveCurrentPositionBtn?.addEventListener("click", saveCurrentReportedPosition);
+  elements.savePositionLibraryBtn?.addEventListener("click", () => savePositionLibrary());
+  elements.resetPositionLibraryBtn?.addEventListener("click", resetPositionLibraryDraft);
   elements.toolSelect.addEventListener("change", () => saveActiveTool(elements.toolSelect.value));
   elements.toolValueSlider.addEventListener("pointerdown", beginToolSliderEdit);
   elements.toolValueSlider.addEventListener("pointerup", () => {
@@ -5735,27 +6189,24 @@ function bindActions() {
       updateColorProfileDraft(zoneSelect.dataset.colorDropZone, { drop_zone: zoneSelect.value });
     }
   });
-  elements.dropPresetEditor?.addEventListener("input", (event) => {
-    const input = event.target.closest("[data-drop-zone-field]");
-    if (!input) return;
-    updateDropZoneDraft(input.dataset.dropZone, input.dataset.dropZoneField, input.value);
+  elements.taskDestinationEditor?.addEventListener("input", (event) => {
+    const input = event.target.closest("[data-task-destination-field]");
+    if (!input || input.tagName === "SELECT") return;
+    updateTaskDestinationDraft(input.dataset.taskDestination, input.dataset.taskDestinationField, input.value);
   });
-  elements.dropPresetEditor?.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-drop-zone-delete]");
+  elements.taskDestinationEditor?.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-task-destination-field]");
+    if (!input || input.tagName !== "SELECT") return;
+    updateTaskDestinationDraft(input.dataset.taskDestination, input.dataset.taskDestinationField, input.value);
+  });
+  elements.taskDestinationEditor?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-task-destination-delete]");
     if (!button) return;
-    deleteDropPreset(button.dataset.dropZoneDelete);
+    deleteTaskDestination(button.dataset.taskDestinationDelete);
   });
-  elements.colorProfileEditor?.addEventListener("change", (event) => {
-    const enabledInput = event.target.closest("[data-settings-color-enabled]");
-    const zoneSelect = event.target.closest("[data-settings-color-drop-zone]");
-    if (enabledInput) {
-      updateColorProfileDraft(enabledInput.dataset.settingsColorEnabled, { enabled: enabledInput.checked });
-    }
-    if (zoneSelect) {
-      updateColorProfileDraft(zoneSelect.dataset.settingsColorDropZone, { drop_zone: zoneSelect.value });
-    }
-  });
-  elements.addDropPresetBtn?.addEventListener("click", addDropPreset);
+  elements.addTaskDestinationBtn?.addEventListener("click", addTaskDestination);
+  elements.saveTaskMappingsBtn?.addEventListener("click", saveTaskMappingEdits);
+  elements.discardTaskMappingsBtn?.addEventListener("click", discardTaskMappingEdits);
   [
     elements.taskModeSelect,
     elements.executionStrategySelect,

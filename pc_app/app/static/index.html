@@ -66,6 +66,24 @@
                   <div id="jointControls" class="joint-controls"></div>
                 </section>
 
+                <section class="panel-section position-library-panel">
+                  <div class="section-header">
+                    <div>
+                      <h2>Position Library</h2>
+                      <p class="hint">General saved robot poses. Tasks can reference these positions, but they are not task-owned.</p>
+                    </div>
+                    <span id="positionLibraryStatus" class="status-chip">Saved</span>
+                  </div>
+                  <div class="button-row action-row">
+                    <button id="addJointPositionBtn" class="ghost" type="button">New Joint</button>
+                    <button id="addCartesianPositionBtn" class="ghost" type="button">New Cartesian</button>
+                    <button id="saveCurrentPositionBtn" type="button">Save Current Pose</button>
+                    <button id="savePositionLibraryBtn" class="primary" type="button" disabled>Save Library</button>
+                    <button id="resetPositionLibraryBtn" class="ghost" type="button" disabled>Discard Edits</button>
+                  </div>
+                  <div id="positionLibraryList" class="position-library-list"></div>
+                </section>
+
                 <section class="panel-section">
                   <div class="section-header">
                     <div>
@@ -177,6 +195,11 @@
                     <label class="wide-field task-colors-field">Colors
                       <select id="includeColorsSelect" multiple hidden></select>
                       <div id="colorPresetMapping" class="color-preset-mapping"></div>
+                      <span class="field-help">Draft means this color assignment has not been saved. Saved mappings are reused by later task runs.</span>
+                      <div class="button-row task-mapping-actions">
+                        <button id="saveTaskMappingsBtn" class="ghost" type="button" disabled>Save task mappings</button>
+                        <button id="discardTaskMappingsBtn" class="ghost" type="button" disabled>Discard task edits</button>
+                      </div>
                     </label>
                     <label>Color priority
                       <input id="colorPriorityInput" type="text" placeholder="red, blue" />
@@ -199,7 +222,7 @@
                         <option value="grid">Zone grid</option>
                       </select>
                     </label>
-                    <label class="task-legacy-field">Drop zone
+                    <label class="task-legacy-field">Task destination
                       <select id="dropZoneSelect"></select>
                     </label>
                     <label class="task-legacy-field">Color profile
@@ -370,7 +393,7 @@
                         <option value="manual_cartesian">Manual Cartesian</option>
                         <option value="manual_joint">Manual joints</option>
                         <option value="vision_detection">Vision object</option>
-                        <option value="drop_zone">Drop zone</option>
+                        <option value="drop_zone">Task destination</option>
                       </select>
                     </label>
                     <label id="programSourceItemField">Target
@@ -447,7 +470,7 @@
                     <button type="button" data-settings-target="settingsJoints">Joints</button>
                     <button type="button" data-settings-target="settingsMotion">Motion</button>
                     <button type="button" data-settings-target="settingsTooling">Tooling</button>
-                    <button type="button" data-settings-target="settingsTaskPresets">Task presets</button>
+                    <button type="button" data-settings-target="settingsTaskDestinations">Task destinations</button>
                     <button type="button" data-settings-target="settingsCamera">Camera</button>
                     <button type="button" data-settings-target="settingsTcpCalibration">TCP calibration</button>
                     <button type="button" data-settings-target="settingsHardware">Hardware</button>
@@ -566,24 +589,19 @@
                   <div id="toolCalibration" class="path-summary"></div>
                 </section>
 
-                <section class="panel-section settings-section" id="settingsTaskPresets">
+                <section class="panel-section settings-section" id="settingsTaskDestinations">
                   <div class="section-header">
                     <div>
-                      <h2>Task presets</h2>
-                      <p class="hint">Named robot-frame drop positions and color-to-preset defaults used by color sorting.</p>
+                      <h2>Task destinations</h2>
+                      <p class="hint">Task-specific drop anchors used by color sorting. Color assignments are edited in Tasks.</p>
                     </div>
-                    <button id="addDropPresetBtn" type="button">Add preset</button>
+                    <button id="addTaskDestinationBtn" type="button">Add destination</button>
                   </div>
                   <div class="subsection-heading">
-                    <h3>Drop position presets</h3>
+                    <h3>Drop destinations</h3>
                     <p class="hint">Coordinates are active-TCP robot-frame millimeters. Optional grids are finite row-major placement slots.</p>
                   </div>
-                  <div id="dropPresetEditor" class="drop-preset-editor"></div>
-                  <div class="subsection-heading">
-                    <h3>Color defaults</h3>
-                    <p class="hint">Detected unknown colors appear here as drafts after detection and must be saved before running.</p>
-                  </div>
-                  <div id="colorProfileEditor" class="color-profile-editor"></div>
+                  <div id="taskDestinationEditor" class="task-destination-editor"></div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsCamera">

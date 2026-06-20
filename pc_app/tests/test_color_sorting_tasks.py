@@ -220,14 +220,17 @@ def test_fixed_and_grid_assignment_capacity_are_deterministic():
 
     raw = {
         **config.raw,
-        "drop_zones": {
-            **config.raw.get("drop_zones", {}),
-            "dropoff_a": {
-                "x_mm": -120.0,
-                "y_mm": 180.0,
-                "z_mm": 45.0,
-                "phi_deg": 0.0,
-                "grid": {"rows": 1, "columns": 1, "x_spacing_mm": 10.0, "y_spacing_mm": 10.0},
+        "task_destinations": {
+            **config.raw["task_destinations"],
+            "destinations": {
+                **config.raw["task_destinations"]["destinations"],
+                "dropoff_a": {
+                    "x_mm": -120.0,
+                    "y_mm": 180.0,
+                    "z_mm": 45.0,
+                    "phi_deg": 0.0,
+                    "grid": {"rows": 1, "columns": 1, "x_spacing_mm": 10.0, "y_spacing_mm": 10.0},
+                },
             },
         },
     }
@@ -431,11 +434,14 @@ def test_invalid_drop_zone_coordinates_are_reported_instead_of_becoming_zero():
     config = load_config(EXAMPLE_CONFIG_PATH)
     raw = {
         **config.raw,
-        "drop_zones": {
-            **config.raw["drop_zones"],
-            "dropoff_a": {
-                **config.raw["drop_zones"]["dropoff_a"],
-                "x_mm": "not-a-number",
+        "task_destinations": {
+            **config.raw["task_destinations"],
+            "destinations": {
+                **config.raw["task_destinations"]["destinations"],
+                "dropoff_a": {
+                    **config.raw["task_destinations"]["destinations"]["dropoff_a"],
+                    "x_mm": "not-a-number",
+                },
             },
         },
     }
@@ -448,4 +454,4 @@ def test_invalid_drop_zone_coordinates_are_reported_instead_of_becoming_zero():
     )
 
     assert not plan["ok"]
-    assert "drop zone dropoff_a x_mm must be a finite number" in plan["error"]
+    assert "task destination dropoff_a x_mm must be a finite number" in plan["error"]

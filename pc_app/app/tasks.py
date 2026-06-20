@@ -17,6 +17,7 @@ from .demo_settings import (
     validate_named_position,
 )
 from .kinematics import forward_kinematics
+from .task_destinations import task_destination_errors
 
 
 SUPPORTED_STRATEGIES = {"closed_loop", "batch_once"}
@@ -395,19 +396,13 @@ def _tool_steps(config: RobotConfig) -> tuple[dict[str, Any], dict[str, Any], di
 
 
 def _validate_drop_zone_config(config: RobotConfig) -> None:
-    raw_zones = config.raw.get("drop_zones")
-    if raw_zones is None:
+    errors = task_destination_errors(config, named_positions(config))
+    if not errors:
         return
-    if not isinstance(raw_zones, dict):
-        raise TaskSettingsError("drop_zones must be an object")
-    for name, raw_zone in raw_zones.items():
-        if not isinstance(raw_zone, dict):
-            raise TaskSettingsError(f"drop zone {name} must be an object")
-        target = raw_zone.get("target") if isinstance(raw_zone.get("target"), dict) else raw_zone
-        for key in ("x_mm", "y_mm", "z_mm"):
-            _finite_number(target.get(key), f"drop zone {name} {key}")
-        if target.get("phi_deg") is not None:
-            _finite_number(target["phi_deg"], f"drop zone {name} phi_deg")
+    name, messages = next(iter(errors.items()))
+    if name == "_schema":
+        raise TaskSettingsError("; ".join(messages))
+    raise TaskSettingsError("; ".join(messages))
 
 
 def _target_with_phi(x_mm: float, y_mm: float, z_mm: float, phi: dict[str, Any]) -> dict[str, Any]:
@@ -536,6 +531,11 @@ def build_pick_and_place_sequence(
     approach_clearance = max(0.0, _as_float(profile.get("approach_clearance_mm"), settings["approach_clearance_mm"]))
     drop_clearance = max(0.0, _as_float(profile.get("drop_approach_clearance_mm"), settings["drop_approach_clearance_mm"]))
     modes = profile.get("motion_modes", settings.get("motion_modes", {}))
+    drop_reference_meta = {
+        key: deepcopy(drop_pose[key])
+        for key in ("position_id", "position_display_name", "position_type")
+        if key in drop_pose
+    }
 
     # Vision may include stale or placeholder Z/phi. The task contract uses X/Y
     # from perception and resolves active-TCP Z/phi from configuration.
@@ -597,7 +597,7 @@ def build_pick_and_place_sequence(
         "steps": steps,
         "waypoints": waypoints,
         "object_target": {"x_mm": object_pose["x_mm"], "y_mm": object_pose["y_mm"], "z_mm": pickup_z, **pickup_phi},
-        "drop_target": {**at_drop, "drop_zone": zone_name},
+        "drop_target": {**at_drop, **drop_reference_meta, "drop_zone": zone_name},
         "motion_modes": deepcopy(modes),
     }
 

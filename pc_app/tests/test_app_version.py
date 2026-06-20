@@ -143,3 +143,20 @@ def test_frontend_contains_model_truth_and_tcp_frame_hooks():
     assert "settingsModelTruth" in index_html
     assert "makeTcpFrameAxes" in robot_view_js
     assert "currentTcpAxisZ" in robot_view_js
+
+
+def test_frontend_contains_position_library_hooks():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "Position Library" in index_html
+    assert "positionLibraryList" in app_js
+    assert "addJointPositionBtn" in app_js
+    assert "addCartesianPositionBtn" in app_js
+    assert "data-position-duplicate" in app_js
+    assert "/api/position-library" in app_js
+    assert "Task destinations" in index_html
+    assert "taskDestinationEditor" in app_js
+    assert "positionReferenceOptionsHtml" in app_js
+    assert "/api/task-mappings" in app_js
+    assert "Color-to-destination defaults" not in index_html
