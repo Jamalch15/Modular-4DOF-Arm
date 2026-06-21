@@ -4,6 +4,7 @@ import json
 import re
 from copy import deepcopy
 from datetime import datetime, timezone
+from hashlib import sha256
 from math import cos, sin, tau
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from .kinematics import forward_kinematics
 
 PROGRAM_SCHEMA_VERSION = 1
 PROGRAM_STORE_SCHEMA_VERSION = 1
+CACHED_PLAN_SCHEMA_VERSION = 1
 PROGRAM_STORE_PATH = Path(__file__).resolve().parents[1] / "config" / "programs.local.json"
 
 
@@ -45,6 +47,16 @@ def _slug(value: str) -> str:
 
 def new_program_id(name: str) -> str:
     return f"{_slug(name)}-{uuid4().hex[:8]}"
+
+
+def program_motion_fingerprint(program: dict[str, Any]) -> str:
+    payload = {
+        "schema_version": int(program.get("schema_version", PROGRAM_SCHEMA_VERSION)),
+        "required_tool": program.get("required_tool"),
+        "steps": program.get("steps", []),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return sha256(encoded).hexdigest()[:16]
 
 
 def normalize_program_step(config: RobotConfig, raw: dict[str, Any], index: int) -> dict[str, Any]:
@@ -200,6 +212,8 @@ def normalize_program(
         program["required_tool"] = required_tool.strip()
     if isinstance(raw.get("metadata"), dict):
         program["metadata"] = deepcopy(raw["metadata"])
+    if isinstance(raw.get("cached_plan"), dict):
+        program["cached_plan"] = deepcopy(raw["cached_plan"])
     return program
 
 
@@ -497,6 +511,28 @@ def save_user_program(
     return program
 
 
+def save_user_program_cached_plan(
+    config: RobotConfig,
+    program_id: str,
+    cached_plan: dict[str, Any],
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    programs = load_user_programs(config, path)
+    program = programs.get(program_id)
+    if program is None:
+        raise ProgramLibraryError(f"program {program_id} was not found")
+    if program.get("read_only") or str(program_id).startswith("demo-"):
+        raise ProgramLibraryError("built-in templates cannot store compiled plans")
+    prepared_plan = deepcopy(cached_plan)
+    prepared_plan["schema_version"] = CACHED_PLAN_SCHEMA_VERSION
+    prepared_plan["program_fingerprint"] = program_motion_fingerprint(program)
+    prepared_plan["saved_at"] = _now_iso()
+    program["cached_plan"] = prepared_plan
+    programs[program_id] = normalize_program(config, program, source="user")
+    write_user_programs(programs, path)
+    return programs[program_id]
+
+
 def delete_user_program(
     config: RobotConfig,
     program_id: str,
@@ -560,6 +596,7 @@ def copy_program_to_user(
             "copied_from": source["id"],
         },
     }
+    copied.pop("cached_plan", None)
     for index, step in enumerate(copied["steps"]):
         step["id"] = f"step-{index + 1}"
     return save_user_program(config, copied, path)

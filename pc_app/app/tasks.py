@@ -561,26 +561,141 @@ def build_pick_and_place_sequence(
         "grid_slot": grid_slot,
     }
 
-    def move(label: str, target: dict[str, Any], mode: str) -> dict[str, Any]:
+    def waypoint_metadata(waypoint: dict[str, Any]) -> dict[str, Any]:
+        mode = str(waypoint.get("mode") or ("joint" if waypoint.get("type") == "joint" else "linear"))
+        if waypoint.get("type") == "cartesian":
+            target = waypoint.get("target", {})
+            return {
+                "target_frame": "robot_base",
+                "movement_mode": mode,
+                "height_mm": _as_float(target.get("z_mm"), 0.0),
+                "target_kind": "active_tcp",
+            }
+        fk = forward_kinematics(
+            [_as_float(value) for value in waypoint.get("angles_deg", config.home_pose)],
+            config.links,
+        )
+        return {
+            "target_frame": "robot_base",
+            "movement_mode": "joint",
+            "height_mm": _as_float(fk.get("z_mm"), 0.0),
+            "target_kind": "joint_pose_active_tcp",
+        }
+
+    def recovery_target(target: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "target_frame": "robot_base",
+            "movement_mode": "linear",
+            "height_mm": _as_float(target.get("z_mm"), 0.0),
+            "waypoint": {"type": "cartesian", "mode": "linear", "target": deepcopy(target)},
+        }
+
+    def move(
+        label: str,
+        target: dict[str, Any],
+        mode: str,
+        phase: str,
+        *,
+        retreat_target: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        waypoint = {"type": "cartesian", "mode": mode, "target": target}
         return {
             "kind": "move",
             "label": label,
-            "waypoint": {"type": "cartesian", "mode": mode, "target": target},
+            "phase": phase,
+            "waypoint": waypoint,
+            **waypoint_metadata(waypoint),
+            "safe_retreat_available": retreat_target is not None,
+            "recovery_target": recovery_target(retreat_target) if retreat_target is not None else None,
             **{key: value for key, value in object_meta.items() if value is not None},
         }
 
+    safe_start = {
+        "kind": "move",
+        "label": "safe",
+        "phase": "safe",
+        "waypoint": safe,
+        **waypoint_metadata(safe),
+        "safe_retreat_available": True,
+        "recovery_target": {"waypoint": deepcopy(safe), **waypoint_metadata(safe)},
+        **{k: v for k, v in object_meta.items() if v is not None},
+    }
+    safe_finish = {
+        **deepcopy(safe_start),
+        "phase": "return_safe",
+    }
+    release_tool.update(
+        {
+            "phase": "tool_prepare",
+            "hold_transition": "none",
+            "safe_retreat_available": True,
+            "recovery_target": {"waypoint": deepcopy(safe), **waypoint_metadata(safe)},
+        }
+    )
+    capture_tool.update(
+        {
+            "phase": "grip",
+            "hold_transition": "possibly_held",
+            "safe_retreat_available": True,
+            "recovery_target": recovery_target(above_pick),
+        }
+    )
+    final_release_tool.update(
+        {
+            "phase": "release",
+            "hold_transition": "release_unconfirmed",
+            "safe_retreat_available": True,
+            "recovery_target": recovery_target(above_drop),
+        }
+    )
     steps: list[dict[str, Any]] = [
-        {"kind": "move", "label": "safe", "waypoint": safe, **{k: v for k, v in object_meta.items() if v is not None}},
+        safe_start,
         release_tool,
-        move("above pickup", above_pick, str(modes.get("transfer", "joint"))),
-        move("pickup", at_pick, str(modes.get("pickup_descent", "linear"))),
+        move(
+            "above pickup",
+            above_pick,
+            str(modes.get("transfer", "joint")),
+            "pickup_approach",
+            retreat_target=above_pick,
+        ),
+        move(
+            "pickup",
+            at_pick,
+            str(modes.get("pickup_descent", "linear")),
+            "pickup_descent",
+            retreat_target=above_pick,
+        ),
         capture_tool,
-        move("lift", above_pick, str(modes.get("lift", "linear"))),
-        move("above dropoff", above_drop, str(modes.get("transfer", "joint"))),
-        move("dropoff", at_drop, str(modes.get("drop_descent", "linear"))),
+        move(
+            "lift",
+            above_pick,
+            str(modes.get("lift", "linear")),
+            "pickup_retreat",
+            retreat_target=above_pick,
+        ),
+        move(
+            "above dropoff",
+            above_drop,
+            str(modes.get("transfer", "joint")),
+            "transfer",
+            retreat_target=above_drop,
+        ),
+        move(
+            "dropoff",
+            at_drop,
+            str(modes.get("drop_descent", "linear")),
+            "drop_descent",
+            retreat_target=above_drop,
+        ),
         final_release_tool,
-        move("lift from dropoff", above_drop, str(modes.get("lift", "linear"))),
-        {"kind": "move", "label": "safe", "waypoint": safe, **{k: v for k, v in object_meta.items() if v is not None}},
+        move(
+            "lift from dropoff",
+            above_drop,
+            str(modes.get("lift", "linear")),
+            "drop_retreat",
+            retreat_target=above_drop,
+        ),
+        safe_finish,
     ]
     for tool_step in [release_tool, capture_tool, final_release_tool]:
         tool_step.update({key: value for key, value in object_meta.items() if value is not None})
@@ -599,6 +714,8 @@ def build_pick_and_place_sequence(
         "object_target": {"x_mm": object_pose["x_mm"], "y_mm": object_pose["y_mm"], "z_mm": pickup_z, **pickup_phi},
         "drop_target": {**at_drop, **drop_reference_meta, "drop_zone": zone_name},
         "motion_modes": deepcopy(modes),
+        "active_tool": str(tools_settings(config).get("active", "")),
+        "tool_type": str(tool_settings(config).get("type", "")),
     }
 
 
@@ -905,21 +1022,6 @@ def build_color_sorting_plan(
     if not calibration_settings(config).get("tool_dimensions_validated", False):
         warnings.append("active tool dimensions are not validated for hardware")
     errors = list(filtering["errors"])
-    if strategy == "closed_loop":
-        include_colors = set(settings.get("filters", {}).get("include_colors", []))
-        zones = drop_zones(config)
-        for color, profile in color_profiles.items():
-            if not isinstance(profile, dict) or profile.get("enabled", True) is False:
-                continue
-            if include_colors and color not in include_colors:
-                continue
-            zone_name = str(profile.get("drop_zone") or settings.get("default_drop_zone") or "")
-            if zone_name not in zones:
-                message = f"missing drop zone {zone_name or '-'} for enabled color {color}"
-                if settings["missing_drop_zone_policy"] == "error":
-                    errors.append(message)
-                else:
-                    warnings.append(message)
     ordered = order_sorting_candidates(config, candidates, settings)
     if selected_detection_ids:
         missing_selected = [

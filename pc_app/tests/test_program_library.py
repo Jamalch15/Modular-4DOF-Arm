@@ -14,7 +14,9 @@ from app.program_library import (
     delete_user_program,
     find_program,
     load_user_programs,
+    program_motion_fingerprint,
     save_user_program,
+    save_user_program_cached_plan,
 )
 
 
@@ -204,3 +206,50 @@ def test_program_library_preserves_motion_overrides_and_tool_steps(tmp_path):
     assert saved["steps"][1]["type"] == "tool"
     assert saved["steps"][1]["action"] == "close"
     assert saved["steps"][1]["settle_ms"] == 200.0
+
+
+def test_user_program_persists_compiled_plan_with_definition_fingerprint(tmp_path):
+    config = reference_config()
+    store = tmp_path / "programs.local.json"
+    saved = save_user_program(
+        config,
+        {
+            "name": "Reusable move",
+            "steps": [
+                {
+                    "label": "Home",
+                    "type": "joint",
+                    "angles_deg": config.home_pose,
+                }
+            ],
+        },
+        store,
+    )
+
+    with_plan = save_user_program_cached_plan(
+        config,
+        saved["id"],
+        {
+            "backend_build_id": "test-build",
+            "config_id": "test-config",
+            "model_fingerprint": "test-model",
+            "start_reported_angles_deg": config.home_pose,
+            "preview": {
+                "mode": "program",
+                "trajectory": {
+                    "duration_s": 1.0,
+                    "waypoint_count": 2,
+                    "waypoints": [config.home_pose, config.home_pose],
+                },
+            },
+        },
+        store,
+    )
+
+    reloaded = load_user_programs(config, store)[saved["id"]]
+    assert reloaded["cached_plan"]["backend_build_id"] == "test-build"
+    assert reloaded["cached_plan"]["program_fingerprint"] == program_motion_fingerprint(with_plan)
+    assert reloaded["cached_plan"]["preview"]["trajectory"]["waypoint_count"] == 2
+
+    updated = save_user_program(config, {**saved, "description": "changed"}, store)
+    assert "cached_plan" not in updated

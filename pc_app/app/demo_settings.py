@@ -313,10 +313,22 @@ def calibration_settings(config: RobotConfig) -> dict[str, Any]:
         "movement_tolerance_deg": 0.2,
         "tool_dimensions_validated": False,
         "last_validation": "",
+        "measurement_reference": {
+            "frame": "robot_base",
+            "workspace_plane_z_mm": 0.0,
+            "z_reference": "robot_base",
+            "measured_point": "active_tcp",
+            "notes": "Working assumption: measured Z values are expressed in the robot-base frame.",
+        },
+        "physical_model_history": [],
     }
     raw = config.raw.get("calibration")
     if isinstance(raw, dict):
-        defaults.update(deepcopy(raw))
+        for key, value in raw.items():
+            if key == "measurement_reference" and isinstance(value, dict):
+                defaults["measurement_reference"].update(deepcopy(value))
+            else:
+                defaults[key] = deepcopy(value)
     return defaults
 
 

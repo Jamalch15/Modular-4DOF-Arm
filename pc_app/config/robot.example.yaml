@@ -524,11 +524,21 @@ calibration:
   movement_tolerance_deg: 0.2
   tool_dimensions_validated: false
   last_validation: ""
+  measurement_reference:
+    # Explicitly state how manual/touch-off measurements become robot-base Z.
+    # If the work plate is not at robot-base Z=0, measure that height and save it
+    # here before collecting calibration samples.
+    frame: robot_base
+    workspace_plane_z_mm: 0.0
+    z_reference: robot_base
+    measured_point: active_tcp
+    notes: "Working assumption: measured Z values are expressed in the robot-base frame."
+  physical_model_history: []
 
 kinematics_calibration:
   # Optional command-layer TCP correction. FK remains the unmodified robot
   # model. Profiles are fitted and populated by the operator workflow.
-  schema_version: 1
+  schema_version: 2
   enabled: false
   active_profile: gripper
   default_model: affine_xy_z_offset
@@ -545,6 +555,12 @@ kinematics_calibration:
     maximum_sample_residual_mm: 250.0
     outlier_floor_mm: 5.0
     outlier_mad_scale: 3.5
+    minimum_validation_samples: 2
+    minimum_xy_span_mm: 80.0
+    minimum_z_span_mm: 15.0
+    minimum_phi_span_deg: 20.0
+    maximum_enable_xy_correction_mm: 35.0
+    maximum_enable_z_correction_mm: 20.0
   profiles: {}
 
 future_transport_notes:

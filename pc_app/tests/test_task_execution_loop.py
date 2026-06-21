@@ -1,4 +1,6 @@
 import asyncio
+from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,6 +36,7 @@ def restore_runtime_state():
         "reported_angles_deg": list(main.state.reported_angles_deg),
         "task_task": main.task_task,
         "simulation_vision_queue": list(main.simulation_vision_queue),
+        "latest_vision_snapshot": dict(main.latest_vision_snapshot),
         "task_previews": dict(main.task_previews),
     }
     yield
@@ -48,6 +51,8 @@ def restore_runtime_state():
     main.state.reported_angles_deg = snapshot["reported_angles_deg"]
     main.task_task = snapshot["task_task"]
     main.simulation_vision_queue[:] = snapshot["simulation_vision_queue"]
+    main.latest_vision_snapshot.clear()
+    main.latest_vision_snapshot.update(snapshot["latest_vision_snapshot"])
     main.task_previews.clear()
     main.task_previews.update(snapshot["task_previews"])
     main.task_selection_events.clear()
@@ -219,14 +224,15 @@ def test_closed_loop_safety_gate_loss_stops_before_capture(monkeypatch):
     assert main.state.task_execution["terminal_reason"] == "safety gate lost"
 
 
-def test_task_stop_reports_holding_uncertainty(monkeypatch):
+def test_task_stop_before_grip_reports_no_object_held(monkeypatch):
     configure_task_runtime(monkeypatch, {"execution_strategy": "closed_loop", "max_objects": 1})
 
     result = asyncio.run(main.stop_task())
 
     assert result["ok"] is True
     assert main.state.task_execution["status"] == "stopped"
-    assert main.state.task_execution["holding_uncertain"] is True
+    assert main.state.task_execution["object_hold_state"] == "none"
+    assert main.state.task_execution["holding_uncertain"] is False
 
 
 def test_cancelled_task_cannot_overwrite_stopped_status_with_completed(monkeypatch):
@@ -270,7 +276,179 @@ def test_cancelled_task_cannot_overwrite_stopped_status_with_completed(monkeypat
 
     assert main.state.task_execution["status"] == "stopped"
     assert main.state.task_execution["terminal_reason"] == "STOP"
-    assert main.state.task_execution["holding_uncertain"] is True
+    assert main.state.task_execution["holding_uncertain"] is False
+
+
+@pytest.mark.parametrize(
+    ("phase", "steps", "blocked_action", "expected_hold", "last_completed"),
+    [
+        (
+            "pickup_approach",
+            [
+                {
+                    "kind": "move",
+                    "label": "above pickup",
+                    "phase": "pickup_approach",
+                    "safe_retreat_available": True,
+                    "recovery_target": {"waypoint": {"type": "joint", "angles_deg": [0, 35, 15, 0]}},
+                    "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0, 35, 15, 0]},
+                }
+            ],
+            None,
+            "none",
+            None,
+        ),
+        (
+            "grip",
+            [
+                {
+                    "kind": "tool",
+                    "label": "close gripper",
+                    "phase": "grip",
+                    "action": "close",
+                    "hold_transition": "possibly_held",
+                    "safe_retreat_available": True,
+                    "recovery_target": {"waypoint": {"type": "joint", "angles_deg": [0, 35, 15, 0]}},
+                }
+            ],
+            "close",
+            "possibly_held",
+            None,
+        ),
+        (
+            "transfer",
+            [
+                {
+                    "kind": "tool",
+                    "label": "close gripper",
+                    "phase": "grip",
+                    "action": "close",
+                    "hold_transition": "possibly_held",
+                },
+                {
+                    "kind": "move",
+                    "label": "above dropoff",
+                    "phase": "transfer",
+                    "safe_retreat_available": True,
+                    "recovery_target": {"waypoint": {"type": "joint", "angles_deg": [0, 35, 15, 0]}},
+                    "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0, 35, 15, 0]},
+                },
+            ],
+            None,
+            "possibly_held",
+            "close gripper",
+        ),
+        (
+            "release",
+            [
+                {
+                    "kind": "tool",
+                    "label": "close gripper",
+                    "phase": "grip",
+                    "action": "close",
+                    "hold_transition": "possibly_held",
+                },
+                {
+                    "kind": "tool",
+                    "label": "open gripper",
+                    "phase": "release",
+                    "action": "open",
+                    "hold_transition": "release_unconfirmed",
+                    "safe_retreat_available": True,
+                    "recovery_target": {"waypoint": {"type": "joint", "angles_deg": [0, 35, 15, 0]}},
+                },
+            ],
+            "open",
+            "release_unconfirmed",
+            "close gripper",
+        ),
+        (
+            "drop_retreat",
+            [
+                {
+                    "kind": "tool",
+                    "label": "close gripper",
+                    "phase": "grip",
+                    "action": "close",
+                    "hold_transition": "possibly_held",
+                },
+                {
+                    "kind": "tool",
+                    "label": "open gripper",
+                    "phase": "release",
+                    "action": "open",
+                    "hold_transition": "release_unconfirmed",
+                },
+                {
+                    "kind": "move",
+                    "label": "lift from dropoff",
+                    "phase": "drop_retreat",
+                    "safe_retreat_available": True,
+                    "recovery_target": {"waypoint": {"type": "joint", "angles_deg": [0, 35, 15, 0]}},
+                    "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0, 35, 15, 0]},
+                },
+            ],
+            None,
+            "release_unconfirmed",
+            "open gripper",
+        ),
+    ],
+)
+def test_abort_reports_phase_hold_state_last_step_and_recovery(
+    monkeypatch,
+    phase,
+    steps,
+    blocked_action,
+    expected_hold,
+    last_completed,
+):
+    preview = configure_task_runtime(monkeypatch, {"execution_strategy": "batch_once", "max_objects": 1})
+    main.state.known_pose = True
+
+    async def fake_broadcast():
+        return None
+
+    async def fake_tool_action(action, value=None):
+        if action == blocked_action:
+            await asyncio.sleep(60)
+        return {"ok": True}
+
+    def fake_build_preview(**kwargs):
+        return {"ok": True, "preview": {"trajectory": {"mode": "program"}}}
+
+    async def blocking_execute(_preview):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "apply_tool_action", fake_tool_action)
+    monkeypatch.setattr(main, "build_preview", fake_build_preview)
+    monkeypatch.setattr(main, "execute_waypoint_path", blocking_execute)
+
+    async def run_and_stop():
+        main.task_task = asyncio.create_task(
+            main.execute_task_sequence({"steps": steps}, preview["settings"], preview["branch"])
+        )
+        for _ in range(100):
+            current = (main.state.task_execution.get("current_step") or {}).get("phase")
+            if current == phase:
+                break
+            await asyncio.sleep(0.01)
+        assert (main.state.task_execution.get("current_step") or {}).get("phase") == phase
+        await main.stop_task()
+
+    asyncio.run(run_and_stop())
+
+    execution = main.state.task_execution
+    assert execution["status"] == "stopped"
+    assert execution["current_step"]["phase"] == phase
+    assert execution["object_hold_state"] == expected_hold
+    assert execution["holding_uncertain"] is (expected_hold != "none")
+    assert execution["safe_retreat_available"] is True
+    assert execution["recovery_options"]
+    if last_completed is None:
+        assert execution["last_completed_step"] is None
+    else:
+        assert execution["last_completed_step"]["label"] == last_completed
 
 
 def test_task_motion_fault_is_reported_as_failed(monkeypatch):
@@ -539,6 +717,134 @@ def test_task_preview_carries_program_motion_contract(monkeypatch):
     assert contract["limits"]["path_mode"] == "program"
     assert contract["limits"]["segment_limits"]
     assert contract["limits"]["limiting_constraint"]["type"] in {"speed", "acceleration", "waypoint_rate"}
+
+
+def test_task_preview_binds_detection_pose_model_settings_and_destinations(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    client.post(
+        "/api/simulation/vision/queue",
+        json={"frames": [{"detections": [detection("red", detection_id="r1")]}]},
+    )
+    frame = client.get("/api/vision/frame").json()
+
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": frame["detections"],
+            "detection_snapshot_id": frame["detection_snapshot_id"],
+            "detection_captured_at": frame["captured_at"],
+            "task_settings": {"execution_strategy": "closed_loop", "max_objects": 1},
+        },
+    ).json()
+
+    assert payload["ok"], payload
+    bindings = payload["task_preview"]["bindings"]
+    assert bindings["detection_snapshot_id"] == frame["detection_snapshot_id"]
+    assert bindings["detection_captured_at"] == frame["captured_at"]
+    assert bindings["pose_revision"] == main.state.pose_revision
+    assert bindings["config_id"] == main.RUNNING_CONFIG_ID
+    assert bindings["model_fingerprint"] == main.robot_model_fingerprint()
+    assert bindings["task_settings_revision"]
+    assert bindings["destination_revision"] == main.task_mapping_fingerprint()
+
+
+def test_task_execute_rejects_preview_after_detection_snapshot_changes(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    client.post(
+        "/api/simulation/vision/queue",
+        json={"frames": [{"detections": [detection("red", detection_id="r1")]}]},
+    )
+    frame = client.get("/api/vision/frame").json()
+    preview = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": frame["detections"],
+            "detection_snapshot_id": frame["detection_snapshot_id"],
+            "detection_captured_at": frame["captured_at"],
+            "task_settings": {"execution_strategy": "closed_loop", "max_objects": 1},
+        },
+    ).json()
+    assert preview["ok"], preview
+
+    client.post(
+        "/api/simulation/vision/queue",
+        json={"frames": [{"detections": [detection("blue", detection_id="b1")]}]},
+    )
+    client.get("/api/vision/frame")
+    payload = client.post("/api/task/execute", json={"preview_id": preview["preview_id"]}).json()
+
+    assert payload["ok"] is False
+    assert "detection snapshot changed" in payload["error"]
+
+
+def test_task_execute_rejects_modified_task_settings_contract(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    preview = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": [detection("red", detection_id="r1")],
+            "task_settings": {"execution_strategy": "batch_once", "max_objects": 1},
+        },
+    ).json()
+    assert preview["ok"], preview
+    main.task_previews[preview["preview_id"]]["task_settings"]["pickup_z_mm"] += 1.0
+
+    payload = client.post("/api/task/execute", json={"preview_id": preview["preview_id"]}).json()
+
+    assert payload["ok"] is False
+    assert "task settings changed" in payload["error"]
+
+
+def test_task_execute_rejects_preview_after_destination_mapping_changes(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    preview = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": [detection("red", detection_id="r1")],
+            "task_settings": {"execution_strategy": "batch_once", "max_objects": 1},
+        },
+    ).json()
+    assert preview["ok"], preview
+    changed_raw = deepcopy(config.raw)
+    changed_raw["color_profiles"]["red"]["drop_zone"] = "dropoff_b"
+    monkeypatch.setattr(main, "config", replace(config, raw=changed_raw))
+
+    payload = client.post("/api/task/execute", json={"preview_id": preview["preview_id"]}).json()
+
+    assert payload["ok"] is False
+    assert "destinations or color mappings changed" in payload["error"]
 
 
 @pytest.mark.parametrize(

@@ -55,7 +55,7 @@ FRAME_DEFINITIONS: list[dict[str, str]] = [
     {
         "id": "robot_base",
         "label": "Robot base",
-        "definition": "Origin is the base rotation axis on the mounting/workspace Z=0 reference. +X sideways, +Y forward, +Z up.",
+        "definition": "Origin is the declared base mounting reference. +X sideways, +Y forward, +Z up. The work plate may have a non-zero Z in this frame.",
     },
     {
         "id": "dh_frame_4",
@@ -75,7 +75,7 @@ FRAME_DEFINITIONS: list[dict[str, str]] = [
     {
         "id": "workspace_plane",
         "label": "Workspace plane",
-        "definition": "Planar robot-frame X/Y map used by camera detections. It does not define arm reach by itself.",
+        "definition": "Planar robot-frame X/Y map used by camera detections, with Z declared separately by calibration.measurement_reference.workspace_plane_z_mm.",
     },
     {
         "id": "camera_image",
@@ -248,6 +248,7 @@ def model_truth_summary(config: RobotConfig, fk: dict[str, Any] | None = None) -
         "transform_chain": deepcopy(TRANSFORM_CHAIN),
         "frames": deepcopy(FRAME_DEFINITIONS),
         "active_tool": _active_tool(config),
+        "measurement_reference": deepcopy(calibration_settings(config).get("measurement_reference", {})),
         "joint_conventions": joint_convention_table(config),
         "dh_rows": [asdict(row) for row in config.kinematics.dh_rows],
         "calibration_layers": [
@@ -256,6 +257,7 @@ def model_truth_summary(config: RobotConfig, fk: dict[str, Any] | None = None) -
             {"id": "actuator_mapping", "label": "Actuator zero/sign/gearing", "source": "joints[].zero_offset_deg, direction_sign, hardware"},
             {"id": "tool_tcp", "label": "Tool TCP dimensions", "source": "tools.presets.*.tcp_offset_mm"},
             {"id": "workspace", "label": "Camera/workspace map", "source": "camera.calibration.workspace_aruco"},
+            {"id": "measurement_reference", "label": "Workspace/TCP measurement reference", "source": "calibration.measurement_reference"},
             {"id": "command_correction", "label": "Cartesian command correction", "source": "kinematics_calibration"},
         ],
         "z_audit_order": list(Z_AUDIT_ORDER),

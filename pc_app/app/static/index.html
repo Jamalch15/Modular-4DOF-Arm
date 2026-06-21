@@ -149,7 +149,7 @@
                   <div class="section-header">
                     <div>
                       <h2>Detect</h2>
-                      <p class="hint">Use the existing camera popup and vision pipeline. Capture never starts motion.</p>
+                      <p class="hint">Capture, inspect, and optionally select detections. If none are selected, all eligible detections are planned. Capture never starts motion.</p>
                     </div>
                   </div>
                   <div class="button-row action-row">
@@ -298,7 +298,7 @@
                   <div class="section-header">
                     <div>
                       <h2>Run</h2>
-                      <p class="hint">Closed-loop progress, current step, capture status, and stop behavior.</p>
+                      <p class="hint">Closed-loop progress, current and last-completed steps, hold uncertainty, and recovery options.</p>
                     </div>
                     <button id="taskStopBtn" class="warn" type="button">Stop Task</button>
                   </div>
@@ -335,6 +335,7 @@
                       <span class="toggle-text">Auto phi</span>
                     </label>
                   </div>
+                  <p class="field-help">Auto phi prioritizes reachable tool angles below -90&deg; for a downward-forward orientation.</p>
                   <div class="button-row action-row">
                     <button id="previewIkBtn" type="button" class="primary">Preview</button>
                     <button id="executeIkBtn" type="button" disabled>Execute</button>
@@ -403,7 +404,7 @@
                   <div class="program-library-group">
                     <div class="subsection-heading">
                       <h3>Built-in demos</h3>
-                      <p class="hint">Read-only templates. Preview is required before every run.</p>
+                      <p class="hint">Read-only templates. Copy one to save and automatically reuse its compiled plan.</p>
                     </div>
                     <div id="builtInProgramList" class="program-library-list"></div>
                   </div>
@@ -470,7 +471,7 @@
                     </div>
                   </div>
                   <div class="program-preview-controls">
-                    <button id="previewProgramBtn" type="button" class="primary">Plan and preview full program</button>
+                    <button id="previewProgramBtn" type="button" class="primary">Plan full program</button>
                   </div>
                   <div id="programPreviewSummary" class="program-preview-summary"></div>
                   <div id="programPlayback" class="program-playback" aria-live="polite">
@@ -494,7 +495,7 @@
                       </label>
                     </div>
                   </div>
-                  <p class="program-execute-hint">Playback is visual only. Execute remains locked until this exact full-program preview is valid.</p>
+                  <p class="program-execute-hint">Playback is visual only. A saved user program keeps its valid plan for reuse from the same starting pose.</p>
                 </section>
 
                 <section class="panel-section task-rail task-step-panel program-run-panel" data-program-panel="run" hidden>
@@ -733,8 +734,8 @@
                 <section class="panel-section settings-section" id="settingsTcpCalibration">
                   <div class="section-header">
                     <div>
-                      <h2>Cartesian TCP calibration</h2>
-                      <p class="hint">Fits a tool-specific command correction in the robot base frame. FK and joint-space commands remain unchanged.</p>
+                      <h2>Cartesian accuracy calibration</h2>
+                      <p class="hint">Audit the physical model first. Residual command correction is a separate final layer and does not prove the DH model is correct.</p>
                     </div>
                     <span id="tcpCalibrationStatus" class="status-chip">Disabled</span>
                   </div>
@@ -745,26 +746,48 @@
                   </div>
 
                   <div class="subsection-heading">
-                    <h3>1. Generate and move to targets</h3>
-                    <p class="hint">Fit moves are intentionally uncorrected. Validation moves use the fitted correction.</p>
+                    <h3>1. Verify reference frame and tool</h3>
+                    <p class="hint">Confirm the physical point and Z datum before collecting data. The workflow rejects samples from stale tools, models, or references.</p>
                   </div>
+                  <div id="tcpCalibrationReferenceStatus" class="path-summary"></div>
                   <div class="settings-field-grid tcp-calibration-grid">
-                    <label>Grid rows <input id="tcpCalRowsInput" type="number" min="1" max="10" step="1" value="3" /></label>
-                    <label>Grid columns <input id="tcpCalColumnsInput" type="number" min="1" max="10" step="1" value="4" /></label>
-                    <label>Workspace margin <span class="input-with-unit"><input id="tcpCalMarginInput" type="number" min="0" step="1" value="25" /><span>mm</span></span></label>
-                    <label>Target Z <span class="input-with-unit"><input id="tcpCalTargetZInput" type="number" step="1" value="45" /><span>mm</span></span></label>
-                    <label>Tool pitch <span class="input-with-unit"><input id="tcpCalTargetPhiInput" type="number" step="1" value="0" /><span>deg</span></span></label>
+                    <label>Workspace plane Z in robot base
+                      <span class="input-with-unit"><input id="tcpCalWorkspacePlaneZInput" type="number" step="0.1" value="0" /><span>mm</span></span>
+                    </label>
+                    <label>Measured physical point
+                      <select id="tcpCalMeasuredPointSelect">
+                        <option value="active_tcp">Active tool TCP</option>
+                      </select>
+                    </label>
+                    <label>Approach direction
+                      <select id="tcpCalApproachSelect">
+                        <option value="unknown">Not controlled</option>
+                        <option value="positive_z">From +Z</option>
+                        <option value="negative_z">From -Z</option>
+                        <option value="radial_out">Radially outward</option>
+                        <option value="radial_in">Radially inward</option>
+                      </select>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="tcpCalReferenceConfirmInput" type="checkbox" />
+                      <span class="toggle-text">I verified the TCP point and robot-base Z reference</span>
+                    </label>
+                  </div>
+
+                  <div class="subsection-heading">
+                    <h3>2. Collect fit and held-out validation samples</h3>
+                    <p class="hint">The app automatically chooses valid joint poses spanning X/Y, height, and tool pitch. This avoids fitting a weak dataset or asking the operator to understand which Z/Phi combinations are informative.</p>
                   </div>
                   <div class="button-row calibration-actions">
-                    <button id="tcpCalGenerateBtn" type="button">Generate targets</button>
+                    <button id="tcpCalGenerateBtn" type="button">Generate automatic target set</button>
                   </div>
                   <div id="tcpCalibrationTargetList" class="program-list compact-list"></div>
 
                   <div class="settings-field-grid tcp-calibration-grid">
-                    <label>Target X <span class="input-with-unit"><input id="tcpCalXInput" type="number" step="1" /><span>mm</span></span></label>
-                    <label>Target Y <span class="input-with-unit"><input id="tcpCalYInput" type="number" step="1" /><span>mm</span></span></label>
-                    <label>Target Z <span class="input-with-unit"><input id="tcpCalZInput" type="number" step="1" /><span>mm</span></span></label>
-                    <label>Phi <span class="input-with-unit"><input id="tcpCalPhiInput" type="number" step="1" /><span>deg</span></span></label>
+                    <label>Selected X <span class="input-with-unit"><input id="tcpCalXInput" type="number" readonly /><span>mm</span></span></label>
+                    <label>Selected Y <span class="input-with-unit"><input id="tcpCalYInput" type="number" readonly /><span>mm</span></span></label>
+                    <label>Automatic Z <span class="input-with-unit"><input id="tcpCalZInput" type="number" readonly /><span>mm</span></span></label>
+                    <label>Automatic Phi <span class="input-with-unit"><input id="tcpCalPhiInput" type="number" readonly /><span>deg</span></span></label>
                   </div>
                   <div class="button-row calibration-actions">
                     <button id="tcpCalPreviewFitBtn" type="button">Preview fit move</button>
@@ -774,7 +797,7 @@
                   <p id="tcpCalibrationMoveStatus" class="field-help">No calibration move previewed.</p>
 
                   <div class="subsection-heading">
-                    <h3>2. Measure and save sample</h3>
+                    <h3>3. Measure and save sample</h3>
                     <p class="hint">Camera X/Y and manual or touch-off Z are noisy measurements. Confirm the marker and coordinate frame before saving.</p>
                   </div>
                   <div class="settings-field-grid tcp-calibration-grid">
@@ -800,8 +823,27 @@
                   <p id="tcpCalibrationMeasurementStatus" class="field-help">Manual XY entry is available if vision cannot isolate the TCP marker.</p>
 
                   <div class="subsection-heading">
-                    <h3>3. Fit, enable, and validate</h3>
-                    <p class="hint">Affine XY plus Z offset needs at least four non-collinear fit samples. Constant XYZ needs at least two.</p>
+                    <h3>4. Diagnose and fit the physical model</h3>
+                    <p class="hint">Only identifiable parameter groups are fitted. Updates are proposals until explicitly applied while disarmed.</p>
+                  </div>
+                  <div class="settings-field-grid tcp-calibration-grid">
+                    <label>Physical model parameter group
+                      <select id="tcpCalPhysicalModelSelect">
+                        <option value="joint_zeros">DH joint zero offsets</option>
+                        <option value="geometry_basic">Base height/side and main link lengths</option>
+                        <option value="joint_zeros_geometry">Joint zeros + basic geometry</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="tcpCalFitPhysicalBtn" type="button">Fit physical-model candidate</button>
+                    <button id="tcpCalApplyPhysicalBtn" class="warn" type="button" disabled>Apply accepted model update</button>
+                  </div>
+                  <div id="tcpCalibrationPhysicalMetrics" class="path-summary"></div>
+
+                  <div class="subsection-heading">
+                    <h3>5. Fit optional residual command correction</h3>
+                    <p class="hint">Requires held-out validation, fresh signatures, acceptable correction magnitude, and explicit enablement.</p>
                   </div>
                   <div class="settings-field-grid tcp-calibration-grid">
                     <label>Calibration model

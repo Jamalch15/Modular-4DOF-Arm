@@ -127,6 +127,26 @@ def test_plan_uses_configured_tcp_z_phi_and_linear_near_object_modes():
     assert modes["dropoff"] == "linear"
 
 
+def test_every_generated_move_exposes_frame_mode_height_and_recovery_phase():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    plan = build_color_sorting_plan(
+        config,
+        [detection("red", 0, 180, detection_id="r1")],
+        color_profiles(config),
+        task_settings={"execution_strategy": "batch_once"},
+    )
+
+    assert plan["ok"]
+    moves = [step for step in plan["steps"] if step["kind"] == "move"]
+    assert moves
+    for step in moves:
+        assert step["target_frame"] == "robot_base"
+        assert step["movement_mode"] in {"joint", "linear"}
+        assert isinstance(step["height_mm"], float)
+        assert step["phase"]
+        assert isinstance(step["safe_retreat_available"], bool)
+
+
 def test_per_color_object_profile_overrides_z_and_phi():
     config = load_config(EXAMPLE_CONFIG_PATH)
     plan = build_color_sorting_plan(
@@ -365,7 +385,7 @@ def test_missing_active_tool_preset_is_a_planning_error():
     assert "active tool vacuum is missing" in plan["error"]
 
 
-def test_closed_loop_validates_enabled_color_mappings_before_capture():
+def test_closed_loop_only_requires_mappings_for_colors_in_the_fresh_capture():
     config = load_config(EXAMPLE_CONFIG_PATH)
     profiles = {
         **color_profiles(config),
@@ -379,8 +399,8 @@ def test_closed_loop_validates_enabled_color_mappings_before_capture():
         task_settings={"execution_strategy": "closed_loop", "missing_drop_zone_policy": "error"},
     )
 
-    assert not plan["ok"]
-    assert "missing drop zone missing_zone for enabled color green" in plan["error"]
+    assert plan["ok"]
+    assert plan["objects"][0]["color"] == "red"
 
 
 def test_batch_mode_only_requires_drop_zones_for_relevant_detections():

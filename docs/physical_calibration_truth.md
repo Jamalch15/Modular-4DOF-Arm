@@ -38,11 +38,14 @@ theta = q * direction_sign + zero_offset_deg + theta_offset_deg
 
 ## Frames
 
-- Robot base: robot-frame millimeters, `+X` sideways, `+Y` forward, `+Z` up.
+- Robot base: declared base mounting reference in millimeters, `+X` sideways,
+  `+Y` forward, `+Z` up.
 - DH frame 4 / wrist-flange: final DH frame before tool offset.
 - Tool frame: origin at flange; tool `+Z` is the configured forward direction.
 - TCP: Cartesian FK/IK point used by previews, tasks, and programs.
-- Workspace plane: camera-calibrated robot X/Y plane, not the full reach limit.
+- Workspace plane: camera-calibrated robot X/Y plane with its robot-base Z
+  stored separately in `calibration.measurement_reference`; not the full reach
+  limit.
 - Camera/image: pixel frame transformed into workspace X/Y by calibration.
 
 ## Z Error Audit Order
@@ -58,6 +61,34 @@ For the current observed low-Z error, audit in this order:
 6. DH signs and offsets.
 7. Repeatability, backlash, and compliance.
 8. Cartesian command correction, only after the model is accepted.
+
+## Current Local Evidence
+
+The saved June 19, 2026 magnet samples are legacy/unsigned samples and must be
+recaptured with the staged workflow before they can enable correction.
+Nevertheless, they are useful diagnostic evidence:
+
+- four fit samples have approximately -30.4 mm mean Z residual with about
+  1.8 mm standard deviation;
+- FK-to-command error is below about 0.7 mm;
+- the samples use tool pitch near 0 degrees, where the modeled tool-forward
+  axis has almost no vertical component;
+- therefore the configured forward TCP length alone is unlikely to explain
+  the observed 30 mm vertical error in those poses;
+- a repeated nominal target differs by roughly 7 mm in measured Z, so
+  repeatability and measurement procedure also require attention;
+- the affine residual fit fails the held-out validation sample and should not
+  be enabled.
+
+Working diagnosis order for new measurements:
+
+1. robot-base versus work-plate Z datum;
+2. measured physical point and contact/marker offset;
+3. shoulder/elbow reference and actuator mapping;
+4. base height and DH/model geometry;
+5. tool TCP using poses with meaningful pitch variation;
+6. backlash/compliance and direction-dependent repeatability;
+7. residual command correction only after held-out validation.
 
 ## Measurement Sheet
 

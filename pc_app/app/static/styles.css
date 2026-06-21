@@ -680,6 +680,37 @@ code {
   gap: 6px;
 }
 
+.task-generated-steps,
+.task-recovery-options {
+  display: grid;
+  gap: 7px;
+}
+
+.task-generated-step {
+  display: grid;
+  grid-template-columns: 28px minmax(110px, 0.7fr) minmax(180px, 1fr) minmax(90px, 0.5fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(13, 19, 29, 0.7);
+}
+
+.task-generated-step span,
+.task-generated-step code,
+.task-generated-step small,
+.task-recovery-options div {
+  color: var(--muted);
+}
+
+.task-recovery-options {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(13, 19, 29, 0.7);
+}
+
 .ignored-list div,
 .assigned-targets span {
   display: flex;

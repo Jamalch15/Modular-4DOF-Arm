@@ -38,6 +38,8 @@ const state = {
   programPreview: null,
   programPreviewFailure: null,
   programPreviewPending: false,
+  programPlanRestorePending: false,
+  programSavedPlanStatus: "",
   programHasPreviewed: false,
   programExecutionActive: false,
   programExecutionAwaitingStart: false,
@@ -72,6 +74,7 @@ const state = {
   selectedSerialPort: null,
   latestDetections: [],
   taskDetectionsCapturedAt: null,
+  taskDetectionSnapshotId: null,
   activeTaskStep: "setup",
   taskProgressStep: "setup",
   taskColorProfilesDraft: null,
@@ -111,6 +114,7 @@ const state = {
   tcpCalibrationTargets: [],
   tcpCalibrationMove: null,
   tcpCalibrationMeasurementSource: { xy: "manual", z: "manual" },
+  tcpCalibrationPhysicalResult: null,
   versionTimer: null,
 };
 
@@ -383,11 +387,6 @@ const elements = {
   tcpCalibrationStatus: $("#tcpCalibrationStatus"),
   tcpCalibrationWorkspaceStatus: $("#tcpCalibrationWorkspaceStatus"),
   tcpCalibrationModelStatus: $("#tcpCalibrationModelStatus"),
-  tcpCalRowsInput: $("#tcpCalRowsInput"),
-  tcpCalColumnsInput: $("#tcpCalColumnsInput"),
-  tcpCalMarginInput: $("#tcpCalMarginInput"),
-  tcpCalTargetZInput: $("#tcpCalTargetZInput"),
-  tcpCalTargetPhiInput: $("#tcpCalTargetPhiInput"),
   tcpCalGenerateBtn: $("#tcpCalGenerateBtn"),
   tcpCalibrationTargetList: $("#tcpCalibrationTargetList"),
   tcpCalXInput: $("#tcpCalXInput"),
@@ -410,6 +409,15 @@ const elements = {
   tcpCalUseTouchOffBtn: $("#tcpCalUseTouchOffBtn"),
   tcpCalSaveSampleBtn: $("#tcpCalSaveSampleBtn"),
   tcpCalibrationMeasurementStatus: $("#tcpCalibrationMeasurementStatus"),
+  tcpCalibrationReferenceStatus: $("#tcpCalibrationReferenceStatus"),
+  tcpCalWorkspacePlaneZInput: $("#tcpCalWorkspacePlaneZInput"),
+  tcpCalMeasuredPointSelect: $("#tcpCalMeasuredPointSelect"),
+  tcpCalApproachSelect: $("#tcpCalApproachSelect"),
+  tcpCalReferenceConfirmInput: $("#tcpCalReferenceConfirmInput"),
+  tcpCalPhysicalModelSelect: $("#tcpCalPhysicalModelSelect"),
+  tcpCalFitPhysicalBtn: $("#tcpCalFitPhysicalBtn"),
+  tcpCalApplyPhysicalBtn: $("#tcpCalApplyPhysicalBtn"),
+  tcpCalibrationPhysicalMetrics: $("#tcpCalibrationPhysicalMetrics"),
   tcpCalModelSelect: $("#tcpCalModelSelect"),
   tcpCalEnableInput: $("#tcpCalEnableInput"),
   tcpCalFitBtn: $("#tcpCalFitBtn"),
@@ -647,7 +655,7 @@ function clonePlain(value) {
   return JSON.parse(JSON.stringify(value || {}));
 }
 
-const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_destinations"]);
+const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_destinations", "calibration"]);
 const CORE_POSITION_IDS = new Set(["home"]);
 
 function savedSettingsDetail() {
@@ -1312,6 +1320,7 @@ function renderModelTruthSummary() {
   `;
   elements.modelTruthSummary.innerHTML = `
     <div class="log-line"><span>Active tool</span><code>${escapeHtml(tool.label || tool.name || "-")} (${escapeHtml(tool.type || "generic")}) TCP ${formatPoint(tool.tcp_offset_mm || {}, 1)} mm</code></div>
+    <div class="log-line"><span>Workspace plane Z</span><code>${format(truth.measurement_reference?.workspace_plane_z_mm, 2)} mm in robot base</code></div>
     <div class="log-line"><span>Tool mapping</span><code>tool +Z -> local DH +X; command correction does not change FK</code></div>
     ${currentFrameHtml}
     <div class="model-truth-chain">
@@ -1672,6 +1681,7 @@ function invalidateTaskPreview(reason = "") {
 function invalidateTaskDetections(reason = "Refresh detections before planning") {
   state.latestDetections = [];
   state.taskDetectionsCapturedAt = null;
+  state.taskDetectionSnapshotId = null;
   state.selectedDetectionIds.clear();
   state.view?.setObjectDetections([]);
   renderDetectionList([]);
@@ -2540,6 +2550,7 @@ function renderTaskSummary(sequence, preview) {
   const taskPreview = sequence?.task_preview || state.lastTaskPreview || {};
   const warnings = taskPreview.warnings || [];
   const normalized = taskPreview.normalized_settings || {};
+  const bindings = taskPreview.bindings || preview?.task_bindings || {};
   const calibrationApplied = Array.isArray(preview?.calibration)
     && preview.calibration.some((item) => item.applied);
   const orientation = normalized.orientation_policy === "fixed"
@@ -2554,6 +2565,8 @@ function renderTaskSummary(sequence, preview) {
     <div class="log-line"><span>Objects</span><code>${taskPreview.selected_objects?.length || sequence?.object_count || 0}</code></div>
     <div class="log-line"><span>TCP Z</span><code>pick ${format(normalized.pickup_z_mm)} / drop ${format(normalized.dropoff_z_mm)} mm</code></div>
     <div class="log-line"><span>Orientation</span><code>${orientation}</code></div>
+    <div class="log-line"><span>Detection snapshot</span><code>${bindings.detection_snapshot_id || "-"}</code></div>
+    <div class="log-line"><span>Active tool</span><code>${taskPreview.active_tool || "-"} / ${taskPreview.tool_type || "-"}</code></div>
     <div class="log-line"><span>Warnings</span><code>${warnings.length ? warnings.join("; ") : "-"}</code></div>
   `;
 }
@@ -2564,6 +2577,7 @@ function renderTaskPlanPreview(taskPreview = {}, sequence = {}) {
   const ignored = taskPreview.ignored_detections || sequence.ignored_detections || [];
   const assigned = taskPreview.assigned_targets || [];
   const modes = taskPreview.motion_modes || {};
+  const steps = sequence.steps || [];
   if (!objects.length && !ignored.length) {
     elements.taskPlanPreview.innerHTML = `<div class="empty-state">No planned objects yet.</div>`;
     return;
@@ -2600,6 +2614,17 @@ function renderTaskPlanPreview(taskPreview = {}, sequence = {}) {
     </div>
     ${assigned.length ? `<div class="assigned-targets">${assigned.map((item) => `<span>${item.color || "object"} → ${item.drop_zone}${item.grid_slot ? ` / slot ${item.grid_slot.index + 1}` : ""}</span>`).join("")}</div>` : ""}
   `;
+  elements.taskPlanPreview.insertAdjacentHTML("beforeend", `
+    <div class="task-generated-steps">
+      <h3>Generated sequence</h3>
+      ${steps.map((step, index) => {
+        const moveDetail = step.kind === "move"
+          ? `${step.target_frame || "-"} · ${step.movement_mode || step.waypoint?.mode || "-"} · z ${step.height_mm == null ? "-" : format(step.height_mm)} mm`
+          : `tool action · ${step.action || "-"}`;
+        return `<div class="task-generated-step"><span>${index + 1}</span><strong>${escapeHtml(step.label || step.kind || "step")}</strong><code>${escapeHtml(moveDetail)}</code><small>${escapeHtml(step.phase || "-")}</small></div>`;
+      }).join("") || `<div class="empty-state">No generated steps.</div>`}
+    </div>
+  `);
 }
 
 async function previewTask() {
@@ -2632,6 +2657,8 @@ async function previewTask() {
       ? {
           task,
           detections: state.latestDetections,
+          detection_snapshot_id: state.taskDetectionSnapshotId,
+          detection_captured_at: state.taskDetectionsCapturedAt,
           task_settings: taskSettings,
           selected_detection_ids: selectedIds,
           settings: motionSettings,
@@ -2680,6 +2707,7 @@ async function executeTask() {
     state.taskPreviewId = null;
     state.taskPreviewCreatedAt = null;
     state.taskDetectionsCapturedAt = null;
+    state.taskDetectionSnapshotId = null;
     state.latestDetections = [];
     state.selectedDetectionIds.clear();
     state.view?.setObjectDetections([]);
@@ -2824,7 +2852,8 @@ async function detectVision() {
       return;
     }
     state.latestDetections = payload.detections || [];
-    state.taskDetectionsCapturedAt = Date.now() / 1000;
+    state.taskDetectionsCapturedAt = payload.captured_at || Date.now() / 1000;
+    state.taskDetectionSnapshotId = payload.detection_snapshot_id || null;
     ensureDetectedColorDrafts(state.latestDetections, { markDirty: true });
     state.selectedDetectionIds.clear();
     invalidateTaskPreview("Detections refreshed");
@@ -3173,7 +3202,7 @@ function renderTcpCalibrationTargets() {
   if (!elements.tcpCalibrationTargetList) return;
   elements.tcpCalibrationTargetList.innerHTML = "";
   if (!state.tcpCalibrationTargets.length) {
-    elements.tcpCalibrationTargetList.innerHTML = `<div class="empty-state">Generate a workspace grid or enter one target manually.</div>`;
+    elements.tcpCalibrationTargetList.innerHTML = `<div class="empty-state">Generate an automatic model-aware target set.</div>`;
     return;
   }
   state.tcpCalibrationTargets.forEach((point, index) => {
@@ -3182,7 +3211,7 @@ function renderTcpCalibrationTargets() {
     item.className = `program-item ${point.reachable ? "" : "invalid"}`;
     item.innerHTML = `
       <div class="program-title">
-        <span>Point ${index + 1}</span>
+        <span>Point ${index + 1} · ${point.recommended_role || "fit"}</span>
         <span>${point.reachable ? "reachable" : "IK blocked"}</span>
       </div>
       <code>x ${format(target.x_mm, 1)}, y ${format(target.y_mm, 1)}, z ${format(target.z_mm, 1)}, phi ${format(target.phi_deg, 1)}</code>
@@ -3198,26 +3227,50 @@ function renderTcpCalibration() {
   const settings = summary.settings || {};
   const profile = summary.active_profile || {};
   const result = profile.result || null;
+  const physicalResult = profile.physical_model_result || state.tcpCalibrationPhysicalResult || null;
   const workspace = summary.workspace || {};
+  const freshness = summary.freshness || {};
+  const activation = summary.activation || {};
+  const coverage = summary.coverage || result?.coverage || {};
+  const reference = summary.context?.measurement_reference || state.config?.calibration?.measurement_reference || {};
   const samples = Array.isArray(profile.samples) ? profile.samples : [];
   const enabled = Boolean(summary.enabled);
-  elements.tcpCalibrationStatus.textContent = enabled ? "Enabled" : result ? "Fitted, disabled" : "Not fitted";
+  elements.tcpCalibrationStatus.textContent = enabled
+    ? "Correction enabled"
+    : freshness.fresh === false && result
+      ? "Stale, disabled"
+      : result
+        ? "Fitted, disabled"
+        : "Audit required";
   elements.tcpCalibrationStatus.classList.toggle("ready", enabled);
-  elements.tcpCalibrationStatus.classList.toggle("warning", !enabled && Boolean(result));
+  elements.tcpCalibrationStatus.classList.toggle("warning", !enabled && Boolean(result || freshness.fresh === false));
   elements.tcpCalEnableInput.checked = Boolean(settings.enabled && profile.enabled);
+  elements.tcpCalEnableInput.disabled = !activation.eligible;
   elements.tcpCalModelSelect.value = profile.model_type || settings.default_model || "affine_xy_z_offset";
+  if (elements.tcpCalWorkspacePlaneZInput && document.activeElement !== elements.tcpCalWorkspacePlaneZInput) {
+    elements.tcpCalWorkspacePlaneZInput.value = format(reference.workspace_plane_z_mm ?? 0, 2);
+  }
+  if (elements.tcpCalMeasuredPointSelect) elements.tcpCalMeasuredPointSelect.value = reference.measured_point || "active_tcp";
 
   elements.tcpCalibrationWorkspaceStatus.innerHTML = `
     <div class="log-line"><span>Workspace map</span><code>${workspace.calibrated ? "saved" : "not calibrated"}</code></div>
     <div class="log-line"><span>Source</span><code>${workspace.source || "-"}</code></div>
     <div class="log-line"><span>Tool profile</span><code>${summary.active_profile_key || state.config?.tools?.active || "-"}</code></div>
     <div class="log-line"><span>Frame</span><code>robot base XYZ, mm; +Z upward</code></div>
+    <div class="log-line"><span>Workspace plane Z</span><code>${format(reference.workspace_plane_z_mm, 2)} mm in robot base</code></div>
   `;
   elements.tcpCalibrationModelStatus.innerHTML = `
     <div class="log-line"><span>Model</span><code>${profile.model_type || "not fitted"}</code></div>
     <div class="log-line"><span>Fit samples</span><code>${samples.filter((sample) => sample.role !== "validation").length}</code></div>
     <div class="log-line"><span>Validation samples</span><code>${samples.filter((sample) => sample.role === "validation").length}</code></div>
     <div class="log-line"><span>Result</span><code>${result?.fit?.status || "not run"}</code></div>
+    <div class="log-line"><span>Profile freshness</span><code>${freshness.fresh ? "current" : (freshness.messages || ["not fitted"]).join("; ")}</code></div>
+  `;
+  elements.tcpCalibrationReferenceStatus.innerHTML = `
+    <div class="log-line"><span>Active tool/TCP</span><code>${summary.context?.tool?.tool || "-"} · x ${format(summary.context?.tool?.tcp_offset_mm?.x, 1)}, y ${format(summary.context?.tool?.tcp_offset_mm?.y, 1)}, z ${format(summary.context?.tool?.tcp_offset_mm?.z, 1)} mm</code></div>
+    <div class="log-line"><span>Joint authority</span><code>${state.robotState?.simulation ? "simulation" : state.robotState?.encoder_available === "1111" ? "measured encoders" : "estimated/open-loop"}</code></div>
+    <div class="log-line"><span>Measured point</span><code>${reference.measured_point || "active_tcp"}</code></div>
+    <div class="log-line"><span>Reference check</span><code>${elements.tcpCalReferenceConfirmInput?.checked ? "operator confirmed" : "confirmation required before preview"}</code></div>
   `;
 
   const fit = result?.fit || summary.fit_quality;
@@ -3229,7 +3282,26 @@ function renderTcpCalibration() {
     <div class="log-line"><span>Validation landing</span><code>${tcpMetricText(validation?.landing)} (${validation?.status || "not run"})</code></div>
     <div class="log-line"><span>Worst fit</span><code>${(fit?.worst_samples || []).slice(0, 3).map((item) => `${item.id}: ${format(item.error_xy_mm, 1)} XY`).join(" | ") || "-"}</code></div>
     <div class="log-line"><span>Diagnostics</span><code>${diagnostics.join(" | ") || "No fitted diagnostics yet."}</code></div>
+    <div class="log-line"><span>Coverage</span><code>XY ${format(coverage.xy_span_mm, 1)} mm · Z ${format(coverage.z_span_mm, 1)} mm · Phi ${format(coverage.phi_span_deg, 1)}°</code></div>
+    <div class="log-line"><span>Activation gate</span><code>${activation.eligible ? "eligible" : (activation.reasons || ["fit and validate first"]).join("; ")}</code></div>
   `;
+
+  if (elements.tcpCalibrationPhysicalMetrics) {
+    const parameters = physicalResult?.parameters || [];
+    elements.tcpCalibrationPhysicalMetrics.innerHTML = physicalResult
+      ? `
+        <div class="log-line"><span>Candidate</span><code>${physicalResult.parameter_group || "-"}</code></div>
+        <div class="log-line"><span>Parameter deltas</span><code>${parameters.map((item) => `${item.name} ${format(item.delta, 3)} ${item.unit}`).join(" | ") || "-"}</code></div>
+        <div class="log-line"><span>Fit before/after</span><code>${tcpMetricText(physicalResult.fit?.before)} → ${tcpMetricText(physicalResult.fit?.after)}</code></div>
+        <div class="log-line"><span>Validation before/after</span><code>${tcpMetricText(physicalResult.validation?.before)} → ${tcpMetricText(physicalResult.validation?.after)}</code></div>
+        <div class="log-line"><span>Apply gate</span><code>${physicalResult.safe_to_apply ? "accepted" : (physicalResult.apply_blockers || []).join("; ")}</code></div>
+      `
+      : `<div class="log-line"><span>Physical model</span><code>No candidate fitted.</code></div>`;
+  }
+  state.tcpCalibrationPhysicalResult = physicalResult;
+  if (elements.tcpCalApplyPhysicalBtn) {
+    elements.tcpCalApplyPhysicalBtn.disabled = !physicalResult?.safe_to_apply;
+  }
 
   elements.tcpCalibrationSamples.innerHTML = "";
   if (!samples.length) {
@@ -3251,23 +3323,47 @@ function renderTcpCalibration() {
 }
 
 async function generateTcpCalibrationTargets() {
-  const payload = await postJson("/api/kinematics-calibration/targets", {
-    rows: readRequiredNumber(elements.tcpCalRowsInput, "Grid rows", { min: 1, max: 10, integer: true }),
-    columns: readRequiredNumber(elements.tcpCalColumnsInput, "Grid columns", { min: 1, max: 10, integer: true }),
-    margin_mm: readRequiredNumber(elements.tcpCalMarginInput, "Workspace margin", { min: 0 }),
-    z_mm: readRequiredNumber(elements.tcpCalTargetZInput, "Target Z"),
-    phi_deg: readRequiredNumber(elements.tcpCalTargetPhiInput, "Tool pitch"),
-    apply_calibration: false,
-  });
-  if (!payload.ok) return;
-  state.tcpCalibrationTargets = payload.points || [];
-  renderTcpCalibrationTargets();
-  const firstReachable = state.tcpCalibrationTargets.find((point) => point.reachable);
-  if (firstReachable) setTcpCalibrationTarget(firstReachable.intended_target);
-  elements.tcpCalibrationMoveStatus.textContent = `${payload.reachability?.reachable_count || 0} reachable; ${payload.reachability?.unreachable_count || 0} blocked by IK.`;
+  elements.tcpCalGenerateBtn.disabled = true;
+  elements.tcpCalGenerateBtn.textContent = "Generating...";
+  elements.tcpCalibrationMoveStatus.textContent =
+    "Selecting safe, informative targets from the active model and workspace...";
+  try {
+    const payload = await postJson("/api/kinematics-calibration/targets", {
+      count: 12,
+      validation_stride: 4,
+      apply_calibration: false,
+    });
+    if (!payload.ok) {
+      elements.tcpCalibrationMoveStatus.textContent = payload.error || "Automatic target generation failed.";
+      return;
+    }
+    state.tcpCalibrationTargets = payload.points || [];
+    renderTcpCalibrationTargets();
+    const firstReachable = state.tcpCalibrationTargets.find((point) => point.reachable);
+    if (firstReachable) {
+      setTcpCalibrationTarget(firstReachable.intended_target);
+      elements.tcpCalRoleSelect.value = firstReachable.recommended_role || "fit";
+    }
+    const coverage = payload.strategy?.coverage || {};
+    elements.tcpCalibrationMoveStatus.textContent =
+      `${payload.strategy?.message || "Automatic target set generated"} ` +
+      `Coverage: X ${format(coverage.x_span_mm, 0)}, Y ${format(coverage.y_span_mm, 0)}, ` +
+      `Z ${format(coverage.z_span_mm, 0)} mm, Phi ${format(coverage.phi_span_deg, 0)} deg.`;
+  } finally {
+    elements.tcpCalGenerateBtn.disabled = false;
+    elements.tcpCalGenerateBtn.textContent = "Generate automatic target set";
+  }
 }
 
 async function previewTcpCalibrationMove(applyCalibration, role) {
+  if (!elements.tcpCalReferenceConfirmInput?.checked) {
+    showLocalError("Verify and confirm the active TCP point and robot-base Z reference before previewing calibration motion.");
+    return;
+  }
+  if (state.settingsDirtyScopes.has("calibration")) {
+    const saved = await saveAllSettings();
+    if (!saved) return;
+  }
   let target;
   try {
     target = tcpCalibrationTarget();
@@ -3282,6 +3378,7 @@ async function previewTcpCalibrationMove(applyCalibration, role) {
     branch: "auto",
     settings: pathSettings(),
     apply_calibration: Boolean(applyCalibration),
+    purpose: role === "validation" ? "kinematics_calibration_validation" : "kinematics_calibration_fit",
   });
   if (!payload.ok) {
     elements.tcpCalibrationMoveStatus.textContent = `${payload.diagnostic_category || "preview"}: ${payload.error || "failed"}`;
@@ -3358,10 +3455,12 @@ function useTcpCalibrationTouchOff() {
   try {
     const surface = readRequiredNumber(elements.tcpCalSurfaceZInput, "Known surface Z");
     const offset = readRequiredNumber(elements.tcpCalContactOffsetInput, "TCP contact offset");
-    const measuredZ = surface + offset;
+    const workspacePlaneZ = readRequiredNumber(elements.tcpCalWorkspacePlaneZInput, "Workspace plane Z");
+    const measuredZ = workspacePlaneZ + surface + offset;
     elements.tcpCalMeasuredZInput.value = format(measuredZ, 3);
     state.tcpCalibrationMeasurementSource.z = {
       type: "touch_off",
+      workspace_plane_z_mm: workspacePlaneZ,
       surface_z_mm: surface,
       contact_offset_mm: offset,
     };
@@ -3392,8 +3491,14 @@ async function saveTcpCalibrationSample() {
     role: elements.tcpCalRoleSelect.value,
     quality: readNumber(elements.tcpCalQualityInput, 1),
     measurement_source: state.tcpCalibrationMeasurementSource,
-    joint_source: state.robotState?.encoder_available?.includes?.("1") ? "reported_encoder" : "reported_or_commanded",
-    notes: state.tcpCalibrationMove?.executed ? "captured after calibration workflow move" : "captured without confirmed workflow execution",
+    preview_id: state.tcpCalibrationMove?.preview_id || null,
+    measured_point: elements.tcpCalMeasuredPointSelect?.value || "active_tcp",
+    reference_frame: "robot_base",
+    approach: {
+      direction: elements.tcpCalApproachSelect?.value || "unknown",
+      operator_confirmed_reference: Boolean(elements.tcpCalReferenceConfirmInput?.checked),
+    },
+    notes: "captured after bound calibration workflow move",
   });
   if (!payload.ok) {
     elements.tcpCalibrationMeasurementStatus.textContent = payload.error || "Sample was rejected.";
@@ -3408,13 +3513,46 @@ async function fitTcpCalibration() {
   elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Status</span><code>Fitting...</code></div>`;
   const payload = await postJson("/api/kinematics-calibration/fit", {
     model_type: elements.tcpCalModelSelect.value,
-    enable_after_fit: Boolean(elements.tcpCalEnableInput.checked),
+    enable_after_fit: false,
   });
   if (!payload.ok) {
     elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Fit error</span><code>${payload.error || "failed"}</code></div>`;
     return;
   }
   if (payload.config) applyConfig(payload.config);
+}
+
+async function fitTcpPhysicalModel() {
+  elements.tcpCalibrationPhysicalMetrics.innerHTML = `<div class="log-line"><span>Status</span><code>Fitting constrained physical model...</code></div>`;
+  const payload = await postJson("/api/kinematics-calibration/physical-model/fit", {
+    parameter_group: elements.tcpCalPhysicalModelSelect?.value || "joint_zeros",
+  });
+  if (!payload.ok) {
+    elements.tcpCalibrationPhysicalMetrics.innerHTML = `<div class="log-line"><span>Fit error</span><code>${escapeHtml(payload.error || "failed")}</code></div>`;
+    return;
+  }
+  state.tcpCalibrationPhysicalResult = payload.result;
+  if (payload.config) applyConfig(payload.config);
+}
+
+async function applyTcpPhysicalModel() {
+  const result = state.tcpCalibrationPhysicalResult;
+  if (!result?.safe_to_apply) return;
+  if (!window.confirm("Apply this accepted physical-model update? This changes DH/geometry, disables residual correction, invalidates previews, and never moves the robot.")) {
+    return;
+  }
+  const payload = await postJson("/api/kinematics-calibration/physical-model/apply", {
+    result_id: result.id,
+    confirm: true,
+  });
+  if (!payload.ok) {
+    showLocalError(payload.error || "Physical-model update was not applied.");
+    return;
+  }
+  state.tcpCalibrationPhysicalResult = null;
+  if (payload.config) applyConfig(payload.config);
+  if (payload.state) renderState(payload.state);
+  clearViewPreview();
 }
 
 async function applyTcpCalibrationEnableState() {
@@ -3986,6 +4124,8 @@ function renderTaskExecution(robotState = state.robotState) {
   }
   const current = execution.current_object || {};
   const step = execution.current_step || {};
+  const lastCompleted = execution.last_completed_step || {};
+  const recovery = execution.recovery || {};
   const latest = execution.latest_capture || {};
   const candidates = execution.candidate_objects || [];
   const ignored = execution.ignored_objects || [];
@@ -4001,7 +4141,9 @@ function renderTaskExecution(robotState = state.robotState) {
       <div class="run-metric"><span>Current</span><strong>${current.color || "-"}</strong><small>${current.detection_id || current.drop_zone || "-"}</small></div>
       <div class="run-metric"><span>Step</span><strong>${step.index && step.total ? `${step.index}/${step.total}` : "-"}</strong><small>${step.label || "-"}</small></div>
       <div class="run-metric"><span>Capture</span><strong>${latest.detection_count ?? "-"}</strong><small>${latest.provider || latest.calibration_source || "-"}</small></div>
-      <div class="run-metric"><span>Tool feedback</span><strong>${execution.tool_feedback?.status || "unknown"}</strong><small>${execution.holding_uncertain ? "holding uncertain" : "no hold feedback"}</small></div>
+      <div class="run-metric"><span>Tool/object</span><strong>${execution.object_hold_state || "none"}</strong><small>${execution.holding_uncertain ? "holding uncertain" : "no object hold indicated"}</small></div>
+      <div class="run-metric"><span>Last completed</span><strong>${lastCompleted.index && lastCompleted.total ? `${lastCompleted.index}/${lastCompleted.total}` : "-"}</strong><small>${lastCompleted.label || "-"}</small></div>
+      <div class="run-metric"><span>Safe retreat</span><strong>${recovery.safe_retreat_available ? "available" : "unavailable"}</strong><small>${step.phase || execution.phase || "-"}</small></div>
     </div>
     ${execution.status === "waiting_for_selection" ? `<div class="task-waiting">Manual mode: choose a candidate with the Pick button in the detection table.</div>` : ""}
     <div class="task-object-queue compact">
@@ -4010,6 +4152,10 @@ function renderTaskExecution(robotState = state.robotState) {
     <div class="ignored-list">
       ${ignored.slice(0, 6).map((item) => `<div><span>${item.color || item.detection_id}</span><code>${item.reason || item.reason_code}</code></div>`).join("")}
       ${warnings.map((warning) => `<div><span>warning</span><code>${warning}</code></div>`).join("")}
+    </div>
+    <div class="task-recovery-options">
+      <strong>Recovery options</strong>
+      ${(recovery.options || execution.recovery_options || []).map((option) => `<div>${escapeHtml(option)}</div>`).join("") || `<div>None reported.</div>`}
     </div>
   `;
   renderDetectionList(state.latestDetections);
@@ -4391,12 +4537,14 @@ function updateDisabledState() {
   const programLocked = programEditingLocked();
   elements.previewProgramBtn.disabled =
     state.programPreviewPending ||
+    state.programPlanRestorePending ||
     state.programExecutionActive ||
     enabledProgramSteps === 0;
   elements.executeProgramBtn.disabled =
     !programPreviewIsFresh() ||
     Boolean(programGateReason) ||
     state.programPreviewPending ||
+    state.programPlanRestorePending ||
     state.programExecutionActive;
   elements.clearProgramBtn.disabled = state.programWaypoints.length === 0 || programLocked;
   elements.addProgramStepBtn.disabled = programLocked || !programSelectedSourceIsReady();
@@ -4731,7 +4879,12 @@ function activeProgramRecord() {
 }
 
 function programEditingLocked() {
-  return Boolean(state.programReadOnly || state.programExecutionActive || state.programSaving);
+  return Boolean(
+    state.programReadOnly ||
+    state.programExecutionActive ||
+    state.programSaving ||
+    state.programPlanRestorePending
+  );
 }
 
 function setProgramLibraryStatus(message, tone = "") {
@@ -4747,6 +4900,8 @@ function resetProgramPreviewState(reason = "") {
   state.programPreviewFailure = null;
   state.programPreviewRevision = null;
   state.programValidationRevision = null;
+  state.programPlanRestorePending = false;
+  state.programSavedPlanStatus = "";
   state.programHasPreviewed = false;
   state.programExecutionFailed = false;
   state.programExecutionAwaitingStart = false;
@@ -4793,6 +4948,71 @@ function replaceCurrentProgram(program, { stage = "build" } = {}) {
   renderProgramLibrary();
 }
 
+async function restoreSavedProgramPlan({ stageOnSuccess = "run", quiet = false } = {}) {
+  const programId = state.programActiveId;
+  const revision = state.programRevision;
+  if (
+    !programId ||
+    state.programReadOnly ||
+    state.programDirty ||
+    state.programPlanRestorePending ||
+    state.programExecutionActive
+  ) {
+    return false;
+  }
+  state.programPlanRestorePending = true;
+  state.programSavedPlanStatus = quiet ? "" : "Checking saved plan...";
+  renderProgramBuilder({ inspector: false });
+  let payload;
+  try {
+    const response = await fetch(`/api/programs/${encodeURIComponent(programId)}/restore-plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ program_revision: revision }),
+    });
+    payload = await response.json();
+  } catch (error) {
+    if (programId === state.programActiveId && revision === state.programRevision) {
+      state.programPlanRestorePending = false;
+      state.programSavedPlanStatus = `Could not load the saved plan: ${error.message || error}`;
+      renderProgramBuilder({ inspector: false });
+    }
+    return false;
+  }
+  if (programId !== state.programActiveId || revision !== state.programRevision) {
+    if (programId === state.programActiveId) state.programPlanRestorePending = false;
+    return false;
+  }
+  state.programPlanRestorePending = false;
+  if (!payload.ok) {
+    state.programSavedPlanStatus = payload.error || "Saved plan is not reusable from the current robot pose.";
+    if (!quiet && activeProgramRecord()?.cached_plan?.available) {
+      state.programLastEditReason = state.programSavedPlanStatus;
+    }
+    renderProgramBuilder({ inspector: false });
+    return false;
+  }
+
+  clearProgramTargetPreview();
+  renderPreview(payload.preview);
+  state.programPreview = payload.preview;
+  state.programPreviewRevision = revision;
+  state.programValidationRevision = revision;
+  state.programPreviewFailure = null;
+  state.programHasPreviewed = true;
+  state.programExecutionFailed = false;
+  state.programSavedPlanStatus = "Saved plan loaded for the current starting pose.";
+  state.programPlaybackElapsedS = 0;
+  if (stageOnSuccess) setActiveProgramStage(stageOnSuccess);
+  renderProgramBuilder({ inspector: false });
+  return true;
+}
+
+async function loadLibraryProgram(program) {
+  replaceCurrentProgram(program, { stage: "build" });
+  await restoreSavedProgramPlan();
+}
+
 function startNewProgram() {
   replaceCurrentProgram(
     {
@@ -4837,6 +5057,7 @@ function programLibraryRowHtml(program) {
   const template = Boolean(program.read_only || program.template);
   const steps = Array.isArray(program.steps) ? program.steps.length : 0;
   const metadata = program.metadata || {};
+  const cachedPlan = program.cached_plan || {};
   const adaptiveText = metadata.adaptive ? "geometry-adaptive" : "saved targets";
   return `
     <div class="program-library-row ${isActive ? "active" : ""}" data-program-id="${escapeHtml(program.id)}">
@@ -4848,6 +5069,7 @@ function programLibraryRowHtml(program) {
       <div class="program-library-row-meta">
         <span>${steps} step${steps === 1 ? "" : "s"}</span>
         <span>${template ? adaptiveText : "persistent"}</span>
+        ${cachedPlan.available ? `<span>saved plan</span>` : ""}
         ${metadata.radius_mm ? `<span>${format(metadata.radius_mm, 1)} mm radius</span>` : ""}
       </div>
       <div class="program-library-row-actions">
@@ -5677,6 +5899,7 @@ function renderProgramPreviewSummary() {
       ${errors.slice(0, 5).map((error) => `<div class="program-summary-message error"><strong>Needs attention</strong><span>${escapeHtml(error)}</span></div>`).join("")}
       ${calibrationWarnings.slice(0, 3).map((warning) => `<div class="program-summary-message warning"><strong>Warning</strong><span>${escapeHtml(warning)}</span></div>`).join("")}
       ${fresh && !errors.length ? `<div class="program-summary-message success"><strong>Preview matches</strong><span>${trajectory.waypoint_count || 0} planned path points are ready for execution.</span></div>` : ""}
+      ${state.programSavedPlanStatus ? `<div class="program-summary-message ${fresh ? "success" : "neutral"}"><strong>Saved plan</strong><span>${escapeHtml(state.programSavedPlanStatus)}</span></div>` : ""}
       ${!stepCount ? `<div class="program-summary-message neutral"><strong>No sequence yet</strong><span>Add a motion step above. Editing never sends a robot command.</span></div>` : ""}
     </div>
   `;
@@ -5980,6 +6203,7 @@ async function previewProgram() {
 
   state.programPreviewPending = true;
   state.programPreviewFailure = null;
+  state.programSavedPlanStatus = "";
   renderProgramBuilder({ inspector: false });
   const payload = await postJson("/api/path/preview", {
     mode: "program",
@@ -5987,6 +6211,10 @@ async function previewProgram() {
     settings: pathSettings(),
     waypoints: clonePlain(state.programWaypoints),
     program_revision: revision,
+    program_id:
+      state.programActiveId && !state.programDirty && !state.programReadOnly
+        ? state.programActiveId
+        : null,
   });
   state.programPreviewPending = false;
   if (revision !== state.programRevision) {
@@ -6001,6 +6229,25 @@ async function previewProgram() {
     state.programPreviewRevision = revision;
     state.programPreviewFailure = null;
     state.programExecutionFailed = false;
+    if (payload.plan_cache?.saved) {
+      state.programSavedPlanStatus = "Plan saved automatically for this program and starting pose.";
+      const record = activeProgramRecord();
+      if (record) {
+        record.cached_plan = {
+          available: true,
+          saved_at: payload.plan_cache.saved_at,
+          start_reported_angles_deg: payload.plan_cache.start_reported_angles_deg,
+          duration_s: payload.plan_cache.duration_s,
+          waypoint_count: payload.plan_cache.waypoint_count,
+        };
+      }
+    } else if (payload.plan_cache?.error) {
+      state.programSavedPlanStatus = `Plan is valid but was not saved: ${payload.plan_cache.error}`;
+    } else if (!state.programActiveId || state.programDirty || state.programReadOnly) {
+      state.programSavedPlanStatus = state.programReadOnly
+        ? "Copy this template to save and reuse its compiled plan."
+        : "Save the program first to persist this compiled plan.";
+    }
     state.programPlaybackElapsedS = 0;
     startProgramPlayback({ restart: true });
   } else {
@@ -6082,6 +6329,7 @@ function syncProgramExecutionState(robotState) {
     state.programExecutionFailed = false;
     state.programExecutionError = "";
     state.programLastEditReason = "Execution finished";
+    void restoreSavedProgramPlan({ stageOnSuccess: "run", quiet: true });
   }
 }
 
@@ -6144,6 +6392,19 @@ function readCalibrationPayload() {
       color_sorting: {
         ...(state.config.tasks?.color_sorting || {}),
         orientation_policy: elements.orientationPolicySelect?.value || state.config.tasks?.color_sorting?.orientation_policy || "prefer_downward",
+      },
+    },
+    calibration: {
+      ...(state.config.calibration || {}),
+      measurement_reference: {
+        ...(state.config.calibration?.measurement_reference || {}),
+        frame: "robot_base",
+        workspace_plane_z_mm: readNumber(
+          elements.tcpCalWorkspacePlaneZInput,
+          state.config.calibration?.measurement_reference?.workspace_plane_z_mm || 0
+        ),
+        z_reference: "robot_base",
+        measured_point: elements.tcpCalMeasuredPointSelect?.value || "active_tcp",
       },
     },
     path_defaults: pathSettings(),
@@ -6277,6 +6538,16 @@ function applyConfig(config) {
   elements.plannerTypeSelect.value = pathDefaults.planner_type || "s_curve";
   elements.jerkPercentInput.value = format(pathDefaults.jerk_percent ?? 25, 0);
   elements.blendPercentInput.value = format(pathDefaults.blend_percent ?? 0, 0);
+  if (elements.tcpCalWorkspacePlaneZInput) {
+    elements.tcpCalWorkspacePlaneZInput.value = format(
+      state.config.calibration?.measurement_reference?.workspace_plane_z_mm ?? 0,
+      2
+    );
+  }
+  if (elements.tcpCalMeasuredPointSelect) {
+    elements.tcpCalMeasuredPointSelect.value =
+      state.config.calibration?.measurement_reference?.measured_point || "active_tcp";
+  }
   syncPlannerControls();
   buildJointControls();
   buildPerJointTuning();
@@ -7039,18 +7310,34 @@ function bindActions() {
   elements.tcpCalCaptureXyBtn?.addEventListener("click", captureTcpCalibrationXy);
   elements.tcpCalUseTouchOffBtn?.addEventListener("click", useTcpCalibrationTouchOff);
   elements.tcpCalSaveSampleBtn?.addEventListener("click", saveTcpCalibrationSample);
+  elements.tcpCalFitPhysicalBtn?.addEventListener("click", fitTcpPhysicalModel);
+  elements.tcpCalApplyPhysicalBtn?.addEventListener("click", applyTcpPhysicalModel);
   elements.tcpCalFitBtn?.addEventListener("click", fitTcpCalibration);
   elements.tcpCalApplyEnableBtn?.addEventListener("click", applyTcpCalibrationEnableState);
   elements.tcpCalibrationTargetList?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-tcp-cal-target]");
     if (!button) return;
     const point = state.tcpCalibrationTargets[Number(button.dataset.tcpCalTarget)];
-    if (point) setTcpCalibrationTarget(point.intended_target);
+    if (point) {
+      setTcpCalibrationTarget(point.intended_target);
+      elements.tcpCalRoleSelect.value = point.recommended_role || "fit";
+    }
   });
   elements.tcpCalibrationSamples?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-tcp-cal-delete]");
     if (button) deleteTcpCalibrationSample(button.dataset.tcpCalDelete);
   });
+  elements.tcpCalWorkspacePlaneZInput?.addEventListener("input", () => {
+    if (elements.tcpCalReferenceConfirmInput) elements.tcpCalReferenceConfirmInput.checked = false;
+    markSettingsDirty("calibration", "Measurement reference changed. Save and reconfirm it before calibration motion.");
+    renderTcpCalibration();
+  });
+  elements.tcpCalMeasuredPointSelect?.addEventListener("change", () => {
+    if (elements.tcpCalReferenceConfirmInput) elements.tcpCalReferenceConfirmInput.checked = false;
+    markSettingsDirty("calibration", "Measured point changed. Save and reconfirm it before calibration motion.");
+    renderTcpCalibration();
+  });
+  elements.tcpCalReferenceConfirmInput?.addEventListener("change", renderTcpCalibration);
 
   elements.sliderRangeControls.addEventListener("input", () => {
     state.ikUserEdited = true;
@@ -7092,7 +7379,7 @@ function bindActions() {
       const programId = libraryAction.dataset.programId;
       const action = libraryAction.dataset.programLibraryAction;
       const program = state.programLibrary.find((item) => item.id === programId);
-      if (action === "load" && program) replaceCurrentProgram(program, { stage: "build" });
+      if (action === "load" && program) void loadLibraryProgram(program);
       if (action === "copy") copyLibraryProgram(programId);
       if (action === "delete") deleteProgram(programId);
       return;

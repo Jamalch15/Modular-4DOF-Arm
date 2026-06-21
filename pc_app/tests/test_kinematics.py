@@ -282,6 +282,26 @@ def test_inverse_kinematics_auto_phi_prefers_closest_reachable_downward_angle():
     assert result["selected"]["fk"]["tool_phi_deg"] == approx(-135.0, abs=1.0)
 
 
+def test_inverse_kinematics_auto_phi_defaults_below_minus_ninety():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+
+    result = inverse_kinematics(
+        {
+            "x_mm": 0.0,
+            "y_mm": -200.0,
+            "z_mm": 120.0,
+            "phi_auto": True,
+        },
+        config.links,
+        config.joints,
+        config.home_pose,
+    )
+
+    assert result["ok"], result["notes"]
+    assert result["selected"]["fk"]["tool_phi_deg"] < -90.0
+    assert any("downward_forward_priority" in note for note in result["notes"])
+
+
 def test_inverse_kinematics_auto_phi_refines_valid_limit_analytic_seed():
     config = load_config(EXAMPLE_CONFIG_PATH)
     rows = [

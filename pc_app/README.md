@@ -250,9 +250,15 @@ motion sequences.
   executes the displayed path through the normal safety gates.
 - `Preview selected step` plans through all preceding enabled steps so the
   selected step is checked in sequence context.
-- `Preview full program` is required before `Run` unlocks execution.
+- Planning a saved user program persists its compiled trajectory. Loading the
+  program restores that plan automatically when the program, planner code,
+  robot configuration/model, and starting joint pose still match.
+- If a run finishes back at the saved starting pose, the same compiled plan is
+  restored automatically for another run. Otherwise the program must be
+  planned again from the new pose.
 - User programs persist in ignored `config/programs.local.json`; the file uses
-  a versioned JSON schema and is not committed with machine-specific data.
+  a versioned JSON schema and also stores the optional compiled plan. It is not
+  committed with machine-specific data.
 
 ### Settings Tab
 
@@ -372,7 +378,9 @@ Working assumption:
 - Shoulder, elbow, and wrist are pitch joints in the vertical radial plane
 - Shoulder 0 deg points the upper arm vertically upward
 - Positive shoulder, elbow, and wrist angles bend the chain toward the local horizontal reach direction
-- `phi` is the current tool angle target used by the numerical IK workflow
+- `phi` is the current tool angle target used by the numerical IK workflow.
+  Auto-phi globally prioritizes reachable angles below `-90 deg`, with
+  `-100 deg` as the default downward-forward preference.
 - The measured prototype geometry currently derives `d1 = L1 + L3`, base side
   offset `L2`, `d2 = s4*L4`, `a2 = L5`, `d3 = s6*L6`, `a3 = L7`,
   `d4 = s8*L8`, and `a4 = L9`

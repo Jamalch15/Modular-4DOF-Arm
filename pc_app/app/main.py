@@ -9,7 +9,8 @@ import tempfile
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
-from math import isfinite
+from itertools import product
+from math import dist, isfinite
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
@@ -30,6 +31,7 @@ from .apriltag_calibration import (
 )
 from .cartesian_servo import CartesianServo, CartesianServoLimits
 from .cartesian_calibration import (
+    calibration_context as kinematics_calibration_context,
     calibration_settings as kinematics_calibration_settings,
     calibration_summary as kinematics_calibration_summary,
     correct_cartesian_target,
@@ -75,6 +77,11 @@ from .position_library import (
     validate_position_record,
     normalize_position_record,
 )
+from .physical_model_calibration import (
+    PARAMETER_GROUPS as PHYSICAL_MODEL_PARAMETER_GROUPS,
+    fit_physical_model,
+    physical_model_updates,
+)
 from .program_library import (
     PROGRAM_SCHEMA_VERSION,
     ProgramLibraryError,
@@ -82,6 +89,8 @@ from .program_library import (
     copy_program_to_user,
     delete_user_program,
     find_program,
+    program_motion_fingerprint,
+    save_user_program_cached_plan,
     save_user_program,
 )
 from .task_destinations import (
@@ -264,6 +273,7 @@ task_task: asyncio.Task[None] | None = None
 task_selection_events: dict[str, asyncio.Event] = {}
 task_selection_choices: dict[str, str] = {}
 simulation_vision_queue: list[dict[str, Any]] = []
+latest_vision_snapshot: dict[str, Any] = {}
 cartesian_jog_task: asyncio.Task[None] | None = None
 event_log = EventLog()
 active_motion_run_id: str | None = None
@@ -313,6 +323,78 @@ def robot_model_fingerprint(links: LinkConfig | None = None) -> str:
     return hashlib.sha256(encoded).hexdigest()[:12]
 
 
+def stable_payload_fingerprint(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def public_program_record(program: dict[str, Any]) -> dict[str, Any]:
+    record = deepcopy(program)
+    cached_plan = record.pop("cached_plan", None)
+    if isinstance(cached_plan, dict):
+        preview = cached_plan.get("preview") if isinstance(cached_plan.get("preview"), dict) else {}
+        trajectory = preview.get("trajectory") if isinstance(preview.get("trajectory"), dict) else {}
+        record["cached_plan"] = {
+            "available": True,
+            "saved_at": cached_plan.get("saved_at"),
+            "start_reported_angles_deg": cached_plan.get("start_reported_angles_deg"),
+            "duration_s": trajectory.get("duration_s"),
+            "waypoint_count": trajectory.get("waypoint_count"),
+        }
+    return record
+
+
+def task_mapping_fingerprint() -> str:
+    try:
+        destinations = drop_zones(config)
+    except TaskDestinationError:
+        destinations = config.raw.get("task_destinations", config.raw.get("drop_zones", {}))
+    return stable_payload_fingerprint(
+        {
+            "color_profiles": color_profiles(config),
+            "task_destinations": destinations,
+        }
+    )
+
+
+def register_vision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    captured_at = float(payload.get("captured_at") or time())
+    detections = payload.get("detections") if isinstance(payload.get("detections"), list) else []
+    snapshot_id = str(payload.get("detection_snapshot_id") or uuid4())
+    snapshot = {
+        "id": snapshot_id,
+        "captured_at": captured_at,
+        "fingerprint": stable_payload_fingerprint(detections),
+        "provider": payload.get("provider"),
+        "calibration_source": payload.get("calibration_source"),
+    }
+    latest_vision_snapshot.clear()
+    latest_vision_snapshot.update(snapshot)
+    return {
+        **payload,
+        "captured_at": captured_at,
+        "detection_snapshot_id": snapshot_id,
+        "detection_fingerprint": snapshot["fingerprint"],
+    }
+
+
+def task_contract_fingerprint(
+    *,
+    task_settings: dict[str, Any],
+    path_settings: dict[str, Any],
+    branch: str,
+    selected_detection_ids: list[str] | None,
+) -> str:
+    return stable_payload_fingerprint(
+        {
+            "task_settings": task_settings,
+            "path_settings": path_settings,
+            "branch": branch,
+            "selected_detection_ids": [str(value) for value in selected_detection_ids or []],
+        }
+    )
+
+
 def pose_snapshot_fields(*, planning_links: LinkConfig | None = None) -> dict[str, Any]:
     return {
         "start_pose_revision": int(state.pose_revision),
@@ -350,6 +432,143 @@ def preview_stale_reason(preview: dict[str, Any]) -> str | None:
             f"{[round(float(value), 3) for value in state.reported_angles_deg]} "
             f"(max delta {max_delta:.3f} deg); preview again"
         )
+    return None
+
+
+def cache_program_preview(
+    program_id: str,
+    requested_waypoints: list[dict[str, Any]],
+    preview: dict[str, Any],
+) -> dict[str, Any]:
+    program = find_program(config, program_id)
+    if program is None:
+        raise ProgramLibraryError(f"program {program_id} was not found")
+    if program.get("read_only"):
+        raise ProgramLibraryError("copy the built-in template before saving a compiled plan")
+    requested_fingerprint = program_motion_fingerprint(
+        {
+            "schema_version": program.get("schema_version", PROGRAM_SCHEMA_VERSION),
+            "required_tool": program.get("required_tool"),
+            "steps": requested_waypoints,
+        }
+    )
+    expected_fingerprint = program_motion_fingerprint(program)
+    if requested_fingerprint != expected_fingerprint:
+        raise ProgramLibraryError("saved program differs from the previewed sequence")
+
+    cached_preview = deepcopy(preview)
+    cached_preview.pop("id", None)
+    cached_preview.pop("created_at", None)
+    cached_preview.pop("execution_started_at", None)
+    cached_preview.pop("execution_start_pose_revision", None)
+    cached_preview.pop("execution_count", None)
+    cached_preview["program_revision"] = None
+    saved = save_user_program_cached_plan(
+        config,
+        program_id,
+        {
+            "backend_build_id": RUNNING_BACKEND_BUILD_ID,
+            "config_id": RUNNING_CONFIG_ID,
+            "model_fingerprint": robot_model_fingerprint(),
+            "start_reported_angles_deg": [
+                float(value) for value in preview.get("start_reported_angles_deg", [])
+            ],
+            "preview": cached_preview,
+        },
+    )
+    return public_program_record(saved).get("cached_plan", {})
+
+
+def restore_cached_program_preview(
+    program: dict[str, Any],
+    program_revision: int | None,
+) -> dict[str, Any]:
+    cached_plan = program.get("cached_plan")
+    if not isinstance(cached_plan, dict):
+        return {"ok": False, "cache_miss": True, "error": "No saved plan is available yet."}
+    if cached_plan.get("program_fingerprint") != program_motion_fingerprint(program):
+        return {
+            "ok": False,
+            "cache_miss": True,
+            "error": "The saved program changed after its plan was created.",
+        }
+    if cached_plan.get("backend_build_id") != RUNNING_BACKEND_BUILD_ID:
+        return {
+            "ok": False,
+            "cache_miss": True,
+            "error": "Planner code changed after this plan was saved.",
+        }
+    if cached_plan.get("config_id") != RUNNING_CONFIG_ID:
+        return {
+            "ok": False,
+            "cache_miss": True,
+            "error": "Robot configuration changed after this plan was saved.",
+        }
+    if cached_plan.get("model_fingerprint") != robot_model_fingerprint():
+        return {
+            "ok": False,
+            "cache_miss": True,
+            "error": "Robot model changed after this plan was saved.",
+        }
+
+    preview = deepcopy(cached_plan.get("preview"))
+    if not isinstance(preview, dict) or preview.get("mode") != "program":
+        return {"ok": False, "cache_miss": True, "error": "The saved plan is invalid."}
+    stale_reason = preview_stale_reason(preview)
+    if stale_reason:
+        return {"ok": False, "cache_miss": True, "error": stale_reason}
+
+    preview_id = str(uuid4())
+    preview.update(
+        {
+            "id": preview_id,
+            "created_at": time(),
+            "source": "saved_program_plan",
+            "program_id": program["id"],
+            "program_revision": program_revision,
+            **pose_snapshot_fields(),
+        }
+    )
+    path_previews[preview_id] = preview
+    for stale_id, stale in list(path_previews.items()):
+        if time() - stale.get("created_at", 0.0) > 600:
+            path_previews.pop(stale_id, None)
+    log_event(
+        "program",
+        "saved plan restored",
+        program_id=program["id"],
+        preview_id=preview_id,
+    )
+    return {
+        "ok": True,
+        "restored": True,
+        "preview_id": preview_id,
+        "preview": preview,
+        "cached_plan": public_program_record(program).get("cached_plan", {}),
+    }
+
+
+def task_preview_stale_reason(preview: dict[str, Any]) -> str | None:
+    base_reason = preview_stale_reason(preview)
+    if base_reason:
+        return base_reason
+    if preview.get("destination_revision") != task_mapping_fingerprint():
+        return "task destinations or color mappings changed after preview; preview the task again"
+    expected_contract = preview.get("task_settings_revision")
+    actual_contract = task_contract_fingerprint(
+        task_settings=preview.get("task_settings", {}),
+        path_settings=preview.get("settings", {}),
+        branch=str(preview.get("branch", "auto")),
+        selected_detection_ids=preview.get("selected_detection_ids"),
+    )
+    if expected_contract != actual_contract:
+        return "task settings changed after preview; preview the task again"
+    if preview.get("detection_snapshot_server_bound"):
+        snapshot_id = str(preview.get("detection_snapshot_id") or "")
+        if not latest_vision_snapshot or snapshot_id != str(latest_vision_snapshot.get("id") or ""):
+            return "detection snapshot changed after preview; refresh detections and preview the task again"
+        if preview.get("detection_fingerprint") != latest_vision_snapshot.get("fingerprint"):
+            return "detection contents changed after preview; refresh detections and preview the task again"
     return None
 
 
@@ -416,7 +635,9 @@ class PathPreviewRequest(BaseModel):
     settings: PathSettingsRequest | None = None
     waypoints: list[dict[str, Any]] | None = None
     apply_calibration: bool = True
+    purpose: str | None = None
     program_revision: int | None = None
+    program_id: str | None = None
 
 
 class PathExecuteRequest(BaseModel):
@@ -445,6 +666,10 @@ class ProgramSaveRequest(BaseModel):
 
 class ProgramCopyRequest(BaseModel):
     name: str | None = None
+
+
+class ProgramRestorePlanRequest(BaseModel):
+    program_revision: int | None = None
 
 
 class ProgramStepPreviewRequest(BaseModel):
@@ -578,6 +803,8 @@ class TaskPreviewRequest(BaseModel):
     settings: PathSettingsRequest | None = None
     task_settings: dict[str, Any] | None = None
     selected_detection_ids: list[str] | None = None
+    detection_snapshot_id: str | None = None
+    detection_captured_at: float | None = None
     branch: str = "auto"
 
 
@@ -591,11 +818,12 @@ class TaskSelectionRequest(BaseModel):
 
 
 class KinematicsCalibrationTargetsRequest(BaseModel):
-    rows: int = 3
-    columns: int = 4
-    margin_mm: float = 25.0
+    count: int = 12
     z_mm: float = 45.0
     phi_deg: float = 0.0
+    z_levels_mm: list[float] | None = None
+    phi_levels_deg: list[float] | None = None
+    validation_stride: int = 4
     apply_calibration: bool = False
 
 
@@ -606,6 +834,10 @@ class KinematicsCalibrationSampleRequest(BaseModel):
     role: str = "fit"
     quality: float = 1.0
     measurement_source: dict[str, Any] | None = None
+    preview_id: str | None = None
+    measured_point: str = "active_tcp"
+    reference_frame: str = "robot_base"
+    approach: dict[str, Any] | None = None
     joint_source: str = "reported"
     notes: str = ""
 
@@ -619,6 +851,17 @@ class KinematicsCalibrationFitRequest(BaseModel):
 class KinematicsCalibrationEnableRequest(BaseModel):
     enabled: bool
     profile_key: str | None = None
+
+
+class PhysicalModelFitRequest(BaseModel):
+    parameter_group: str = "joint_zeros"
+    profile_key: str | None = None
+
+
+class PhysicalModelApplyRequest(BaseModel):
+    result_id: str
+    profile_key: str | None = None
+    confirm: bool = False
 
 
 def public_config() -> dict[str, Any]:
@@ -1132,6 +1375,18 @@ def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> d
     return merged
 
 
+def calibration_path_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
+    merged = request_settings(settings)
+    merged["global_speed_deg_s"] = min(float(merged["global_speed_deg_s"]), 10.0)
+    merged["global_accel_deg_s2"] = min(float(merged["global_accel_deg_s2"]), 20.0)
+    merged["tcp_speed_mm_s"] = min(float(merged["tcp_speed_mm_s"]), 20.0)
+    merged["tcp_accel_mm_s2"] = min(float(merged["tcp_accel_mm_s2"]), 60.0)
+    merged["phi_speed_deg_s"] = min(float(merged["phi_speed_deg_s"]), 15.0)
+    merged["phi_accel_deg_s2"] = min(float(merged["phi_accel_deg_s2"]), 45.0)
+    merged["motion_purpose"] = "calibration_measurement_move"
+    return merged
+
+
 def validated_task_path_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
     merged = request_settings(settings)
     errors: list[str] = []
@@ -1417,6 +1672,7 @@ def cancel_motion_tasks() -> None:
 
 ACTIVE_TASK_STATUSES = {"queued", "running", "capturing", "planning", "executing", "waiting_for_selection", "stopping"}
 TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped"}
+UNCERTAIN_HOLD_STATES = {"possibly_held", "confirmed_held", "release_unconfirmed"}
 
 
 def update_task_execution(**updates: Any) -> dict[str, Any]:
@@ -1426,6 +1682,35 @@ def update_task_execution(**updates: Any) -> dict[str, Any]:
     state.task_execution = payload
     state.updated_at = time()
     return payload
+
+
+def task_recovery_summary(execution: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = execution or state.task_execution or {}
+    step = current.get("current_step") if isinstance(current.get("current_step"), dict) else {}
+    hold_state = str(current.get("object_hold_state") or "none")
+    retreat_target = step.get("recovery_target")
+    safe_retreat_available = bool(
+        step.get("safe_retreat_available")
+        and isinstance(retreat_target, dict)
+        and state.known_pose
+        and state.motion_state not in {MotionState.ESTOP, MotionState.FAULT}
+    )
+    options = ["verify robot pose before any recovery motion"]
+    if hold_state in UNCERTAIN_HOLD_STATES:
+        options.append("inspect or secure the tool/object before moving")
+        options.append("do not change the commanded tool state until object state is resolved")
+    else:
+        options.append("confirm that no object is held")
+    if safe_retreat_available:
+        options.append("preview and command the recorded clearance retreat")
+    else:
+        options.append("re-preview a safe recovery path; automatic retreat is unavailable")
+    return {
+        "object_hold_state": hold_state,
+        "safe_retreat_available": safe_retreat_available,
+        "retreat_target": deepcopy(retreat_target) if isinstance(retreat_target, dict) else None,
+        "options": options,
+    }
 
 
 def start_task_execution_state(
@@ -1446,6 +1731,7 @@ def start_task_execution_state(
         "phase": "queued",
         "current_object": None,
         "current_step": None,
+        "last_completed_step": None,
         "completed_count": 0,
         "remaining_count": max(0, total_objects),
         "total_count": max(0, total_objects),
@@ -1453,26 +1739,47 @@ def start_task_execution_state(
         "ignored_objects": [],
         "candidate_objects": [],
         "tool_feedback": {"available": False, "status": "not_implemented"},
+        "object_hold_state": "none",
         "holding_uncertain": False,
+        "safe_retreat_available": False,
+        "recovery_options": [],
+        "recovery": {},
         "warnings": [],
         "terminal_reason": None,
         "settings": settings,
         "started_at": time(),
         "updated_at": time(),
     }
+    recovery = task_recovery_summary(state.task_execution)
+    state.task_execution.update(
+        recovery=recovery,
+        safe_retreat_available=recovery["safe_retreat_available"],
+        recovery_options=recovery["options"],
+    )
     state.updated_at = time()
 
 
-def finish_task_execution(status: str, reason: str, *, holding_uncertain: bool = False) -> None:
+def finish_task_execution(
+    status: str,
+    reason: str,
+    *,
+    holding_uncertain: bool | None = None,
+) -> None:
     if not state.task_execution:
         return
     if state.task_execution.get("status") in TERMINAL_TASK_STATUSES:
         return
+    hold_state = str(state.task_execution.get("object_hold_state") or "none")
+    uncertain = hold_state in UNCERTAIN_HOLD_STATES if holding_uncertain is None else holding_uncertain
+    recovery = task_recovery_summary()
     update_task_execution(
         status=status,
         phase=status,
         terminal_reason=reason,
-        holding_uncertain=holding_uncertain,
+        holding_uncertain=uncertain,
+        safe_retreat_available=recovery["safe_retreat_available"],
+        recovery_options=recovery["options"],
+        recovery=recovery,
         finished_at=time(),
     )
 
@@ -2010,6 +2317,7 @@ def build_preview(
     branch: str,
     source: str = "preview",
     apply_calibration: bool = True,
+    calibration_trial: bool = False,
     program_revision: int | None = None,
 ) -> dict[str, Any]:
     mode = mode.lower()
@@ -2054,6 +2362,7 @@ def build_preview(
             waypoint_program,
             config,
             apply_enabled=calibration_requested,
+            validation_trial=calibration_trial,
         )
         if apply_calibration and not calibration_compatible:
             for correction in corrections:
@@ -2097,6 +2406,7 @@ def build_preview(
             requested_target,
             config,
             apply_enabled=calibration_requested,
+            validation_trial=calibration_trial,
         )
         if apply_calibration and not calibration_compatible:
             correction["reason"] = "kinematics_override"
@@ -2182,6 +2492,7 @@ def build_preview(
         "command_target": command_target,
         "calibration": calibration_metadata,
         "settings": settings,
+        "branch": branch,
         "ik": ik_result,
         "trajectory": trajectory,
         "motion_contract": trajectory.get("motion_contract", {}),
@@ -2914,15 +3225,26 @@ async def execute_task_sequence(
                 stopped = True
                 break
             label = str(step.get("label", step.get("kind", "step")))
+            current_step = {
+                "label": label,
+                "index": step_index,
+                "total": len(steps),
+                "kind": step.get("kind"),
+                "phase": step.get("phase"),
+                "target_frame": step.get("target_frame"),
+                "movement_mode": step.get("movement_mode"),
+                "height_mm": step.get("height_mm"),
+                "safe_retreat_available": bool(step.get("safe_retreat_available")),
+                "recovery_target": deepcopy(step.get("recovery_target")),
+            }
+            hold_state = str((state.task_execution or {}).get("object_hold_state") or "none")
+            hold_transition = str(step.get("hold_transition") or "")
+            if hold_transition and (hold_transition != "none" or hold_state == "none"):
+                hold_state = hold_transition
             update_task_execution(
                 status="executing",
-                phase="executing_sequence",
-                current_step={
-                    "label": label,
-                    "index": step_index,
-                    "total": len(steps),
-                    "kind": step.get("kind"),
-                },
+                phase=str(step.get("phase") or "executing_sequence"),
+                current_step=current_step,
                 current_object={
                     "index": step.get("object_index"),
                     "detection_id": step.get("detection_id"),
@@ -2930,6 +3252,14 @@ async def execute_task_sequence(
                     "drop_zone": step.get("drop_zone"),
                     "grid_slot": step.get("grid_slot"),
                 },
+                object_hold_state=hold_state,
+                holding_uncertain=hold_state in UNCERTAIN_HOLD_STATES,
+            )
+            recovery = task_recovery_summary()
+            update_task_execution(
+                safe_retreat_available=recovery["safe_retreat_available"],
+                recovery_options=recovery["options"],
+                recovery=recovery,
             )
             await broadcast_state()
             log_event("task", label)
@@ -2946,6 +3276,9 @@ async def execute_task_sequence(
                     }
                 )
                 await asyncio.sleep(max(0.0, float(settings.get("tool_action_delay_ms", 150)) / 1000.0))
+                update_task_execution(
+                    last_completed_step={**current_step, "completed_at": time()},
+                )
                 continue
             waypoint = step.get("waypoint")
             if not isinstance(waypoint, dict):
@@ -2980,6 +3313,9 @@ async def execute_task_sequence(
             if state.motion_state in {MotionState.ESTOP, MotionState.STOPPED}:
                 stopped = True
                 break
+            update_task_execution(
+                last_completed_step={**current_step, "completed_at": time()},
+            )
 
             object_index = step.get("object_index")
             next_object_index = (
@@ -3005,16 +3341,16 @@ async def execute_task_sequence(
         cancelled = True
         log_event("task", "task cancelled")
         if terminal_on_finish:
-            finish_task_execution("stopped", "task cancelled", holding_uncertain=True)
+            finish_task_execution("stopped", "task cancelled")
         raise
     finally:
         if terminal_on_finish and not cancelled:
             if failed_reason:
-                finish_task_execution("failed", failed_reason, holding_uncertain=True)
+                finish_task_execution("failed", failed_reason)
             elif stopped:
-                finish_task_execution("stopped", state.motion_state.value, holding_uncertain=True)
+                finish_task_execution("stopped", state.motion_state.value)
             elif state.motion_state == MotionState.FAULT:
-                finish_task_execution("failed", state.last_error or "task motion fault", holding_uncertain=True)
+                finish_task_execution("failed", state.last_error or "task motion fault")
             else:
                 total = int((state.task_execution or {}).get("total_count", 0))
                 update_task_execution(completed_count=total, remaining_count=0)
@@ -3120,7 +3456,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             gate_reason = task_motion_gate_reason()
             if gate_reason:
                 state.set_error(gate_reason)
-                finish_task_execution("failed", gate_reason, holding_uncertain=True)
+                finish_task_execution("failed", gate_reason)
                 await broadcast_state()
                 return
 
@@ -3141,7 +3477,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             if not clear_result.get("ok"):
                 reason = clear_result.get("error") or "camera-clear move failed"
                 state.set_error(reason)
-                finish_task_execution("failed", reason, holding_uncertain=True)
+                finish_task_execution("failed", reason)
                 await broadcast_state()
                 return
 
@@ -3157,7 +3493,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             except Exception as exc:
                 reason = f"closed-loop capture failed: {exc}"
                 state.set_error(reason)
-                finish_task_execution("failed", reason, holding_uncertain=True)
+                finish_task_execution("failed", reason)
                 await broadcast_state()
                 return
 
@@ -3199,7 +3535,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                 selected_id = await wait_for_manual_task_selection(run_id, candidates)
                 if not selected_id:
                     terminal_reason = "manual selection cancelled"
-                    finish_task_execution("stopped", terminal_reason, holding_uncertain=True)
+                    finish_task_execution("stopped", terminal_reason)
                     await broadcast_state()
                     return
                 plan = build_color_sorting_plan(
@@ -3232,14 +3568,14 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                     return
                 reason = "; ".join(errors) or plan.get("error") or "closed-loop planning failed"
                 state.set_error(reason)
-                finish_task_execution("failed", reason, holding_uncertain=True)
+                finish_task_execution("failed", reason)
                 await broadcast_state()
                 return
 
             gate_reason = task_motion_gate_reason()
             if gate_reason:
                 state.set_error(gate_reason)
-                finish_task_execution("failed", gate_reason, holding_uncertain=True)
+                finish_task_execution("failed", gate_reason)
                 await broadcast_state()
                 return
 
@@ -3255,7 +3591,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             if not preflight.get("ok"):
                 reason = preflight.get("error", "closed-loop cycle preflight failed")
                 state.set_error(reason)
-                finish_task_execution("failed", reason, holding_uncertain=True)
+                finish_task_execution("failed", reason)
                 await broadcast_state()
                 return
 
@@ -3274,7 +3610,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             )
             if not result.get("ok"):
                 reason = result.get("error") or state.last_error or "closed-loop cycle failed"
-                finish_task_execution("failed", reason, holding_uncertain=True)
+                finish_task_execution("failed", reason)
                 await broadcast_state()
                 return
 
@@ -3298,7 +3634,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
         finish_task_execution("completed", terminal_reason)
         await broadcast_state()
     except asyncio.CancelledError:
-        finish_task_execution("stopped", "task cancelled", holding_uncertain=True)
+        finish_task_execution("stopped", "task cancelled")
         await broadcast_state()
         raise
     finally:
@@ -3335,6 +3671,7 @@ def reload_runtime_config(
     path_previews.clear()
     task_previews.clear()
     simulation_vision_queue.clear()
+    latest_vision_snapshot.clear()
     state.config_change = {
         **config_change,
         "applied_at": time(),
@@ -3476,7 +3813,7 @@ async def get_programs() -> dict[str, Any]:
     return {
         "ok": True,
         "schema_version": PROGRAM_SCHEMA_VERSION,
-        "programs": programs,
+        "programs": [public_program_record(program) for program in programs],
     }
 
 
@@ -3488,7 +3825,7 @@ async def get_program(program_id: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
     if program is None:
         return {"ok": False, "error": f"program {program_id} was not found"}
-    return {"ok": True, "program": program}
+    return {"ok": True, "program": public_program_record(program)}
 
 
 @app.post("/api/programs")
@@ -3498,7 +3835,7 @@ async def create_or_update_program(request: ProgramSaveRequest) -> dict[str, Any
     except ProgramLibraryError as exc:
         return {"ok": False, "error": str(exc)}
     log_event("program", "program saved", program_id=program["id"], name=program["name"])
-    return {"ok": True, "program": program}
+    return {"ok": True, "program": public_program_record(program)}
 
 
 @app.put("/api/programs/{program_id}")
@@ -3513,7 +3850,7 @@ async def update_program(program_id: str, request: ProgramSaveRequest) -> dict[s
     except ProgramLibraryError as exc:
         return {"ok": False, "error": str(exc)}
     log_event("program", "program updated", program_id=program["id"], name=program["name"])
-    return {"ok": True, "program": program}
+    return {"ok": True, "program": public_program_record(program)}
 
 
 @app.delete("/api/programs/{program_id}")
@@ -3541,7 +3878,25 @@ async def copy_program(program_id: str, request: ProgramCopyRequest) -> dict[str
         copied_from=program_id,
         name=program["name"],
     )
-    return {"ok": True, "program": program}
+    return {"ok": True, "program": public_program_record(program)}
+
+
+@app.post("/api/programs/{program_id}/restore-plan")
+async def restore_program_plan(
+    program_id: str,
+    request: ProgramRestorePlanRequest,
+) -> dict[str, Any]:
+    try:
+        program = find_program(config, program_id)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "cache_miss": True, "error": str(exc)}
+    if program is None:
+        return {
+            "ok": False,
+            "cache_miss": True,
+            "error": f"program {program_id} was not found",
+        }
+    return restore_cached_program_preview(program, request.program_revision)
 
 
 @app.get("/api/serial/ports")
@@ -4405,20 +4760,21 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
         provider=result["provider"],
         calibration_source=result["calibration_source"],
     )
-    return {
+    return register_vision_snapshot({
         "ok": True,
+        "captured_at": time(),
         "detections": result["detections"],
         "workspace": result["workspace"],
         "provider": result["provider"],
         "calibration_source": result["calibration_source"],
-    }
+    })
 
 
 @app.get("/api/vision/frame")
 async def get_vision_frame() -> dict[str, Any]:
     try:
         if state.simulation:
-            return simulation_vision_payload(consume=False)
+            return register_vision_snapshot(simulation_vision_payload(consume=False))
         camera = camera_settings(config)
         image = await asyncio.to_thread(capture_camera_frame, camera)
         result = vision_pipeline.process(
@@ -4426,15 +4782,16 @@ async def get_vision_frame() -> dict[str, Any]:
             camera,
             color_profiles(config),
         )
-        return {
+        return register_vision_snapshot({
             "ok": True,
+            "captured_at": time(),
             "raw_image_b64": encode_image_b64(image),
             "image_b64": encode_image_b64(result["annotated"]),
             "detections": result["detections"],
             "workspace": result["workspace"],
             "provider": result["provider"],
             "calibration_source": result["calibration_source"],
-        }
+        })
     except Exception as exc:
         return {"ok": False, "error": str(exc), "detections": []}
 
@@ -4453,6 +4810,7 @@ async def set_simulation_vision_queue(request: SimulationVisionQueueRequest) -> 
         frames.append(deepcopy(frame))
     simulation_vision_queue.clear()
     simulation_vision_queue.extend(frames)
+    latest_vision_snapshot.clear()
     return {"ok": True, "queue": simulation_vision_status()}
 
 
@@ -4468,6 +4826,7 @@ async def clear_simulation_vision_queue() -> dict[str, Any]:
     if not state.simulation:
         return {"ok": False, "error": "synthetic vision is available only in simulation"}
     simulation_vision_queue.clear()
+    latest_vision_snapshot.clear()
     return {"ok": True, "queue": simulation_vision_status()}
 
 
@@ -4661,6 +5020,17 @@ def _persist_kinematics_calibration(settings: dict[str, Any]) -> None:
     reload_runtime_config()
 
 
+def _persist_calibration_updates(updates: dict[str, Any]) -> None:
+    config_path = ensure_local_config()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        draft_path = Path(tmp_dir) / "robot.local.yaml"
+        shutil.copyfile(config_path, draft_path)
+        save_calibration_updates(draft_path, updates)
+        load_config(draft_path)
+    save_calibration_updates(config_path, updates)
+    reload_runtime_config()
+
+
 def _workspace_polygon() -> list[list[float]]:
     camera = camera_settings(config)
     calibration = camera.get("calibration") if isinstance(camera, dict) else None
@@ -4694,82 +5064,308 @@ def _point_inside_polygon(x: float, y: float, polygon: list[list[float]]) -> boo
     return inside
 
 
+def _joint_samples(
+    minimum: float,
+    maximum: float,
+    count: int,
+    *,
+    lower_fraction: float,
+    upper_fraction: float,
+) -> list[float]:
+    if count <= 1:
+        return [(minimum + maximum) * 0.5]
+    span = maximum - minimum
+    return [
+        minimum + span * (lower_fraction + (upper_fraction - lower_fraction) * index / (count - 1))
+        for index in range(count)
+    ]
+
+
+def _automatic_calibration_targets(
+    robot_config: RobotConfig,
+    polygon: list[list[float]],
+    *,
+    count: int,
+    validation_stride: int,
+) -> dict[str, Any]:
+    if not 6 <= count <= 24:
+        raise ValueError("automatic calibration target count must be between 6 and 24")
+    rows = robot_config.kinematics.dh_rows
+    if len(rows) != 4:
+        raise ValueError("automatic calibration target generation requires four DH rows")
+    reference = kinematics_calibration_context(robot_config).get("measurement_reference", {})
+    plane_z = float(reference.get("workspace_plane_z_mm", 0.0))
+    modeled_reach = sum(abs(float(row.a_mm)) for row in rows) + abs(
+        float(robot_config.links.tool_tcp_offset_mm.get("z", 0.0))
+    )
+    minimum_z = plane_z + 35.0
+    maximum_z = plane_z + min(240.0, max(120.0, modeled_reach * 0.55))
+    joints = robot_config.joints
+    base_values = _joint_samples(
+        joints[0].min_deg,
+        joints[0].max_deg,
+        9,
+        lower_fraction=0.02,
+        upper_fraction=0.98,
+    )
+    shoulder_values = _joint_samples(
+        joints[1].min_deg,
+        joints[1].max_deg,
+        6,
+        lower_fraction=0.03,
+        upper_fraction=0.85,
+    )
+    elbow_values = _joint_samples(
+        joints[2].min_deg,
+        joints[2].max_deg,
+        7,
+        lower_fraction=0.05,
+        upper_fraction=0.95,
+    )
+    desired_phi_values = [-90.0, -45.0, 0.0, 45.0, 90.0]
+    candidates: list[dict[str, Any]] = []
+    for base, shoulder, elbow, desired_phi in product(
+        base_values,
+        shoulder_values,
+        elbow_values,
+        desired_phi_values,
+    ):
+        pitch_without_wrist = sum(
+            angle * row.direction_sign + row.zero_offset_deg
+            for angle, row in [
+                (shoulder, rows[1]),
+                (elbow, rows[2]),
+            ]
+        )
+        wrist = (
+            desired_phi - pitch_without_wrist - rows[3].zero_offset_deg
+        ) / rows[3].direction_sign
+        if not joints[3].min_deg <= wrist <= joints[3].max_deg:
+            continue
+        angles = [base, shoulder, elbow, wrist]
+        fk = forward_kinematics(angles, robot_config.links)
+        if not _point_inside_polygon(float(fk["x_mm"]), float(fk["y_mm"]), polygon):
+            continue
+        if not minimum_z <= float(fk["z_mm"]) <= maximum_z:
+            continue
+        joint_clearance = min(
+            min(
+                (angle - joint.min_deg) / (joint.max_deg - joint.min_deg),
+                (joint.max_deg - angle) / (joint.max_deg - joint.min_deg),
+            )
+            for angle, joint in zip(angles, joints, strict=True)
+        )
+        candidates.append(
+            {
+                "seed_angles_deg": [float(value) for value in angles],
+                "intended_target": {
+                    "x_mm": float(fk["x_mm"]),
+                    "y_mm": float(fk["y_mm"]),
+                    "z_mm": float(fk["z_mm"]),
+                    "phi_deg": float(fk["tool_phi_deg"]),
+                },
+                "joint_clearance_fraction": float(joint_clearance),
+            }
+        )
+    if len(candidates) < count:
+        raise ValueError(
+            f"only {len(candidates)} automatic calibration poses fit the active workspace/model; "
+            "verify workspace bounds, tool TCP, and joint limits"
+        )
+
+    features = [
+        [
+            candidate["intended_target"]["x_mm"],
+            candidate["intended_target"]["y_mm"],
+            candidate["intended_target"]["z_mm"],
+            candidate["intended_target"]["phi_deg"],
+        ]
+        for candidate in candidates
+    ]
+    minimums = [min(values) for values in zip(*features, strict=True)]
+    maximums = [max(values) for values in zip(*features, strict=True)]
+    spans = [max(1e-9, high - low) for low, high in zip(minimums, maximums, strict=True)]
+    normalized = [
+        [(value - low) / span for value, low, span in zip(values, minimums, spans, strict=True)]
+        for values in features
+    ]
+    selected = [
+        max(
+            range(len(candidates)),
+            key=lambda index: candidates[index]["joint_clearance_fraction"],
+        )
+    ]
+    while len(selected) < count:
+        next_index = max(
+            (index for index in range(len(candidates)) if index not in selected),
+            key=lambda index: min(
+                dist(normalized[index], normalized[chosen])
+                for chosen in selected
+            )
+            + 0.2 * candidates[index]["joint_clearance_fraction"],
+        )
+        selected.append(next_index)
+
+    points: list[dict[str, Any]] = []
+    for index, candidate_index in enumerate(selected, start=1):
+        candidate = deepcopy(candidates[candidate_index])
+        role = "validation" if index % validation_stride == 0 else "fit"
+        candidate.update(
+            {
+                "index": index,
+                "recommended_role": role,
+                "command_target": deepcopy(candidate["intended_target"]),
+                "calibration": {
+                    "applied": False,
+                    "reason": "automatic_fit_targets_are_uncorrected",
+                },
+                "reachable": True,
+                "diagnostic_category": "reachable_from_generated_joint_pose",
+                "ik_notes": ["target was generated by FK from a valid in-limit joint pose"],
+            }
+        )
+        points.append(candidate)
+    selected_features = [
+        [
+            point["intended_target"]["x_mm"],
+            point["intended_target"]["y_mm"],
+            point["intended_target"]["z_mm"],
+            point["intended_target"]["phi_deg"],
+        ]
+        for point in points
+    ]
+    selected_ranges = [
+        max(values) - min(values)
+        for values in zip(*selected_features, strict=True)
+    ]
+    return {
+        "points": points,
+        "strategy": {
+            "id": "model_aware_joint_pose_sampling",
+            "message": (
+                "Z and tool pitch were selected automatically from valid joint poses "
+                "to provide spatial and orientation coverage."
+            ),
+            "candidate_count": len(candidates),
+            "selected_count": len(points),
+            "workspace_plane_z_mm": plane_z,
+            "allowed_z_range_mm": [minimum_z, maximum_z],
+            "coverage": {
+                "x_span_mm": selected_ranges[0],
+                "y_span_mm": selected_ranges[1],
+                "z_span_mm": selected_ranges[2],
+                "phi_span_deg": selected_ranges[3],
+            },
+        },
+    }
+
+
+def _calibration_capture_contract(
+    request: KinematicsCalibrationSampleRequest,
+) -> dict[str, Any]:
+    preview_id = str(request.preview_id or "")
+    if not preview_id:
+        raise ValueError("save samples only after executing a calibration preview")
+    preview = path_previews.get(preview_id)
+    if not isinstance(preview, dict):
+        raise ValueError("calibration preview expired; preview and execute the measurement move again")
+    if preview.get("source") not in {
+        "kinematics_calibration_fit",
+        "kinematics_calibration_validation",
+    }:
+        raise ValueError("sample preview was not created by the calibration workflow")
+    if not preview.get("execution_started_at"):
+        raise ValueError("execute the calibration preview before saving its sample")
+    if int(preview.get("execution_count", 0)) != 1:
+        raise ValueError("calibration previews may be executed only once; create a fresh preview")
+    expected_role = "validation" if preview.get("source") == "kinematics_calibration_validation" else "fit"
+    if str(request.role).lower() != expected_role:
+        raise ValueError(f"this preview is bound to a {expected_role} sample")
+    trajectory = preview.get("trajectory") if isinstance(preview.get("trajectory"), dict) else {}
+    waypoints = trajectory.get("waypoints") if isinstance(trajectory.get("waypoints"), list) else []
+    if not waypoints:
+        raise ValueError("calibration preview has no planned endpoint")
+    final_angles = [float(value) for value in waypoints[-1]]
+    deltas = [
+        abs(float(actual) - expected)
+        for actual, expected in zip(state.reported_angles_deg, final_angles, strict=True)
+    ]
+    max_delta = max(deltas, default=0.0)
+    if max_delta > 0.5:
+        raise ValueError(
+            f"reported pose is {max_delta:.2f} deg from the executed calibration endpoint; "
+            "wait for settling or preview the sample again"
+        )
+    for key, requested in [
+        ("intended_target", request.intended_target),
+        ("command_target", request.command_target or request.intended_target),
+    ]:
+        expected = preview.get("target" if key == "intended_target" else "command_target")
+        if not isinstance(expected, dict):
+            raise ValueError(f"calibration preview is missing {key}")
+        if any(
+            abs(float(requested[axis]) - float(expected[axis])) > 0.05
+            for axis in ["x_mm", "y_mm", "z_mm"]
+        ):
+            raise ValueError(f"{key} changed after preview; preview and execute the measurement move again")
+    all_encoder_measured = (
+        len(state.encoder_available) >= len(config.joints)
+        and all(bit == "1" for bit in state.encoder_available[: len(config.joints)])
+        and all(value is not None for value in state.encoder_angles_deg[: len(config.joints)])
+    )
+    return {
+        "preview_id": preview_id,
+        "preview_source": preview.get("source"),
+        "preview_created_at": preview.get("created_at"),
+        "execution_started_at": preview.get("execution_started_at"),
+        "captured_pose_revision": int(state.pose_revision),
+        "captured_pose_source": state.pose_source,
+        "joint_authority": "measured_encoder" if all_encoder_measured else "estimated_open_loop",
+        "reported_pose_is_estimated": not all_encoder_measured,
+        "model_fingerprint": preview.get("model_fingerprint"),
+        "config_id": preview.get("config_id"),
+        "context": kinematics_calibration_context(config),
+    }
+
+
 @app.get("/api/kinematics-calibration")
 async def get_kinematics_calibration() -> dict[str, Any]:
-    return {"ok": True, **kinematics_calibration_summary(config)}
+    return {
+        "ok": True,
+        "physical_model_parameter_groups": deepcopy(PHYSICAL_MODEL_PARAMETER_GROUPS),
+        **kinematics_calibration_summary(config),
+    }
 
 
 @app.post("/api/kinematics-calibration/targets")
 async def generate_kinematics_calibration_targets(
     request: KinematicsCalibrationTargetsRequest,
 ) -> dict[str, Any]:
-    if not 1 <= request.rows <= 10 or not 1 <= request.columns <= 10:
-        return {"ok": False, "error": "rows and columns must be between 1 and 10"}
-    if not all(
-        isfinite(float(value))
-        for value in [request.margin_mm, request.z_mm, request.phi_deg]
-    ):
-        return {"ok": False, "error": "target generation values must be finite"}
+    if not 2 <= int(request.validation_stride) <= 20:
+        return {"ok": False, "error": "validation_stride must be between 2 and 20"}
     try:
         polygon = _workspace_polygon()
-        min_x = min(point[0] for point in polygon) + max(0.0, float(request.margin_mm))
-        max_x = max(point[0] for point in polygon) - max(0.0, float(request.margin_mm))
-        min_y = min(point[1] for point in polygon) + max(0.0, float(request.margin_mm))
-        max_y = max(point[1] for point in polygon) - max(0.0, float(request.margin_mm))
-        if min_x > max_x or min_y > max_y:
-            raise ValueError("margin leaves no usable workspace area")
-        points: list[dict[str, Any]] = []
-        for row in range(request.rows):
-            y = (min_y + max_y) * 0.5 if request.rows == 1 else min_y + (max_y - min_y) * row / (request.rows - 1)
-            columns = range(request.columns) if row % 2 == 0 else reversed(range(request.columns))
-            for column in columns:
-                x = (
-                    (min_x + max_x) * 0.5
-                    if request.columns == 1
-                    else min_x + (max_x - min_x) * column / (request.columns - 1)
-                )
-                if not _point_inside_polygon(x, y, polygon):
-                    continue
-                intended = {
-                    "x_mm": float(x),
-                    "y_mm": float(y),
-                    "z_mm": float(request.z_mm),
-                    "phi_deg": float(request.phi_deg),
-                }
-                command, correction = correct_cartesian_target(
-                    intended,
-                    config,
-                    apply_enabled=request.apply_calibration,
-                )
-                ik = inverse_kinematics(
-                    command,
-                    config.links,
-                    config.joints,
-                    state.reported_angles_deg,
-                )
-                points.append(
-                    {
-                        "index": len(points) + 1,
-                        "intended_target": intended,
-                        "command_target": command,
-                        "calibration": correction,
-                        "reachable": bool(ik.get("ok") and ik.get("selected")),
-                        "diagnostic_category": "reachable" if ik.get("ok") and ik.get("selected") else "ik_reachability",
-                        "ik_notes": ik.get("notes", []),
-                    }
-                )
+        generated = await asyncio.to_thread(
+            _automatic_calibration_targets,
+            config,
+            polygon,
+            count=int(request.count),
+            validation_stride=int(request.validation_stride),
+        )
+        points = generated["points"]
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     summary = kinematics_calibration_summary(config)
     return {
         "ok": True,
         "points": points,
+        "strategy": generated["strategy"],
         "workspace": kinematics_workspace_context(config),
         "fit_quality": summary.get("fit_quality"),
         "validation_quality": summary.get("validation_quality"),
         "reachability": {
-            "reachable_count": sum(1 for point in points if point["reachable"]),
-            "unreachable_count": sum(1 for point in points if not point["reachable"]),
+            "reachable_count": len(points),
+            "unreachable_count": 0,
         },
     }
 
@@ -4783,14 +5379,28 @@ async def save_kinematics_calibration_sample(
     if not state.simulation and (not state.connected or not state.known_pose):
         return {"ok": False, "error": "hardware calibration samples require a connected robot with a known pose"}
     try:
+        capture = _calibration_capture_contract(request)
+        existing_settings = kinematics_calibration_settings(config)
+        for existing_profile in existing_settings.get("profiles", {}).values():
+            if not isinstance(existing_profile, dict):
+                continue
+            if any(
+                str(sample.get("capture", {}).get("preview_id") or "") == str(request.preview_id or "")
+                for sample in existing_profile.get("samples", [])
+                if isinstance(sample, dict)
+            ):
+                raise ValueError("this calibration preview already has a saved sample")
         current_fk = forward_kinematics(state.reported_angles_deg, config.links)
+        payload = dict(request.__dict__)
+        payload["capture"] = capture
+        payload["joint_source"] = capture["joint_authority"]
         sample = create_kinematics_calibration_sample(
-            request.__dict__,
+            payload,
             config,
             state.reported_angles_deg,
             current_fk,
         )
-        settings = kinematics_calibration_settings(config)
+        settings = existing_settings
         profile_key = sample["tool"]
         profiles = settings.setdefault("profiles", {})
         profile = deepcopy(profiles.get(profile_key) or {})
@@ -4804,6 +5414,7 @@ async def save_kinematics_calibration_sample(
                 "enabled": bool(profile.get("enabled", False)),
                 "model_type": str(profile.get("model_type") or settings.get("default_model") or "affine_xy_z_offset"),
                 "workspace": kinematics_workspace_context(config),
+                "context": kinematics_calibration_context(config, profile_key),
                 "samples": samples,
             }
         )
@@ -4811,6 +5422,8 @@ async def save_kinematics_calibration_sample(
         settings["active_profile"] = profile_key
         if sample["role"] == "fit":
             profile.pop("result", None)
+            profile.pop("activation", None)
+            profile.pop("physical_model_result", None)
             profile["enabled"] = False
             settings["enabled"] = False
         elif isinstance(profile.get("result"), dict):
@@ -4848,6 +5461,8 @@ async def delete_kinematics_calibration_sample(sample_id: str) -> dict[str, Any]
         return {"ok": False, "error": "calibration sample not found"}
     profile["samples"] = retained
     profile.pop("result", None)
+    profile.pop("activation", None)
+    profile.pop("physical_model_result", None)
     profile["enabled"] = False
     settings["enabled"] = False
     _persist_kinematics_calibration(settings)
@@ -4870,8 +5485,10 @@ async def fit_kinematics_calibration(
         )
         profile_key = str(settings.get("active_profile"))
         profile = settings["profiles"][profile_key]
-        profile["enabled"] = bool(request.enable_after_fit)
-        settings["enabled"] = bool(request.enable_after_fit)
+        activation = result.get("activation") if isinstance(result.get("activation"), dict) else {}
+        enable = bool(request.enable_after_fit and activation.get("eligible"))
+        profile["enabled"] = enable
+        settings["enabled"] = enable
         _persist_kinematics_calibration(settings)
     except Exception as exc:
         return {"ok": False, "error": str(exc), "diagnostic_category": "fit_quality"}
@@ -4905,6 +5522,18 @@ async def enable_kinematics_calibration(
     profile = profiles.get(profile_key) if isinstance(profiles, dict) else None
     if request.enabled and (not isinstance(profile, dict) or not isinstance(profile.get("result"), dict)):
         return {"ok": False, "error": "fit and save a calibration result before enabling it"}
+    summary = kinematics_calibration_summary(config)
+    if request.enabled and not summary.get("freshness", {}).get("fresh"):
+        return {
+            "ok": False,
+            "error": "calibration profile is stale: " + "; ".join(summary.get("freshness", {}).get("messages", [])),
+        }
+    if request.enabled and not summary.get("activation", {}).get("eligible"):
+        return {
+            "ok": False,
+            "error": "calibration correction is not eligible: "
+            + "; ".join(summary.get("activation", {}).get("reasons", [])),
+        }
     if isinstance(profile, dict):
         profile["enabled"] = bool(request.enabled)
     settings["active_profile"] = profile_key
@@ -4915,6 +5544,117 @@ async def enable_kinematics_calibration(
         return {"ok": False, "error": str(exc)}
     log_event("calibration", "TCP calibration state changed", enabled=request.enabled, profile=profile_key)
     return {"ok": True, "config": public_config(), **kinematics_calibration_summary(config)}
+
+
+@app.post("/api/kinematics-calibration/physical-model/fit")
+async def fit_kinematics_physical_model(
+    request: PhysicalModelFitRequest,
+) -> dict[str, Any]:
+    if state.motion_state == MotionState.MOVING:
+        return {"ok": False, "error": "stop motion before fitting the physical model"}
+    settings = kinematics_calibration_settings(config)
+    profile_key = str(
+        request.profile_key
+        or kinematics_calibration_summary(config).get("active_profile_key")
+        or ""
+    )
+    profiles = settings.get("profiles")
+    profile = profiles.get(profile_key) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict):
+        return {"ok": False, "error": "active calibration profile not found"}
+    try:
+        result = fit_physical_model(
+            profile,
+            config,
+            parameter_group=request.parameter_group,
+            thresholds=settings.get("thresholds"),
+        )
+        profile["physical_model_result"] = result
+        profile["enabled"] = False
+        settings["enabled"] = False
+        _persist_kinematics_calibration(settings)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "diagnostic_category": "physical_model_fit"}
+    log_event(
+        "calibration",
+        "physical model candidate fitted",
+        result_id=result["id"],
+        parameter_group=request.parameter_group,
+        safe_to_apply=result.get("safe_to_apply"),
+    )
+    return {
+        "ok": True,
+        "result": result,
+        "config": public_config(),
+        **kinematics_calibration_summary(config),
+    }
+
+
+@app.post("/api/kinematics-calibration/physical-model/apply")
+async def apply_kinematics_physical_model(
+    request: PhysicalModelApplyRequest,
+) -> dict[str, Any]:
+    if not request.confirm:
+        return {"ok": False, "error": "explicit confirmation is required before applying a physical-model update"}
+    if state.motion_state == MotionState.MOVING or any(
+        task is not None and not task.done() for task in [path_task, live_task, task_task]
+    ):
+        return {"ok": False, "error": "stop all motion and tasks before applying a physical-model update"}
+    if state.hardware_armed:
+        return {"ok": False, "error": "disarm hardware before applying a physical-model update"}
+    settings = kinematics_calibration_settings(config)
+    profile_key = str(
+        request.profile_key
+        or kinematics_calibration_summary(config).get("active_profile_key")
+        or ""
+    )
+    profiles = settings.get("profiles")
+    profile = profiles.get(profile_key) if isinstance(profiles, dict) else None
+    result = profile.get("physical_model_result") if isinstance(profile, dict) else None
+    if not isinstance(result, dict) or str(result.get("id")) != request.result_id:
+        return {"ok": False, "error": "physical-model result not found or no longer active"}
+    if result.get("context", {}).get("model", {}).get("signature") != kinematics_calibration_context(config).get("model", {}).get("signature"):
+        return {"ok": False, "error": "robot model changed after fitting; refit before applying"}
+    try:
+        updates = physical_model_updates(config, result)
+        applied_result = deepcopy(result)
+        applied_result["applied_at"] = datetime.now(timezone.utc).isoformat()
+        profile["last_applied_physical_model_result"] = applied_result
+        existing_samples = deepcopy(profile.get("samples") or [])
+        archives = profile.get("sample_archives")
+        archives = list(archives) if isinstance(archives, list) else []
+        if existing_samples:
+            archives.append(
+                {
+                    "archived_at": applied_result["applied_at"],
+                    "reason": "physical model changed; samples no longer match the active model",
+                    "samples": existing_samples,
+                }
+            )
+        profile["sample_archives"] = archives[-3:]
+        profile["samples"] = []
+        profile.pop("context", None)
+        profile.pop("physical_model_result", None)
+        profile.pop("result", None)
+        profile.pop("activation", None)
+        profile["enabled"] = False
+        settings["enabled"] = False
+        updates["kinematics_calibration"] = settings
+        _persist_calibration_updates(updates)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    log_event(
+        "calibration",
+        "physical model update applied",
+        result_id=request.result_id,
+        parameter_group=result.get("parameter_group"),
+    )
+    return {
+        "ok": True,
+        "message": "physical model updated; correction disabled and all previews invalidated",
+        "config": public_config(),
+        "state": state.to_dict(),
+    }
 
 
 @app.post("/api/ik/solve")
@@ -4933,17 +5673,42 @@ async def solve_ik(request: IkSolveRequest) -> dict[str, Any]:
 @app.post("/api/path/preview")
 async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
     links = links_from_override(request.links_mm)
-    return build_preview(
+    purpose = str(request.purpose or "path")
+    calibration_move = purpose in {
+        "kinematics_calibration_fit",
+        "kinematics_calibration_validation",
+    }
+    result = build_preview(
         mode=request.mode,
         target=request.target.__dict__ if request.target else None,
         waypoint_program=request.waypoints,
         links=links,
-        settings=request_settings(request.settings),
+        settings=calibration_path_settings(request.settings) if calibration_move else request_settings(request.settings),
         branch=request.branch,
-        source="path",
+        source=purpose if calibration_move else "path",
         apply_calibration=request.apply_calibration,
+        calibration_trial=purpose == "kinematics_calibration_validation",
         program_revision=request.program_revision,
     )
+    if (
+        result.get("ok")
+        and request.mode.lower() == "program"
+        and request.program_id
+        and request.waypoints
+    ):
+        try:
+            result["plan_cache"] = {
+                "saved": True,
+                **cache_program_preview(
+                    request.program_id,
+                    request.waypoints,
+                    result["preview"],
+                ),
+            }
+            result["preview"]["program_id"] = request.program_id
+        except ProgramLibraryError as exc:
+            result["plan_cache"] = {"saved": False, "error": str(exc)}
+    return result
 
 
 @app.post("/api/programs/preview-step")
@@ -5020,6 +5785,9 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
 
     state.clear_error()
     state.last_command = f"PATH_EXECUTE {request.preview_id}"
+    preview["execution_started_at"] = time()
+    preview["execution_start_pose_revision"] = int(state.pose_revision)
+    preview["execution_count"] = int(preview.get("execution_count", 0)) + 1
     path_task_source = "path_execute"
     trajectory = preview.get("trajectory", {})
     trajectory_mode = str(trajectory.get("mode", preview.get("mode", ""))).lower()
@@ -5058,6 +5826,10 @@ async def go_path(request: PathGoRequest) -> dict[str, Any]:
 @app.post("/api/task/preview")
 async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
     profiles = deepcopy(color_profiles(config))
+    detection_snapshot_id: str | None = None
+    detection_captured_at: float | None = None
+    detection_fingerprint: str | None = None
+    detection_snapshot_server_bound = False
     task_settings_raw = request.task_settings or {}
     profile_overrides = None
     if isinstance(task_settings_raw, dict):
@@ -5079,6 +5851,25 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             detections = request.detections or ([request.detection] if request.detection else [])
             if not detections:
                 raise TaskSettingsError("refresh detections before previewing a color-sorting task")
+            detection_fingerprint = stable_payload_fingerprint(detections)
+            if request.detection_snapshot_id:
+                detection_snapshot_id = str(request.detection_snapshot_id)
+                if latest_vision_snapshot:
+                    if detection_snapshot_id != str(latest_vision_snapshot.get("id") or ""):
+                        raise TaskSettingsError(
+                            "detection snapshot is stale; refresh detections before previewing the task"
+                        )
+                    if detection_fingerprint != latest_vision_snapshot.get("fingerprint"):
+                        raise TaskSettingsError(
+                            "detection snapshot contents do not match the latest capture"
+                        )
+                    detection_snapshot_server_bound = True
+                    detection_captured_at = float(latest_vision_snapshot.get("captured_at") or time())
+                else:
+                    detection_captured_at = float(request.detection_captured_at or time())
+            else:
+                detection_snapshot_id = f"client-{detection_fingerprint}"
+                detection_captured_at = float(request.detection_captured_at or time())
             sequence = build_color_sorting_plan(
                 config,
                 detections,
@@ -5130,6 +5921,30 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             "task_preview": {"warnings": [], "ignored_detections": [], "selected_objects": []},
             "state": state.to_dict(),
         }
+    task_preview = dict(sequence.get("task_preview", {}))
+    normalized_task_settings = task_preview.get("normalized_settings") or request.task_settings or {}
+    settings_revision = task_contract_fingerprint(
+        task_settings=normalized_task_settings,
+        path_settings=path_settings,
+        branch=request.branch,
+        selected_detection_ids=request.selected_detection_ids,
+    )
+    destination_revision = task_mapping_fingerprint()
+    bindings = {
+        "detection_snapshot_id": detection_snapshot_id,
+        "detection_captured_at": detection_captured_at,
+        "detection_fingerprint": detection_fingerprint,
+        "pose_revision": int(state.pose_revision),
+        "config_id": RUNNING_CONFIG_ID,
+        "model_fingerprint": robot_model_fingerprint(),
+        "task_settings_revision": settings_revision,
+        "destination_revision": destination_revision,
+    }
+    task_preview["bindings"] = bindings
+    task_preview["active_tool"] = str(tools_settings(config).get("active", ""))
+    task_preview["tool_type"] = str(tool_settings(config).get("type", ""))
+    sequence["task_preview"] = task_preview
+
     if not sequence["ok"]:
         state.set_error("; ".join(sequence.get("errors", [])) or "task preview failed")
         await broadcast_state()
@@ -5160,9 +5975,9 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             "state": state.to_dict(),
         }
     preview_id = preview_result["preview_id"]
-    task_preview = dict(sequence.get("task_preview", {}))
     task_preview["estimated_duration_s"] = preview_result["preview"].get("trajectory", {}).get("duration_s", 0.0)
     sequence["task_preview"] = task_preview
+    preview_result["preview"]["task_bindings"] = bindings
     task_previews[preview_id] = {
         "id": preview_id,
         "created_at": time(),
@@ -5178,6 +5993,13 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
         "task_preview": task_preview,
         "settings": path_settings,
         "branch": request.branch,
+        "selected_detection_ids": [str(value) for value in request.selected_detection_ids or []],
+        "detection_snapshot_id": detection_snapshot_id,
+        "detection_captured_at": detection_captured_at,
+        "detection_fingerprint": detection_fingerprint,
+        "detection_snapshot_server_bound": detection_snapshot_server_bound,
+        "task_settings_revision": settings_revision,
+        "destination_revision": destination_revision,
         "config_id": RUNNING_CONFIG_ID,
         "consumed": False,
     }
@@ -5211,7 +6033,7 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
         state.set_error("robot configuration changed after preview; preview the task again")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    stale_reason = preview_stale_reason(preview)
+    stale_reason = task_preview_stale_reason(preview)
     if stale_reason:
         state.set_error(stale_reason.replace("preview again", "preview the task again"))
         log_event(
@@ -5322,7 +6144,7 @@ async def stop_task() -> dict[str, Any]:
         except asyncio.CancelledError:
             pass
     if state.task_execution and state.task_execution.get("status") in ACTIVE_TASK_STATUSES:
-        finish_task_execution("stopped", "task stop requested", holding_uncertain=True)
+        finish_task_execution("stopped", "task stop requested")
     await broadcast_state()
     return {"ok": bool(result.get("ok")), "state": state.to_dict()}
 
@@ -6005,7 +6827,7 @@ async def stop() -> dict[str, Any]:
     state.last_command = format_stop()
     finish_motion_diagnostics("stopped", "STOP")
     if task_active():
-        finish_task_execution("stopped", "STOP", holding_uncertain=True)
+        finish_task_execution("stopped", "STOP")
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_stop())
         refresh_serial_status()
@@ -6032,7 +6854,7 @@ async def estop() -> dict[str, Any]:
     state.last_command = format_estop()
     finish_motion_diagnostics("stopped", "ESTOP")
     if task_active():
-        finish_task_execution("stopped", "ESTOP", holding_uncertain=True)
+        finish_task_execution("stopped", "ESTOP")
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_estop())
         refresh_serial_status()

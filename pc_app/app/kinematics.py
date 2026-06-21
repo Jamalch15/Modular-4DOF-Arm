@@ -30,6 +30,8 @@ Standard DH kinematics with the project robot frame mapped from the DH frame:
 
 CARTESIAN_POSITION_PROGRESS_MIN_FRACTION = 0.20
 CARTESIAN_DIRECTION_ALIGNMENT_MIN = 0.95
+AUTO_PHI_DOWNWARD_FORWARD_BOUNDARY_DEG = -90.0
+AUTO_PHI_DOWNWARD_FORWARD_PREFERRED_DEG = -100.0
 
 
 def _default_rows(links: LinkConfig) -> list[DHRowConfig]:
@@ -855,6 +857,38 @@ def _target_requests_auto_phi(target: dict[str, Any]) -> bool:
     return target.get("phi_deg") is None and target.get("tool_phi_deg") is None
 
 
+def _effective_auto_phi_preference(preferred_phi_deg: float | None) -> float:
+    if (
+        preferred_phi_deg is not None
+        and isfinite(preferred_phi_deg)
+        and _normalize_deg(preferred_phi_deg) < AUTO_PHI_DOWNWARD_FORWARD_BOUNDARY_DEG
+    ):
+        return _normalize_deg(preferred_phi_deg)
+    return AUTO_PHI_DOWNWARD_FORWARD_PREFERRED_DEG
+
+
+def _auto_phi_priority_key(
+    phi_deg: float,
+    current_phi_deg: float,
+    preferred_phi_deg: float | None,
+) -> tuple[float, ...]:
+    normalized = _normalize_deg(phi_deg)
+    effective_preference = _effective_auto_phi_preference(preferred_phi_deg)
+    if normalized < AUTO_PHI_DOWNWARD_FORWARD_BOUNDARY_DEG:
+        return (
+            0.0,
+            angle_distance_deg(normalized, effective_preference),
+            angle_distance_deg(normalized, current_phi_deg),
+            normalized,
+        )
+    return (
+        1.0,
+        angle_distance_deg(normalized, current_phi_deg),
+        angle_distance_deg(normalized, effective_preference),
+        normalized,
+    )
+
+
 def _auto_phi_values(current_phi_deg: float, preferred_phi_deg: float | None = None) -> list[float]:
     values: list[float] = []
     seen: set[int] = set()
@@ -866,25 +900,17 @@ def _auto_phi_values(current_phi_deg: float, preferred_phi_deg: float | None = N
             values.append(normalized)
             seen.add(key)
 
+    effective_preference = _effective_auto_phi_preference(preferred_phi_deg)
     if preferred_phi_deg is not None and isfinite(preferred_phi_deg):
         for delta in [0, -5, 5, -10, 10, -15, 15, -20, 20, -30, 30, -45, 45, -60, 60]:
             add(preferred_phi_deg + delta)
+    for delta in [0, -5, 5, -10, 10, -15, 15, -20, 20, -30, 30, -45, 45, -60, 60]:
+        add(effective_preference + delta)
     for delta in [0, -10, 10, -20, 20, -30, 30, -45, 45, -60, 60, -90, 90, -120, 120, -150, 150, 180]:
         add(current_phi_deg + delta)
     for value in range(-180, 181, 15):
         add(float(value))
-    reference_phi = (
-        preferred_phi_deg
-        if preferred_phi_deg is not None and isfinite(preferred_phi_deg)
-        else current_phi_deg
-    )
-    values.sort(
-        key=lambda value: (
-            angle_distance_deg(value, reference_phi),
-            angle_distance_deg(value, current_phi_deg),
-            value,
-        )
-    )
+    values.sort(key=lambda value: _auto_phi_priority_key(value, current_phi_deg, preferred_phi_deg))
     return values
 
 
@@ -967,10 +993,13 @@ def _auto_phi_candidate_score(
     current_phi_deg: float,
     preferred_phi_deg: float | None = None,
 ) -> tuple[float, ...]:
-    phi_delta = angle_distance_deg(candidate["fk"]["tool_phi_deg"], current_phi_deg)
+    candidate_phi = float(candidate["fk"]["tool_phi_deg"])
+    priority = _auto_phi_priority_key(candidate_phi, current_phi_deg, preferred_phi_deg)
+    phi_delta = angle_distance_deg(candidate_phi, current_phi_deg)
     if preferred_phi_deg is not None and isfinite(preferred_phi_deg):
-        preferred_delta = angle_distance_deg(candidate["fk"]["tool_phi_deg"], preferred_phi_deg)
+        preferred_delta = angle_distance_deg(candidate_phi, preferred_phi_deg)
         return (
+            *priority[:2],
             preferred_delta,
             _candidate_continuity_error(candidate, current),
             0 if candidate["branch"] == "elbow_down" else 1,
@@ -978,6 +1007,7 @@ def _auto_phi_candidate_score(
             phi_delta,
         )
     return (
+        *priority[:2],
         candidate["position_error_mm"],
         _candidate_continuity_error(candidate, current),
         phi_delta,
@@ -1021,14 +1051,16 @@ def _inverse_kinematics_auto_phi(
     notes: list[str] = ["auto_phi"]
     if preferred_phi is not None and isfinite(preferred_phi):
         notes.append(f"preferred_phi {preferred_phi:.1f} deg")
+    notes.append(
+        f"downward_forward_priority phi < {AUTO_PHI_DOWNWARD_FORWARD_BOUNDARY_DEG:.1f} deg"
+    )
     seed_notes: list[str] = []
     searched_phi_values = 0
-    best_reference_delta: float | None = None
-    reference_phi = preferred_phi if preferred_phi is not None and isfinite(preferred_phi) else current_phi
+    best_priority_key: tuple[float, ...] | None = None
 
     for phi in phi_values:
-        reference_delta = angle_distance_deg(phi, reference_phi)
-        if best_reference_delta is not None and reference_delta > best_reference_delta + 1e-9:
+        priority_key = _auto_phi_priority_key(phi, current_phi, preferred_phi)
+        if best_priority_key is not None and priority_key[:2] > best_priority_key[:2]:
             break
         searched_phi_values += 1
         pose = {
@@ -1081,7 +1113,7 @@ def _inverse_kinematics_auto_phi(
                 if candidate["branch"] == requested_branch
             ]
         if selectable_phi_candidates:
-            best_reference_delta = reference_delta
+            best_priority_key = priority_key
 
     notes.insert(1, f"searched {searched_phi_values} phi values")
 
