@@ -150,10 +150,14 @@ by constant reach and Z offsets.
 The reach/Z model can be entered manually in the Settings TCP calibration
 panel. Enter offsets as measured-minus-commanded error: positive reach means
 the TCP lands farther from the base than requested, and positive Z means it
-lands higher. Manual offsets still use the same command-correction path and
-stale signature checks as fitted profiles, but they do not require fit or
-validation samples. Treat them as operator-entered compensation, not proof that
-the model is physically correct.
+lands higher. `Save and apply manual offsets` persists and enables the entered
+values in one action. Manual offsets still use the same command-correction path,
+stale signature checks, IK reachability checks, and path preview as fitted
+profiles, but they do not require fit or validation samples. Values beyond the
+automatic-fit correction limits remain eligible because they were explicitly
+entered by the operator; the UI reports them as warnings. Treat manual values
+as operator-entered compensation, not proof that the model is physically
+correct.
 
 Validation trials can use a fitted correction at conservative speed without
 globally enabling it. Normal Cartesian paths use correction only when:
@@ -162,14 +166,14 @@ globally enabling it. Normal Cartesian paths use correction only when:
 - tool/TCP, model, actuator, workspace, and measurement-reference signatures
   are fresh;
 - at least two held-out corrected landing samples pass for fitted profiles;
-- correction magnitude is below configured limits;
+- fitted correction magnitude is below configured automatic-enable limits;
 - radial samples are far enough from the base axis when fitting reach
   correction;
 - affine sample coverage is adequate.
 
 Joint-space commands and live Cartesian velocity jogging remain uncorrected.
-Endpoint Cartesian previews, programs, named Cartesian positions, and tasks
-share the same command-layer path.
+Endpoint Cartesian previews, direct IK solves, programs, named Cartesian
+positions, and tasks share the same command-layer path.
 
 ## When to Refit
 

@@ -145,6 +145,41 @@ def test_frontend_contains_model_truth_and_tcp_frame_hooks():
     assert "currentTcpAxisZ" in robot_view_js
 
 
+def test_frontend_places_encoder_controls_in_hardware_settings():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    joint_section = index_html.split('id="settingsJoints"', 1)[1].split('id="settingsMotion"', 1)[0]
+    hardware_section = index_html.split('id="settingsHardware"', 1)[1].split("</section>", 1)[0]
+
+    assert 'id="encoderCalibration"' not in joint_section
+    assert 'id="encoderCalibration"' in hardware_section
+    assert "Shoulder encoder hardware" in hardware_section
+    assert "Enable encoder readback" in app_js
+    assert "Use shoulder AS5048A" in app_js
+    assert "Quick shoulder encoder setup" in app_js
+    assert "Quick calibrate" in app_js
+    assert "Run backlash check" in app_js
+    assert "Run assisted sweep" in app_js
+    assert "encoderActionStatus" in app_js
+    assert "Start + capture reference 1" in app_js
+    assert "Move shoulder to angle" in app_js
+    assert "data-encoder-correction-field" in app_js
+    assert "settings.correction.enabled = false;" in app_js
+    assert "Encoder hardware, calibration, or policy settings changed" in app_js
+    assert "Fault threshold only controls when mismatch becomes a fault" in app_js
+    assert "Correction max delta deg (movement cap)" in app_js
+    assert "Measured shoulder live" in app_js
+    assert "Raw shoulder sensor" in app_js
+    assert "Correction gate" in app_js
+    assert "Latest shoulder encoder readback" in app_js
+    sweep_handler = app_js.split("async function runAssistedEncoderSweep()", 1)[1].split(
+        "async function cancelAssistedEncoderSweep()",
+        1,
+    )[0]
+    assert "window.confirm" not in sweep_handler
+    assert 'postJson("/api/encoder/calibration/sweep/start"' in sweep_handler
+
+
 def test_frontend_contains_position_library_hooks():
     app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -205,3 +240,24 @@ def test_frontend_contains_program_library_workflow_and_demo_hooks():
     assert "previewSelectedProgramTarget" in app_js
     assert "executeSelectedProgramTarget" in app_js
     assert 'postJson("/api/path/preview"' in app_js
+    assert "Save and apply manual offsets" in index_html
+    assert 'enabled: true' in app_js
+    execute_preview = app_js.split("async function executePreview()", 1)[1].split(
+        "function activeProgramRecord()",
+        1,
+    )[0]
+    assert "state.ikUserEdited = true;" in execute_preview
+    assert "state.ikUserEdited = false;" not in execute_preview
+    assert "state.latestPreview = null;" in execute_preview
+    preview_ik = app_js.split("async function previewIkPath()", 1)[1].split(
+        "function scheduleIkPreview(",
+        1,
+    )[0]
+    assert "const requestedTarget = ikTargetPayload();" in preview_ik
+    assert "setIkTargetFromRequestedTarget(requestedTarget);" in preview_ik
+    render_state = app_js.split("function renderState(robotState)", 1)[1].split(
+        "function renderPreview(",
+        1,
+    )[0]
+    assert "const preserveRequestedIkTarget = state.ikUserEdited;" in render_state
+    assert "state.ikUserEdited = preserveRequestedIkTarget;" in render_state

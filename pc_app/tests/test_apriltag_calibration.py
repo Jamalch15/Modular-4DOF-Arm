@@ -20,13 +20,13 @@ from app.apriltag_calibration import (
     tag_world_center,
     tag_world_corners,
 )
-from app.config import load_config
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import camera_settings
 from app.vision import encode_image_b64
 
 
 def calibrated_camera() -> dict:
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     camera = camera_settings(config)
     camera["intrinsics"] = {
         "source": "synthetic_test",
@@ -246,7 +246,7 @@ def test_session_resets_samples_when_tag_anchor_geometry_changes():
 
 
 def test_camera_settings_deep_merge_keeps_apriltag_defaults():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     patched = replace(config, raw={**config.raw, "camera": {"source_index": 2, "intrinsics": {"fx_px": 800.0}}})
 
     camera = camera_settings(patched)

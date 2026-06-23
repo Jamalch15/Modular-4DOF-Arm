@@ -10,7 +10,7 @@ from app.vision import apply_planar_transform, detect_configured_colors, planar_
 
 
 def test_named_positions_are_valid_or_report_reasons():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     positions = named_positions(config)
 
     assert "safe" in positions

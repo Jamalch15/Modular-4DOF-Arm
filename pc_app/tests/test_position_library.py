@@ -289,11 +289,13 @@ def test_position_library_allows_duplicate_display_names_with_stable_ids(tmp_pat
     main.state.hardware_armed = False
     monkeypatch.setattr(main, "ensure_local_config", lambda: target)
     client = TestClient(main.app)
+    existing = client.get("/api/position-library").json()["positions"]
 
     payload = client.post(
         "/api/position-library",
         json={
             "positions": {
+                **existing,
                 "fixture_left": {
                     "type": "cartesian",
                     "display_name": "Fixture",
@@ -310,7 +312,7 @@ def test_position_library_allows_duplicate_display_names_with_stable_ids(tmp_pat
     saved = load_config(target)
 
     assert payload["ok"], payload
-    assert set(saved.raw["position_library"]["positions"]) == {"fixture_left", "fixture_right"}
+    assert {"fixture_left", "fixture_right"} <= set(saved.raw["position_library"]["positions"])
     assert saved.raw["position_library"]["positions"]["fixture_left"]["display_name"] == "Fixture"
     assert saved.raw["position_library"]["positions"]["fixture_right"]["display_name"] == "Fixture"
     assert saved.raw["position_library"]["positions"]["fixture_left"]["created_at"]
@@ -460,6 +462,30 @@ def test_position_library_rejects_deleting_position_used_by_task_destination(tmp
 
     assert not payload["ok"]
     assert "break task destination references" in payload["error"]
+
+
+def test_position_library_can_delete_safe_without_task_workflow_restoring_it(tmp_path, monkeypatch):
+    target = tmp_path / "robot.local.yaml"
+    copyfile(EXAMPLE_CONFIG_PATH, target)
+    main.cancel_motion_tasks()
+    main.config = load_config(target)
+    main.state.motion_state = MotionState.IDLE
+    main.state.live_motion_enabled = False
+    main.state.hardware_armed = False
+    monkeypatch.setattr(main, "ensure_local_config", lambda: target)
+    client = TestClient(main.app)
+
+    positions = client.get("/api/position-library").json()["positions"]
+    positions.pop("safe")
+    payload = client.post("/api/position-library", json={"positions": positions}).json()
+    saved = load_config(target)
+
+    assert payload["ok"], payload
+    assert "safe" not in payload["positions"]
+    assert "safe" not in saved.raw["position_library"]["positions"]
+    assert "safe" not in named_positions(saved)
+    assert saved.raw["tasks"]["color_sorting"]["safe_position"] == "home"
+    assert saved.raw["tasks"]["color_sorting"]["camera_clear_position"] == "home"
 
 
 def test_task_mapping_api_saves_new_schema_legacy_bridge_and_clears_draft(tmp_path, monkeypatch):

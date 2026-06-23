@@ -498,3 +498,26 @@ def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):
         assert "does not support" in payload["error"]
     finally:
         monkeypatch.setattr(main, "config", original_config)
+
+
+def test_tool_hardware_ack_does_not_require_redundant_status_round_trip(monkeypatch):
+    reset_runtime_state()
+    try:
+        main.state.simulation = False
+        main.state.hardware_armed = True
+        main.state.tool_state = "unknown"
+        fake = FakeSerial(["OK command=TOOL state=open value=0.000"])
+        monkeypatch.setattr(main, "serial_client", fake)
+        client = TestClient(main.app)
+
+        payload = client.post("/api/tool", json={"action": "open", "tool": "gripper"}).json()
+
+        assert payload["ok"] is True
+        assert fake.sent == ["TOOL OPEN"]
+        assert payload["state"]["tool_state"] == "open"
+        assert payload["state"]["tool_value"] == 0.0
+        assert payload["state"]["motion_state"] == "idle"
+        assert payload["state"]["last_controller_response"].startswith("OK command=TOOL")
+    finally:
+        main.state.simulation = True
+        main.state.hardware_armed = False

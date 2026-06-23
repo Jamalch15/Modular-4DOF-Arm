@@ -45,6 +45,15 @@ from .cartesian_calibration import (
 )
 from .calibration_truth import model_truth_summary
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
+from .encoder import (
+    calibrated_joint_angle,
+    empty_evidence,
+    encoder_axis,
+    evidence_from_status,
+    normalize_encoder_settings,
+    validate_encoder_settings,
+    wrapped_delta_deg,
+)
 from .demo_settings import (
     active_tool_dimensions_validated,
     camera_settings,
@@ -70,6 +79,7 @@ from .motion import (
     build_linear_cartesian_trajectory,
     build_program_trajectory,
     has_reached_target,
+    ik_selection_policy,
 )
 from .position_library import (
     POSITION_LIBRARY_SCHEMA_VERSION,
@@ -107,6 +117,7 @@ from .task_destinations import (
 from .protocol import (
     format_arm,
     format_config_lines,
+    format_correctj,
     format_estop,
     format_hello,
     format_jog_stop,
@@ -121,6 +132,7 @@ from .protocol import (
     format_traj_begin,
     format_traj_point,
     format_traj_start,
+    parse_hello_capabilities,
     parse_status,
 )
 from .robot_state import MotionState, RobotState
@@ -262,7 +274,7 @@ state = RobotState(
 )
 state.active_tool = str(tools_settings(config).get("active", "gripper"))
 state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
-state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
+state.closed_loop_mode = str(encoder_settings(config).get("mode", "diagnostic"))
 state.fk = forward_kinematics(state.reported_angles_deg, config.links)
 limiter = RateLimitedMotion(config, state.reported_angles_deg.copy(), state.target_angles_deg.copy())
 serial_client = SerialClient(config.serial)
@@ -278,6 +290,8 @@ task_selection_choices: dict[str, str] = {}
 task_confirmation_events: dict[str, asyncio.Event] = {}
 simulation_vision_queue: list[dict[str, Any]] = []
 latest_vision_snapshot: dict[str, Any] = {}
+encoder_calibration_sessions: dict[str, dict[str, Any]] = {}
+encoder_calibration_sweep_task: asyncio.Task[None] | None = None
 cartesian_jog_task: asyncio.Task[None] | None = None
 event_log = EventLog()
 active_motion_run_id: str | None = None
@@ -846,7 +860,10 @@ def build_task_motion_preview_skipping_failed_objects(
             failure = {
                 **preview_result,
                 "ok": False,
-                "error": "no task objects have a reachable IK path",
+                "error": (
+                    "no task objects have a safe continuous IK path"
+                    + (f"; last rejection: {reason}" if reason else "")
+                ),
             }
             return failure, current_sequence, skipped
 
@@ -904,6 +921,7 @@ class IkSolveRequest(BaseModel):
     target: IkTargetRequest
     links_mm: dict[str, float] | None = None
     branch: str = "auto"
+    apply_calibration: bool = True
 
 
 class PathPreviewRequest(BaseModel):
@@ -1007,6 +1025,73 @@ class CalibrationRequest(BaseModel):
 
 class SetPoseRequest(BaseModel):
     angles_deg: list[float]
+
+
+class EncoderFaultClearRequest(BaseModel):
+    acknowledge_pose_unknown: bool = False
+
+
+class EncoderCalibrationStartRequest(BaseModel):
+    mounting_location: str = "joint_output"
+    reference_description: str = ""
+    joint_angle_deg: float | None = None
+    capture_initial: bool = False
+
+
+class EncoderCalibrationSampleRequest(BaseModel):
+    session_id: str
+    joint_angle_deg: float
+    label: str = ""
+
+
+class EncoderCalibrationSessionRequest(BaseModel):
+    session_id: str
+
+
+class EncoderCalibrationCommitRequest(BaseModel):
+    session_id: str
+    confirm: bool = False
+
+
+class EncoderQuickCalibrationRequest(BaseModel):
+    joint_angle_deg: float
+    direction_sign: int = 1
+    sensor_turns_per_joint_turn: float = 1.0
+    mounting_location: str = "joint_output"
+    reference_description: str = ""
+    confirm_one_to_one_output_mount: bool = False
+
+
+class EncoderCalibrationSweepStartRequest(BaseModel):
+    start_joint_angle_deg: float
+    sweep_min_deg: float
+    sweep_max_deg: float
+    step_deg: float = 15.0
+    final_approach_direction: int = 1
+    preload_deg: float = 8.0
+    speed_deg_s: float = 6.0
+    accel_deg_s2: float = 24.0
+    settle_ms: int = 350
+    mounting_location: str = "joint_output"
+    reference_description: str = ""
+    confirm_open_loop_sweep: bool = False
+
+
+class EncoderCalibrationSweepSessionRequest(BaseModel):
+    session_id: str
+
+
+class EncoderBacklashCheckRequest(BaseModel):
+    center_joint_angle_deg: float | None = None
+    travel_deg: float = 10.0
+    repeats: int = 1
+    speed_deg_s: float = 6.0
+    settle_ms: int = 350
+
+
+class EncoderCorrectionPolicyRequest(BaseModel):
+    enabled: bool
+    confirm: bool = False
 
 
 class ToolRequest(BaseModel):
@@ -1203,6 +1288,7 @@ def public_config() -> dict[str, Any]:
         "geometry": geometry_settings(config),
         "validation": {
             "model_warnings": model_validation_warnings(config),
+            "encoder_errors": validate_encoder_settings(config, encoder_settings(config)),
             "named_position_errors": named_position_errors(config),
             "position_library_errors": position_library_errors(config, library),
             "task_destination_errors": destination_errors,
@@ -1322,6 +1408,79 @@ def evaluate_hardware_config() -> dict[str, Any]:
         enabled_bits.append("1" if enabled and state_name == "hardware" else "0")
 
     errors.extend(active_tool_hardware_errors())
+    encoder_config = encoder_settings(config)
+    errors.extend(validate_encoder_settings(config, encoder_config))
+
+    pin_uses: dict[int, list[str]] = {}
+
+    def register_pin(value: Any, label: str) -> None:
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            pin = int(value)
+        except (TypeError, ValueError):
+            errors.append(f"{label} must be an integer GPIO")
+            return
+        if pin < -1 or pin > 48:
+            errors.append(f"{label} must be between -1 and 48")
+            return
+        if pin >= 0:
+            pin_uses.setdefault(pin, []).append(label)
+
+    for joint in config.joints:
+        if joint.actuator == "stepper" and joint.hardware.stepper and joint.hardware.stepper.enabled:
+            register_pin(joint.hardware.stepper.step_pin, f"{joint.name} STEP")
+            register_pin(joint.hardware.stepper.dir_pin, f"{joint.name} DIR")
+            register_pin(joint.hardware.stepper.enable_pin, f"{joint.name} ENABLE")
+        elif joint.actuator == "servo" and joint.hardware.servo and joint.hardware.servo.enabled:
+            register_pin(joint.hardware.servo.pwm_pin, f"{joint.name} PWM")
+
+    tools = tools_settings(config)
+    active_tool_name = str(tools.get("active", ""))
+    active_tool = (
+        tools.get("presets", {}).get(active_tool_name, {})
+        if isinstance(tools.get("presets"), dict)
+        else {}
+    )
+    if isinstance(active_tool, dict):
+        tool_io = active_tool.get("io") if isinstance(active_tool.get("io"), dict) else {}
+        if str(active_tool.get("type")) == "servo_gripper":
+            register_pin(tool_io.get("pwm_pin", -1), f"tool {active_tool_name} PWM")
+        elif str(active_tool.get("type")) == "electromagnet":
+            register_pin(tool_io.get("pin", -1), f"tool {active_tool_name} GPIO")
+
+    if bool(encoder_config.get("enabled")):
+        bus = encoder_config.get("bus") if isinstance(encoder_config.get("bus"), dict) else {}
+        register_pin(bus.get("sck_pin", -1), "encoder SPI SCK")
+        register_pin(bus.get("miso_pin", -1), "encoder SPI MISO")
+        register_pin(bus.get("mosi_pin", -1), "encoder SPI MOSI")
+        raw_encoders = config.raw.get("encoders")
+        raw_axes = raw_encoders.get("axes") if isinstance(raw_encoders, dict) else None
+        if isinstance(raw_axes, list):
+            for raw_axis in raw_axes:
+                if not isinstance(raw_axis, dict) or not bool(raw_axis.get("enabled")):
+                    continue
+                try:
+                    joint_number = int(raw_axis.get("joint", 0) or 0)
+                except (TypeError, ValueError):
+                    joint_number = 0
+                joint_name = (
+                    config.joints[joint_number - 1].name
+                    if 1 <= joint_number <= len(config.joints)
+                    else f"joint {joint_number}"
+                )
+                register_pin(
+                    raw_axis.get("cs_pin", -1),
+                    f"{joint_name} encoder CS",
+                )
+        else:
+            shoulder_encoder = encoder_axis(encoder_config)
+            if shoulder_encoder and bool(shoulder_encoder.get("enabled")):
+                register_pin(shoulder_encoder.get("cs_pin", -1), "shoulder encoder CS")
+
+    for pin, uses in sorted(pin_uses.items()):
+        if len(uses) > 1:
+            errors.append(f"GPIO {pin} conflict: {', '.join(uses)}")
     if any(axis == "invalid" for axis in axis_states):
         mode = "invalid"
     elif errors:
@@ -1582,11 +1741,52 @@ def _tool_controller_signature(robot_config: RobotConfig) -> dict[str, Any]:
     }
 
 
+def _encoder_signatures(robot_config: RobotConfig) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    settings = normalize_encoder_settings(robot_config)
+    axis = encoder_axis(settings) or {}
+    io_signature = {
+        "enabled": settings.get("enabled"),
+        "bus": deepcopy(settings.get("bus", {})),
+        "axis": {
+            key: axis.get(key)
+            for key in ["joint", "sensor", "enabled", "cs_pin"]
+        },
+    }
+    calibration_signature = {
+        key: axis.get(key)
+        for key in [
+            "reference_raw_deg",
+            "reference_joint_deg",
+            "direction_sign",
+            "wrap_period_deg",
+            "unwrap_policy",
+            "mounting_location",
+            "sensor_turns_per_joint_turn",
+            "reference_description",
+            "freshness_timeout_ms",
+            "max_noise_deg",
+            "calibration_validated",
+            "calibration_id",
+        ]
+    }
+    policy_signature = {
+        "mode": settings.get("mode"),
+        "verification": deepcopy(settings.get("verification", {})),
+        "correction": deepcopy(settings.get("correction", {})),
+    }
+    return io_signature, calibration_signature, policy_signature
+
+
 def classify_config_change(previous: RobotConfig, current: RobotConfig) -> dict[str, Any]:
     pose_mapping_changed = _joint_pose_mapping_signature(previous) != _joint_pose_mapping_signature(current)
     joint_controller_changed = _joint_controller_signature(previous) != _joint_controller_signature(current)
     io_changed = _joint_io_signature(previous) != _joint_io_signature(current)
     tool_controller_changed = _tool_controller_signature(previous) != _tool_controller_signature(current)
+    previous_encoder_io, previous_encoder_calibration, previous_encoder_policy = _encoder_signatures(previous)
+    current_encoder_io, current_encoder_calibration, current_encoder_policy = _encoder_signatures(current)
+    encoder_io_changed = previous_encoder_io != current_encoder_io
+    encoder_calibration_changed = previous_encoder_calibration != current_encoder_calibration
+    encoder_policy_changed = previous_encoder_policy != current_encoder_policy
     planning_model_changed = (
         previous.links != current.links
         or previous.kinematics != current.kinematics
@@ -1599,7 +1799,8 @@ def classify_config_change(previous: RobotConfig, current: RobotConfig) -> dict[
             for joint in current.joints
         ]
     )
-    sync_required = joint_controller_changed or tool_controller_changed
+    encoder_controller_changed = encoder_io_changed or encoder_calibration_changed or encoder_policy_changed
+    sync_required = joint_controller_changed or tool_controller_changed or encoder_controller_changed
 
     categories: list[str] = []
     reasons: list[str] = []
@@ -1615,6 +1816,15 @@ def classify_config_change(previous: RobotConfig, current: RobotConfig) -> dict[
     if joint_controller_changed and not pose_mapping_changed and not io_changed:
         categories.append("controller_limits")
         reasons.append("controller joint limits or motion caps changed")
+    if encoder_io_changed:
+        categories.append("encoder_io")
+        reasons.append("encoder SPI or chip-select configuration changed")
+    if encoder_calibration_changed:
+        categories.append("encoder_calibration")
+        reasons.append("encoder reference, direction, mounting, or validity limits changed")
+    if encoder_policy_changed:
+        categories.append("encoder_policy")
+        reasons.append("encoder verification or correction policy changed")
     if not categories and previous.raw != current.raw:
         categories.append("runtime")
         reasons.append("runtime-only settings changed")
@@ -1628,6 +1838,7 @@ def classify_config_change(previous: RobotConfig, current: RobotConfig) -> dict[
         "pose_invalidated": pose_mapping_changed,
         "pose_revalidation_required": pose_mapping_changed,
         "previews_invalidated": planning_model_changed,
+        "encoder_measurement_invalidated": encoder_io_changed or encoder_calibration_changed,
     }
 
 
@@ -1910,7 +2121,7 @@ def controller_command_contract(command: str, *, settings: dict[str, Any] | None
             "speed_deg_s": settings.get("global_speed_deg_s"),
             "accel_deg_s2": settings.get("global_accel_deg_s2"),
             "notes": [
-                "hardware endpoint MOVEJ receives one global speed and acceleration",
+                "MOVEJ is a low-level endpoint command and does not receive planned waypoint timestamps",
                 "firmware configuration and per-axis caps still apply on the controller",
                 "per-joint override limits affect preview estimates but are not transmitted in MOVEJ",
             ],
@@ -1925,6 +2136,7 @@ def controller_command_contract(command: str, *, settings: dict[str, Any] | None
             "accel_deg_s2": settings.get("global_accel_deg_s2"),
             "notes": [
                 "queued trajectory uploads planned waypoint timestamps to the controller",
+                "joint-space endpoints and Cartesian/program paths use the same timed upload path",
                 "firmware still enforces configured hardware limits",
             ],
         }
@@ -1976,8 +2188,6 @@ def attach_controller_command_to_motion_contract(
 def anticipated_controller_command(trajectory_mode: str) -> str:
     if state.simulation:
         return "SIM_TRAJ"
-    if str(trajectory_mode).lower() in {"joint", "jog"}:
-        return "MOVEJ"
     return "TRAJ"
 
 
@@ -2176,24 +2386,101 @@ def list_serial_ports() -> list[dict[str, Any]]:
     return ports
 
 
-def update_encoder_verification() -> None:
+def update_encoder_evidence(status: Any) -> None:
     settings = encoder_settings(config)
-    fault_tolerance = float(settings.get("fault_tolerance_deg", 5.0))
-    errors: list[float | None] = []
-    fault = False
-    for index, encoder_angle in enumerate(state.encoder_angles_deg):
-        available = index < len(state.encoder_available) and state.encoder_available[index] == "1"
-        if available and encoder_angle is not None:
-            error = float(encoder_angle) - float(state.target_angles_deg[index])
-            errors.append(error)
-            if abs(error) > fault_tolerance:
-                fault = True
-        else:
-            errors.append(None)
-    state.encoder_errors_deg = errors
-    state.encoder_fault = fault
-    if fault:
-        state.set_error("encoder verification exceeded fault tolerance", fault=True)
+    shoulder = encoder_axis(settings)
+    evidence = [
+        empty_evidence(index + 1, joint.name)
+        for index, joint in enumerate(config.joints)
+    ]
+    if shoulder is not None:
+        index = 1
+        raw_angles = status.encoder_raw_angles_deg or [None] * len(config.joints)
+        raw_counts = status.encoder_raw_counts or [None] * len(config.joints)
+        measured_angles = status.encoder_measured_angles_deg or [None] * len(config.joints)
+        ages = status.encoder_age_ms or [None] * len(config.joints)
+        noise = status.encoder_noise_deg or [None] * len(config.joints)
+        valid_counts = (
+            status.encoder_consecutive_valid_samples
+            or [None] * len(config.joints)
+        )
+        flags = status.encoder_flags or [[] for _ in config.joints]
+        sensor_available = (
+            index < len(status.encoder_available)
+            and status.encoder_available[index] == "1"
+        )
+        raw_angle = raw_angles[index] if sensor_available else None
+        raw_count = raw_counts[index] if sensor_available else None
+        firmware_measured = measured_angles[index] if sensor_available else None
+        measured = None
+        if raw_angle is not None:
+            try:
+                measured = calibrated_joint_angle(float(raw_angle), shoulder)
+            except (TypeError, ValueError):
+                measured = None
+        elif sensor_available:
+            measured = firmware_measured
+        sensor_valid = (
+            sensor_available
+            and index < len(status.encoder_valid)
+            and status.encoder_valid[index] == "1"
+        )
+        required_health_samples = max(
+            1,
+            int(settings.get("verification", {}).get("required_stable_samples", 3)),
+        )
+        valid_count = valid_counts[index]
+        consecutive_health_valid = bool(
+            sensor_valid
+            and (
+                valid_count is None
+                or int(valid_count) >= required_health_samples
+            )
+        )
+        calibrated_valid = bool(
+            settings.get("enabled")
+            and shoulder.get("enabled")
+            and shoulder.get("calibration_validated")
+            and shoulder.get("mounting_location") == "joint_output"
+            and consecutive_health_valid
+            and measured is not None
+        )
+        evidence_flags = list(flags[index])
+        if sensor_valid and not shoulder.get("calibration_validated"):
+            evidence_flags.append("uncalibrated")
+        if sensor_valid and not consecutive_health_valid:
+            evidence_flags.append("warming_up")
+        if sensor_valid and shoulder.get("mounting_location") != "joint_output":
+            evidence_flags.append("relative_only_mounting")
+        evidence[index] = evidence_from_status(
+            joint_number=2,
+            name="shoulder",
+            raw_count=raw_count,
+            raw_angle_deg=raw_angle,
+            measured_angle_deg=measured,
+            valid=calibrated_valid,
+            age_ms=ages[index],
+            noise_deg=noise[index],
+            flags=evidence_flags,
+            freshness_timeout_ms=float(shoulder.get("freshness_timeout_ms", 500)),
+            estimated_angle_deg=float(state.estimated_angles_deg[index]),
+        )
+        evidence[index]["sensor_valid"] = sensor_valid
+        evidence[index]["sensor_available"] = sensor_available
+        evidence[index]["consecutive_valid_samples"] = valid_count
+        evidence[index]["required_health_samples"] = required_health_samples
+        evidence[index]["calibration_validated"] = bool(shoulder.get("calibration_validated"))
+        evidence[index]["mounting_location"] = shoulder.get("mounting_location")
+
+    state.update_encoder_evidence(evidence)
+    state.encoder_angles_deg = [
+        item.get("measured_angle_deg")
+        for item in evidence
+    ]
+    state.encoder_errors_deg = [
+        item.get("mismatch_deg")
+        for item in evidence
+    ]
 
 
 def read_serial_until_any(prefixes: tuple[str, ...], timeout_s: float = 2.0) -> str:
@@ -2275,6 +2562,10 @@ def start_motion_diagnostics(
         "execution_state": "queued",
         "requested_target_deg": [float(value) for value in target_deg],
         "start_reported_deg": [float(value) for value in state.reported_angles_deg],
+        "start_estimated_deg": [float(value) for value in state.estimated_angles_deg],
+        "start_measured_deg": list(state.measured_angles_deg),
+        "start_measurement_valid_mask": state.measurement_valid_mask,
+        "start_joint_authority": list(state.joint_authority),
         "expected_duration_s": float(expected_duration_s),
         "elapsed_s": 0.0,
         "waypoint_count": int(waypoint_count),
@@ -2359,6 +2650,20 @@ def maybe_finish_reached_motion() -> None:
     target = [float(value) for value in state.motion_diagnostics.get("requested_target_deg", state.target_angles_deg)]
     tolerance = float(calibration_settings(config).get("movement_tolerance_deg", 0.2))
     if state.motion_state == MotionState.IDLE and all(abs(error) <= tolerance for error in joint_errors_deg(target, state.reported_angles_deg)):
+        settings = encoder_settings(config)
+        shoulder = encoder_axis(settings)
+        if (
+            not state.simulation
+            and settings.get("enabled")
+            and shoulder
+            and shoulder.get("enabled")
+        ):
+            update_motion_diagnostics(
+                active_motion_run_id,
+                execution_state="settling_verification",
+                result="executing",
+            )
+            return
         finish_motion_diagnostics("reached", run_id=active_motion_run_id)
 
 
@@ -2378,6 +2683,9 @@ def finish_motion_diagnostics(result: str, error: str | None = None, run_id: str
             "progress_ratio": 1.0 if result == "reached" else float(diagnostics.get("progress_ratio", 0.0)),
             "error": error or "",
             "final_reported_deg": [float(value) for value in state.reported_angles_deg],
+            "final_estimated_deg": [float(value) for value in state.estimated_angles_deg],
+            "final_measured_deg": list(state.measured_angles_deg),
+            "final_measurement_valid_mask": state.measurement_valid_mask,
             "final_error_deg": final_error,
             "actual_duration_s": max(0.0, time() - started_at),
             "elapsed_s": max(0.0, time() - started_at),
@@ -2444,6 +2752,16 @@ def send_jog_stop_and_read_response() -> str:
     serial_client.clear_input()
     serial_client.send_line(format_jog_stop())
     response = read_serial_until_any(("OK command=JOG_STOP", "ERR"), timeout_s=0.75)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def send_correctj_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=CORRECTJ", "ERR"), timeout_s=1.0)
     state.last_controller_response = response
     if response.startswith("ERR"):
         raise SerialClientError(response)
@@ -2585,6 +2903,1623 @@ async def wait_for_hardware_target(
     return False, f"hardware target timeout after {timeout_s:.2f}s; joint errors deg=[{error_text}]"
 
 
+def _shoulder_evidence() -> dict[str, Any]:
+    if len(state.encoder_evidence) < 2:
+        return empty_evidence(2, "shoulder")
+    return state.encoder_evidence[1]
+
+
+def latch_encoder_mismatch_fault(message: str, error_deg: float | None) -> None:
+    state.encoder_fault = True
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "status": "fault",
+        "error_deg": error_deg,
+        "message": message,
+        "latched_at": time(),
+        "requires_setpose": True,
+    }
+    known_mask = state.pose_known_mask.ljust(len(config.joints), "0")
+    if len(known_mask) >= 2:
+        known_mask = f"{known_mask[0]}0{known_mask[2:]}"
+    state.update_reported_pose(
+        state.reported_angles_deg,
+        source=state.pose_source,
+        known_mask=known_mask,
+        force_revision=True,
+    )
+    state.target_angles_deg = state.reported_angles_deg.copy()
+    limiter.set_target(state.target_angles_deg)
+    state.set_error(message, fault=True)
+    if serial_client.is_connected and not state.simulation:
+        try:
+            serial_client.send_line(format_stop())
+        except Exception as exc:
+            log_event("encoder", "could not send STOP after encoder fault", error=str(exc))
+    log_event("encoder", message, error_deg=error_deg, severity="fault")
+
+
+async def _stable_shoulder_measurement(required_samples: int) -> tuple[float | None, str]:
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings)
+    if not shoulder:
+        return None, "shoulder encoder is not configured"
+    samples: list[float] = []
+    max_attempts = max(required_samples * 3, required_samples)
+    sample_interval_s = max(
+        0.03,
+        float(settings.get("bus", {}).get("sample_interval_ms", 100)) / 1000.0,
+    )
+    for _ in range(max_attempts):
+        try:
+            refresh_serial_status()
+        except SerialClientError as exc:
+            return None, str(exc)
+        evidence = _shoulder_evidence()
+        measured = evidence.get("measured_angle_deg")
+        noise = evidence.get("noise_deg")
+        if (
+            evidence.get("fresh")
+            and measured is not None
+            and (noise is None or float(noise) <= float(shoulder.get("max_noise_deg", 0.5)))
+        ):
+            samples.append(float(measured))
+            if len(samples) >= required_samples:
+                recent = samples[-required_samples:]
+                if max(recent) - min(recent) <= float(shoulder.get("max_noise_deg", 0.5)):
+                    ordered = sorted(recent)
+                    return ordered[len(ordered) // 2], "stable"
+                samples.clear()
+        await asyncio.sleep(sample_interval_s)
+    evidence = _shoulder_evidence()
+    return None, f"shoulder encoder is {evidence.get('health', 'unavailable')} or noisy"
+
+
+async def verify_shoulder_after_motion(
+    source: str,
+    target_deg: list[float],
+    *,
+    allow_correction: bool = True,
+) -> tuple[bool, str]:
+    if source in {"encoder_calibration_sweep", "encoder_backlash_check"}:
+        return True, "encoder verification skipped during encoder calibration helper motion"
+
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings)
+    if (
+        state.simulation
+        or not settings.get("enabled")
+        or not shoulder
+        or not shoulder.get("enabled")
+    ):
+        return True, "encoder verification disabled"
+
+    verification = settings.get("verification", {})
+    policy = str(verification.get("policy", "diagnostic"))
+    await asyncio.sleep(max(0.0, float(verification.get("settle_delay_ms", 300)) / 1000.0))
+    measured, reason = await _stable_shoulder_measurement(
+        max(1, int(verification.get("required_stable_samples", 3)))
+    )
+    if measured is None:
+        state.encoder_mismatch = {
+            "status": "unavailable",
+            "source": source,
+            "message": reason,
+            "checked_at": time(),
+        }
+        if bool(verification.get("require_encoder")) and policy == "fault":
+            message = f"required shoulder encoder unavailable after motion: {reason}"
+            latch_encoder_mismatch_fault(message, None)
+            return False, message
+        log_event(
+            "encoder",
+            "post-move shoulder verification unavailable",
+            motion_source=source,
+            reason=reason,
+        )
+        return True, reason
+
+    commanded_reference = float(target_deg[1])
+    estimated_reference = float(state.estimated_angles_deg[1])
+    estimated_error = float(measured) - estimated_reference
+    commanded_error = float(measured) - commanded_reference
+    # Encoder verification answers a physical question: did the shoulder end up
+    # where the completed command asked it to end up?  The open-loop estimate is
+    # still useful diagnostic evidence, but it must not be treated as the truth
+    # when deciding mismatch/correction; backlash and lost steps are exactly the
+    # cases where the estimate is expected to disagree.
+    error = commanded_error
+    warning_tolerance = float(verification.get("warning_tolerance_deg", 2.0))
+    fault_tolerance = float(verification.get("fault_tolerance_deg", 5.0))
+    hysteresis = max(0.0, float(verification.get("hysteresis_deg", 0.25)))
+    previous_status = str(state.encoder_mismatch.get("status", ""))
+    status = "ok"
+    if abs(error) > fault_tolerance or (
+        previous_status in {"fault_threshold", "fault"}
+        and abs(error) > max(0.0, fault_tolerance - hysteresis)
+    ):
+        status = "fault_threshold"
+    elif abs(error) > warning_tolerance or (
+        previous_status == "warning"
+        and abs(error) > max(0.0, warning_tolerance - hysteresis)
+    ):
+        status = "warning"
+    state.encoder_mismatch = {
+        "status": status,
+        "source": source,
+        "estimated_deg": estimated_reference,
+        "commanded_deg": commanded_reference,
+        "measured_deg": measured,
+        "error_deg": error,
+        "estimated_error_deg": estimated_error,
+        "commanded_error_deg": commanded_error,
+        "warning_tolerance_deg": warning_tolerance,
+        "fault_tolerance_deg": fault_tolerance,
+        "checked_at": time(),
+    }
+    log_event(
+        "encoder",
+        "post-move shoulder verification",
+        motion_source=source,
+        status=status,
+        commanded_deg=commanded_reference,
+        estimated_deg=estimated_reference,
+        measured_deg=measured,
+        error_deg=error,
+        estimated_error_deg=estimated_error,
+    )
+
+    if abs(error) > fault_tolerance and policy == "fault":
+        message = f"shoulder encoder mismatch {error:.2f} deg exceeds {fault_tolerance:.2f} deg"
+        latch_encoder_mismatch_fault(message, error)
+        return False, message
+
+    correction = settings.get("correction", {})
+    allowed_sources = {str(value) for value in correction.get("allowed_sources", [])}
+    correction_delta = -error
+    correction_bias = 0.0
+    reported_bias = state.correction_state.get("bias_deg")
+    if isinstance(reported_bias, list) and len(reported_bias) > 1 and reported_bias[1] is not None:
+        correction_bias = float(reported_bias[1])
+    try:
+        correction_deadband = max(0.0, float(correction.get("deadband_deg", 0.75)))
+    except (TypeError, ValueError):
+        correction_deadband = 0.75
+    try:
+        correction_limit = float(correction.get("max_delta_deg", 1.0))
+    except (TypeError, ValueError):
+        correction_limit = 1.0
+    limit_margin = max(0.0, float(correction.get("joint_limit_margin_deg", 2.0)))
+    corrected_physical_angle = commanded_reference + correction_bias + correction_delta
+    shoulder_joint = config.joints[1]
+    shoulder_stepper = shoulder_joint.hardware.stepper
+    correction_skip_reason = ""
+    if not allow_correction:
+        correction_skip_reason = "correction disabled for this motion path"
+    elif not correction.get("enabled"):
+        correction_skip_reason = "bounded shoulder correction is disabled"
+    elif source not in allowed_sources:
+        correction_skip_reason = f"motion source {source} is not allowed to run shoulder correction"
+    elif abs(error) <= correction_deadband:
+        correction_skip_reason = (
+            f"shoulder error {abs(error):.2f} deg is within correction deadband "
+            f"{correction_deadband:.2f} deg"
+        )
+    elif abs(error) > correction_limit:
+        correction_skip_reason = (
+            f"shoulder error {abs(error):.2f} deg exceeds correction max delta "
+            f"{correction_limit:.2f} deg"
+        )
+    elif shoulder_joint.actuator != "stepper" or not shoulder_stepper or not shoulder_stepper.enabled:
+        correction_skip_reason = "shoulder correction requires an enabled hardware stepper"
+    elif len(state.hardware_axis_states) <= 1 or state.hardware_axis_states[1] != "hardware":
+        correction_skip_reason = "shoulder axis is not in hardware mode"
+    elif not (
+        shoulder_joint.min_deg + limit_margin <= corrected_physical_angle
+        and corrected_physical_angle <= shoulder_joint.max_deg - limit_margin
+    ):
+        correction_skip_reason = "shoulder correction would cross the configured joint-limit margin"
+    elif not state.known_pose:
+        correction_skip_reason = "Set Pose first; correction requires a known planning pose"
+    elif not state.hardware_armed:
+        correction_skip_reason = "hardware must stay armed for post-move correction"
+    elif state.motion_state != MotionState.IDLE:
+        correction_skip_reason = "robot must be idle before post-move correction"
+    elif task_active():
+        correction_skip_reason = "task execution is active; correction is verification-only"
+    elif cartesian_jog_runtime.get("active"):
+        correction_skip_reason = "Cartesian jog is active; correction is verification-only"
+
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "correction_enabled": bool(correction.get("enabled")),
+        "correction_deadband_deg": correction_deadband,
+        "correction_max_delta_deg": correction_limit,
+        "correction_allowed_sources": sorted(allowed_sources),
+        "correction_would_delta_deg": correction_delta,
+        "correction_skip_reason": correction_skip_reason,
+        "correction_status": (
+            "eligible" if not correction_skip_reason else (
+                "not_needed" if "within correction deadband" in correction_skip_reason else "skipped"
+            )
+        ),
+    }
+    if correction_skip_reason:
+        log_event(
+            "encoder",
+            "post-move shoulder correction skipped",
+            motion_source=source,
+            reason=correction_skip_reason,
+            error_deg=error,
+            deadband_deg=correction_deadband,
+            max_delta_deg=correction_limit,
+        )
+        return True, status
+
+    max_attempts = max(1, int(correction.get("max_attempts", 2)))
+    transaction_id = str(uuid4())
+    for attempt in range(1, max_attempts + 1):
+        delta = -error
+        current_bias = 0.0
+        reported_bias = state.correction_state.get("bias_deg")
+        if isinstance(reported_bias, list) and len(reported_bias) > 1 and reported_bias[1] is not None:
+            current_bias = float(reported_bias[1])
+        candidate_angle = commanded_reference + current_bias + delta
+        if not (
+            shoulder_joint.min_deg + limit_margin
+            <= candidate_angle
+            <= shoulder_joint.max_deg - limit_margin
+        ):
+            message = "shoulder correction would cross the configured joint-limit margin"
+            latch_encoder_mismatch_fault(message, error)
+            return False, message
+        command = format_correctj(
+            2,
+            delta,
+            float(correction.get("speed_deg_s", 2.0)),
+            float(correction.get("accel_deg_s2", 10.0)),
+            transaction_id,
+        )
+        state.correction_state = {
+            "state": "executing",
+            "transaction_id": transaction_id,
+            "attempt": attempt,
+            "requested_delta_deg": delta,
+            "source": source,
+        }
+        state.last_command = command
+        try:
+            send_correctj_and_read_response(command)
+        except SerialClientError as exc:
+            message = f"shoulder correction command failed: {exc}"
+            latch_encoder_mismatch_fault(message, error)
+            return False, message
+
+        deadline = monotonic() + 3.0
+        while monotonic() < deadline:
+            await asyncio.sleep(0.08)
+            try:
+                refresh_serial_status()
+            except SerialClientError as exc:
+                message = f"shoulder correction status failed: {exc}"
+                latch_encoder_mismatch_fault(message, error)
+                return False, message
+            if state.motion_state == MotionState.IDLE:
+                break
+        else:
+            message = "shoulder correction timed out"
+            latch_encoder_mismatch_fault(message, error)
+            return False, message
+
+        await asyncio.sleep(max(0.0, float(verification.get("settle_delay_ms", 300)) / 1000.0))
+        measured, reason = await _stable_shoulder_measurement(
+            max(1, int(verification.get("required_stable_samples", 3)))
+        )
+        if measured is None:
+            message = f"shoulder correction lost encoder authority: {reason}"
+            latch_encoder_mismatch_fault(message, None)
+            return False, message
+        estimated_error = float(measured) - estimated_reference
+        commanded_error = float(measured) - commanded_reference
+        error = commanded_error
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "corrected" if abs(error) <= correction_deadband else "correction_pending",
+            "measured_deg": measured,
+            "error_deg": error,
+            "estimated_error_deg": estimated_error,
+            "commanded_error_deg": commanded_error,
+            "correction_attempt": attempt,
+            "correction_status": "completed" if abs(error) <= correction_deadband else "executing",
+            "correction_skip_reason": "",
+            "corrected_at": time(),
+        }
+        if abs(error) <= correction_deadband:
+            state.correction_state = {
+                **state.correction_state,
+                "state": "completed",
+                "final_error_deg": error,
+            }
+            log_event("encoder", "bounded shoulder correction completed", attempt=attempt, final_error_deg=error)
+            return True, "corrected"
+        if abs(error) > fault_tolerance:
+            break
+
+    message = f"shoulder correction did not converge; final error {error:.2f} deg"
+    latch_encoder_mismatch_fault(message, error)
+    return False, message
+
+
+def encoder_calibration_ready() -> tuple[bool, str]:
+    if state.simulation:
+        return False, "shoulder encoder calibration requires connected hardware"
+    if not serial_client.is_connected or not state.connected:
+        return False, "connect the controller before shoulder encoder calibration"
+    if state.hardware_armed:
+        return False, "disarm hardware before shoulder encoder calibration"
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        return False, "stop all motion before shoulder encoder calibration"
+    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+        return False, "stop live motion, tasks, and Cartesian jog before encoder calibration"
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish"
+    return True, ""
+
+
+def current_raw_shoulder_sample() -> tuple[dict[str, Any] | None, str]:
+    try:
+        refresh_serial_status()
+    except SerialClientError as exc:
+        return None, str(exc)
+    evidence = _shoulder_evidence()
+    raw_angle = evidence.get("raw_angle_deg")
+    age_ms = evidence.get("age_ms")
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings) or {}
+    freshness_limit = float(shoulder.get("freshness_timeout_ms", 500))
+    if not evidence.get("sensor_valid") or raw_angle is None:
+        flags = ", ".join(str(flag) for flag in evidence.get("flags", []))
+        return None, f"shoulder sensor has no valid raw sample{f' ({flags})' if flags else ''}"
+    if age_ms is None or float(age_ms) > freshness_limit:
+        return None, f"shoulder raw sample is stale ({age_ms} ms)"
+    return {
+        "raw_count": evidence.get("raw_count"),
+        "raw_angle_deg": float(raw_angle),
+        "age_ms": int(age_ms),
+        "noise_deg": evidence.get("noise_deg"),
+        "captured_at": time(),
+    }, ""
+
+
+def _validate_encoder_known_joint_angle(value: float | None) -> tuple[float | None, str]:
+    if value is None:
+        return None, "known shoulder angle is required"
+    shoulder = config.joints[1]
+    joint_angle = float(value)
+    if not isfinite(joint_angle) or not shoulder.min_deg <= joint_angle <= shoulder.max_deg:
+        return (
+            None,
+            f"known shoulder angle must be within {shoulder.min_deg:.3f}..{shoulder.max_deg:.3f} deg",
+        )
+    return joint_angle, ""
+
+
+def _encoder_calibration_capture(
+    sample: dict[str, Any],
+    joint_angle: float,
+    label: str,
+    approach_direction: int | None = None,
+    use_for_fit: bool = True,
+) -> dict[str, Any]:
+    captured = {
+        **sample,
+        "joint_angle_deg": float(joint_angle),
+        "label": label.strip(),
+    }
+    if approach_direction in {-1, 0, 1}:
+        captured["approach_direction"] = int(approach_direction)
+    if not use_for_fit:
+        captured["use_for_fit"] = False
+    return captured
+
+
+def _encoder_runtime_ready() -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings)
+    if not settings.get("enabled") or not shoulder or not shoulder.get("enabled"):
+        return None, None, "enable shoulder encoder readback and sync the controller first"
+    if not _controller_supports_encoder_config():
+        return None, None, "controller firmware does not advertise encoder config support"
+    if state.config_sync_status != "synced":
+        return None, None, f"sync controller configuration first ({state.config_sync_status})"
+    return settings, shoulder, ""
+
+
+def encoder_calibration_sweep_ready() -> tuple[bool, str]:
+    if state.simulation:
+        return False, "assisted encoder sweep requires connected hardware"
+    if not serial_client.is_connected or not state.connected:
+        return False, "connect the controller before assisted encoder sweep"
+    if not state.hardware_armed:
+        return False, "arm hardware before running the assisted sweep"
+    if state.motion_state == MotionState.MOVING:
+        return False, "wait for the current motion to finish before assisted encoder sweep"
+    if state.motion_state == MotionState.ESTOP:
+        return False, "clear ESTOP before assisted encoder sweep"
+    if state.motion_state == MotionState.FAULT:
+        return False, state.last_error or "clear the robot fault before assisted encoder sweep"
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        return False, f"robot must be idle or stopped before assisted encoder sweep (current: {state.motion_state.value})"
+    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+        return False, "stop live motion, tasks, and Cartesian jog before assisted encoder sweep"
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish"
+    ready, reason = hardware_ready_for_motion()
+    if not ready:
+        return False, reason
+    _settings, _shoulder, reason = _encoder_runtime_ready()
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _angle_close(a: float, b: float, tolerance: float = 1e-4) -> bool:
+    return abs(float(a) - float(b)) <= tolerance
+
+
+def _encoder_sweep_targets(
+    *,
+    start_deg: float,
+    sweep_min_deg: float,
+    sweep_max_deg: float,
+    step_deg: float,
+) -> list[float]:
+    shoulder = config.joints[1]
+    values = [float(start_deg), float(sweep_min_deg), float(sweep_max_deg), float(step_deg)]
+    if not all(isfinite(value) for value in values):
+        raise ValueError("sweep angles and step must be finite numbers")
+    if step_deg < 1.0 or step_deg > 45.0:
+        raise ValueError("sweep step must be between 1 and 45 degrees")
+    if sweep_min_deg >= sweep_max_deg:
+        raise ValueError("sweep minimum must be below sweep maximum")
+    if sweep_max_deg - sweep_min_deg > 180.0 + 1e-6:
+        raise ValueError("assisted sweep is limited to at most 180 degrees")
+    for label, value in [
+        ("start", start_deg),
+        ("minimum", sweep_min_deg),
+        ("maximum", sweep_max_deg),
+    ]:
+        if not shoulder.min_deg <= value <= shoulder.max_deg:
+            raise ValueError(
+                f"sweep {label} angle {value:.3f} deg is outside "
+                f"{shoulder.min_deg:.3f}..{shoulder.max_deg:.3f} deg"
+            )
+    if not sweep_min_deg <= start_deg <= sweep_max_deg:
+        raise ValueError("start angle must be inside the sweep range")
+
+    targets: list[float] = []
+    value = start_deg - step_deg
+    while value > sweep_min_deg:
+        targets.append(round(value, 6))
+        value -= step_deg
+    if not _angle_close(start_deg, sweep_min_deg) and (
+        not targets or not _angle_close(targets[-1], sweep_min_deg)
+    ):
+        targets.append(round(sweep_min_deg, 6))
+
+    value = sweep_min_deg + step_deg
+    while value < sweep_max_deg:
+        targets.append(round(value, 6))
+        value += step_deg
+    if not targets or not _angle_close(targets[-1], sweep_max_deg):
+        targets.append(round(sweep_max_deg, 6))
+    return targets
+
+
+def _encoder_unidirectional_sweep_targets(
+    *,
+    sweep_min_deg: float,
+    sweep_max_deg: float,
+    step_deg: float,
+    final_approach_direction: int,
+) -> list[float]:
+    shoulder = config.joints[1]
+    values = [float(sweep_min_deg), float(sweep_max_deg), float(step_deg)]
+    if not all(isfinite(value) for value in values):
+        raise ValueError("sweep angles and step must be finite numbers")
+    if final_approach_direction not in {-1, 1}:
+        raise ValueError("final approach direction must be +1 or -1")
+    if step_deg < 1.0 or step_deg > 45.0:
+        raise ValueError("sweep step must be between 1 and 45 degrees")
+    if sweep_min_deg >= sweep_max_deg:
+        raise ValueError("sweep minimum must be below sweep maximum")
+    if sweep_max_deg - sweep_min_deg > 180.0 + 1e-6:
+        raise ValueError("assisted sweep is limited to at most 180 degrees")
+    for label, value in [
+        ("minimum", sweep_min_deg),
+        ("maximum", sweep_max_deg),
+    ]:
+        if not shoulder.min_deg <= value <= shoulder.max_deg:
+            raise ValueError(
+                f"sweep {label} angle {value:.3f} deg is outside "
+                f"{shoulder.min_deg:.3f}..{shoulder.max_deg:.3f} deg"
+            )
+
+    if final_approach_direction > 0:
+        targets = [round(float(sweep_min_deg), 6)]
+        value = float(sweep_min_deg) + float(step_deg)
+        while value < sweep_max_deg:
+            targets.append(round(value, 6))
+            value += float(step_deg)
+        if not _angle_close(targets[-1], sweep_max_deg):
+            targets.append(round(float(sweep_max_deg), 6))
+        return targets
+
+    targets = [round(float(sweep_max_deg), 6)]
+    value = float(sweep_max_deg) - float(step_deg)
+    while value > sweep_min_deg:
+        targets.append(round(value, 6))
+        value -= float(step_deg)
+    if not _angle_close(targets[-1], sweep_min_deg):
+        targets.append(round(float(sweep_min_deg), 6))
+    return targets
+
+
+def _encoder_sweep_preload_target(
+    first_target_deg: float,
+    *,
+    final_approach_direction: int,
+    preload_deg: float,
+) -> float | None:
+    shoulder = config.joints[1]
+    preload = float(preload_deg)
+    if not isfinite(preload) or preload < 0.0 or preload > 45.0:
+        raise ValueError("backlash preload must be between 0 and 45 degrees")
+    if preload <= 1e-9:
+        return None
+    if final_approach_direction > 0:
+        target = float(first_target_deg) - preload
+        if target < shoulder.min_deg:
+            raise ValueError(
+                "sweep minimum is too close to the shoulder limit for the configured "
+                f"{preload:.3f} deg preload; raise the sweep minimum, reduce preload, "
+                "or approach from above"
+            )
+    elif final_approach_direction < 0:
+        target = float(first_target_deg) + preload
+        if target > shoulder.max_deg:
+            raise ValueError(
+                "sweep maximum is too close to the shoulder limit for the configured "
+                f"{preload:.3f} deg preload; lower the sweep maximum, reduce preload, "
+                "or approach from below"
+            )
+    else:
+        raise ValueError("final approach direction must be +1 or -1")
+    return round(target, 6)
+
+
+def _encoder_sweep_path_settings(speed_deg_s: float, accel_deg_s2: float) -> dict[str, Any]:
+    speed = float(speed_deg_s)
+    accel = float(accel_deg_s2)
+    if not isfinite(speed) or not isfinite(accel) or speed <= 0.0 or accel <= 0.0:
+        raise ValueError("sweep speed and acceleration must be positive finite numbers")
+    speed = min(speed, 8.0)
+    accel = min(accel, 30.0)
+    settings = default_path_settings()
+    settings["global_speed_deg_s"] = speed
+    settings["global_accel_deg_s2"] = accel
+    settings["per_joint_speed_deg_s"] = [
+        min(float(value), speed) for value in settings.get("per_joint_speed_deg_s", [])
+    ]
+    settings["per_joint_accel_deg_s2"] = [
+        min(float(value), accel) for value in settings.get("per_joint_accel_deg_s2", [])
+    ]
+    while len(settings["per_joint_speed_deg_s"]) < len(config.joints):
+        settings["per_joint_speed_deg_s"].append(speed)
+    while len(settings["per_joint_accel_deg_s2"]) < len(config.joints):
+        settings["per_joint_accel_deg_s2"].append(accel)
+    settings["per_joint_speed_deg_s"][1] = speed
+    settings["per_joint_accel_deg_s2"][1] = accel
+    return settings
+
+
+def _set_encoder_sweep_status(session: dict[str, Any], **updates: Any) -> None:
+    sweep = session.setdefault("sweep", {})
+    sweep.update(updates)
+    sweep["updated_at"] = time()
+
+
+def _fail_encoder_sweep(session: dict[str, Any], message: str) -> None:
+    _set_encoder_sweep_status(
+        session,
+        status="failed",
+        error=message,
+        finished_at=time(),
+    )
+    log_event("encoder", "assisted shoulder encoder sweep failed", error=message)
+
+
+async def _capture_encoder_sweep_sample(
+    session: dict[str, Any],
+    joint_angle_deg: float,
+    *,
+    label: str,
+    approach_direction: int | None = None,
+) -> dict[str, Any]:
+    sample, reason = current_raw_shoulder_sample()
+    if sample is None:
+        raise RuntimeError(reason)
+    captured = _encoder_calibration_capture(
+        sample,
+        float(joint_angle_deg),
+        label,
+        approach_direction=approach_direction,
+    )
+    session.setdefault("samples", []).append(captured)
+    session["validation"] = validate_encoder_calibration_session(session)
+    log_event(
+        "encoder",
+        "assisted shoulder encoder sweep sample captured",
+        session_id=session.get("id"),
+        joint_angle_deg=joint_angle_deg,
+        raw_angle_deg=sample["raw_angle_deg"],
+        sample_count=len(session.get("samples", [])),
+    )
+    return captured
+
+
+async def run_encoder_calibration_sweep(session_id: str) -> None:
+    global encoder_calibration_sweep_task
+    current_task = asyncio.current_task()
+    session = encoder_calibration_sessions.get(session_id)
+    if not session:
+        return
+    sweep = session.get("sweep", {})
+    targets = [float(value) for value in sweep.get("targets_deg", [])]
+    settings = sweep.get("path_settings", {})
+    settle_s = max(0.0, float(sweep.get("settle_ms", 350)) / 1000.0)
+    preload_target = sweep.get("preload_target_deg")
+    final_approach_direction = int(sweep.get("final_approach_direction", 0) or 0)
+    previous_shoulder_target = (
+        float(session.get("samples", [{}])[-1].get("joint_angle_deg", state.reported_angles_deg[1]))
+        if session.get("samples")
+        else float(state.reported_angles_deg[1])
+    )
+    try:
+        _set_encoder_sweep_status(
+            session,
+            status="running",
+            started_at=sweep.get("started_at") or time(),
+            completed=0,
+            total=len(targets),
+        )
+        await broadcast_state()
+        if preload_target is not None:
+            if session.get("sweep", {}).get("cancel_requested"):
+                _set_encoder_sweep_status(session, status="cancelled", finished_at=time())
+                return
+            preload_target = float(preload_target)
+            current = state.reported_angles_deg.copy()
+            if len(current) < len(config.joints):
+                current = config.home_pose.copy()
+            current[1] = preload_target
+            _set_encoder_sweep_status(
+                session,
+                status="preloading",
+                current_target_deg=preload_target,
+                completed=0,
+            )
+            response = await start_joint_target_trajectory(
+                current,
+                "encoder_calibration_sweep",
+                settings,
+            )
+            if not response.get("ok"):
+                _fail_encoder_sweep(session, response.get("error") or "sweep preload move failed")
+                return
+            task = path_task
+            if task is not None:
+                await task
+            if state.motion_state == MotionState.FAULT or state.last_error:
+                _fail_encoder_sweep(session, state.last_error or "sweep preload move faulted")
+                return
+            diagnostics = state.motion_diagnostics or {}
+            if diagnostics.get("result") not in {None, "reached"}:
+                _fail_encoder_sweep(
+                    session,
+                    str(
+                        diagnostics.get("error")
+                        or diagnostics.get("result")
+                        or "sweep preload move did not complete"
+                    ),
+                )
+                return
+            previous_shoulder_target = preload_target
+            await broadcast_state()
+        for index, target in enumerate(targets, start=1):
+            if session.get("sweep", {}).get("cancel_requested"):
+                _set_encoder_sweep_status(session, status="cancelled", finished_at=time())
+                return
+            current = state.reported_angles_deg.copy()
+            if len(current) < len(config.joints):
+                current = config.home_pose.copy()
+            current[1] = float(target)
+            _set_encoder_sweep_status(
+                session,
+                status="moving",
+                current_target_deg=float(target),
+                active_index=index,
+                completed=index - 1,
+            )
+            response = await start_joint_target_trajectory(
+                current,
+                "encoder_calibration_sweep",
+                settings,
+            )
+            if not response.get("ok"):
+                _fail_encoder_sweep(session, response.get("error") or "sweep move failed")
+                return
+            task = path_task
+            if task is not None:
+                await task
+            if state.motion_state == MotionState.FAULT or state.last_error:
+                _fail_encoder_sweep(session, state.last_error or "sweep move faulted")
+                return
+            diagnostics = state.motion_diagnostics or {}
+            if diagnostics.get("result") not in {None, "reached"}:
+                _fail_encoder_sweep(
+                    session,
+                    str(diagnostics.get("error") or diagnostics.get("result") or "sweep move did not complete"),
+                )
+                return
+            _set_encoder_sweep_status(session, status="settling", completed=index - 1)
+            await asyncio.sleep(settle_s)
+            _set_encoder_sweep_status(session, status="sampling", completed=index - 1)
+            approach_direction = final_approach_direction if final_approach_direction in {-1, 1} else 0
+            if approach_direction == 0:
+                if target > previous_shoulder_target + 1e-6:
+                    approach_direction = 1
+                elif target < previous_shoulder_target - 1e-6:
+                    approach_direction = -1
+            await _capture_encoder_sweep_sample(
+                session,
+                float(target),
+                label=f"sweep {index}/{len(targets)}",
+                approach_direction=approach_direction,
+            )
+            previous_shoulder_target = float(target)
+            _set_encoder_sweep_status(session, completed=index)
+            await broadcast_state()
+        validation = validate_encoder_calibration_session(session)
+        session["validation"] = validation
+        _set_encoder_sweep_status(
+            session,
+            status="completed" if validation.get("ok") else "needs_review",
+            validation_ok=bool(validation.get("ok")),
+            finished_at=time(),
+            completed=len(targets),
+        )
+        log_event(
+            "encoder",
+            "assisted shoulder encoder sweep completed",
+            session_id=session_id,
+            validation_ok=bool(validation.get("ok")),
+            sample_count=len(session.get("samples", [])),
+        )
+    except asyncio.CancelledError:
+        _set_encoder_sweep_status(session, status="cancelled", finished_at=time())
+        raise
+    except Exception as exc:
+        _fail_encoder_sweep(session, str(exc))
+    finally:
+        if encoder_calibration_sweep_task is current_task:
+            encoder_calibration_sweep_task = None
+        await broadcast_state()
+
+
+async def validate_encoder_correction_enablement() -> tuple[bool, str, dict[str, Any]]:
+    settings, shoulder, reason = _encoder_runtime_ready()
+    if reason:
+        return False, reason, {}
+    if shoulder is None or settings is None:
+        return False, "shoulder encoder runtime is not configured", {}
+    if state.simulation:
+        return False, "bounded correction requires connected hardware, not simulation", {}
+    if not serial_client.is_connected or not state.connected:
+        return False, "connect the controller before enabling bounded correction", {}
+    if state.hardware_armed:
+        return False, "disarm hardware before changing bounded correction policy", {}
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        return False, "stop motion before changing bounded correction policy", {}
+    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+        return False, "stop live motion, tasks, and Cartesian jog before enabling bounded correction", {}
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish", {}
+    evaluation = apply_hardware_evaluation()
+    if evaluation["mode"] == "invalid":
+        return False, "; ".join(evaluation["errors"]) or "hardware config is invalid", {}
+    if len(state.hardware_axis_states) <= 1 or state.hardware_axis_states[1] != "hardware":
+        return False, "bounded correction requires the shoulder stepper axis to be hardware-enabled", {}
+    if not state.known_pose:
+        return False, "Set Pose first; correction cannot be enabled while the planning pose is unknown", {}
+    if state.encoder_fault:
+        return False, "clear the encoder fault and Set Pose before enabling bounded correction", {}
+    if str(shoulder.get("mounting_location")) != "joint_output":
+        return False, "bounded correction requires joint-output encoder mounting", {}
+    if not bool(shoulder.get("calibration_validated")):
+        return False, "calibrate and commit the shoulder encoder before enabling correction", {}
+
+    correction = settings.get("correction", {})
+    shoulder_joint = config.joints[1]
+    if shoulder_joint.actuator != "stepper" or not (
+        shoulder_joint.hardware.stepper and shoulder_joint.hardware.stepper.enabled
+    ):
+        return False, "bounded correction requires an enabled hardware shoulder stepper", {}
+
+    try:
+        deadband = float(correction.get("deadband_deg", 0.75))
+        max_delta = float(correction.get("max_delta_deg", 1.0))
+        speed = float(correction.get("speed_deg_s", 2.0))
+        accel = float(correction.get("accel_deg_s2", 10.0))
+        attempts = int(correction.get("max_attempts", 2))
+    except (TypeError, ValueError):
+        return False, "correction limits must be numeric", {}
+    if deadband < 0 or max_delta <= 0 or speed <= 0 or accel <= 0 or attempts < 1:
+        return False, "correction deadband must be non-negative; limits, speed, acceleration, and attempts must be positive", {}
+    if max_delta <= deadband:
+        return False, "correction max delta must be greater than the correction deadband", {}
+
+    verification = settings.get("verification", {})
+    measured, reason = await _stable_shoulder_measurement(
+        max(1, int(verification.get("required_stable_samples", 3)))
+    )
+    if measured is None:
+        return False, f"shoulder encoder is not stable enough for correction enablement: {reason}", {}
+    estimated = float(state.estimated_angles_deg[1])
+    error = float(measured) - estimated
+    warning_tolerance = float(verification.get("warning_tolerance_deg", 2.0))
+    correction_limit = float(correction.get("max_delta_deg", 8.0))
+    if abs(error) > correction_limit:
+        return (
+            False,
+            (
+                "shoulder encoder and planning estimate disagree by "
+                f"{error:.2f} deg, which exceeds the configured correction limit "
+                f"{correction_limit:.2f} deg; use Set Pose or recalibrate before enabling correction"
+            ),
+            {
+                "measured_deg": measured,
+                "estimated_deg": estimated,
+                "error_deg": error,
+                "deadband_deg": deadband,
+                "warning_tolerance_deg": warning_tolerance,
+                "max_delta_deg": correction_limit,
+            },
+        )
+    return (
+        True,
+        (
+            "bounded correction validation passed"
+            if abs(error) <= warning_tolerance
+            else "bounded correction validation passed with existing correctable shoulder mismatch"
+        ),
+        {
+            "measured_deg": measured,
+            "estimated_deg": estimated,
+            "error_deg": error,
+            "deadband_deg": deadband,
+            "warning_tolerance_deg": warning_tolerance,
+            "max_delta_deg": correction_limit,
+            "initial_mismatch_correctable": abs(error) > deadband,
+            "mounting_location": shoulder.get("mounting_location"),
+            "calibration_id": shoulder.get("calibration_id"),
+        },
+    )
+
+
+def _solve_least_squares(rows: list[list[float]], values: list[float]) -> list[float] | None:
+    if not rows or len(rows) != len(values):
+        return None
+    columns = len(rows[0])
+    if columns == 0 or any(len(row) != columns for row in rows):
+        return None
+    normal = [[0.0 for _ in range(columns)] for _ in range(columns)]
+    rhs = [0.0 for _ in range(columns)]
+    for row, value in zip(rows, values, strict=True):
+        for i in range(columns):
+            rhs[i] += row[i] * value
+            for j in range(columns):
+                normal[i][j] += row[i] * row[j]
+
+    for pivot in range(columns):
+        best = max(range(pivot, columns), key=lambda index: abs(normal[index][pivot]))
+        if abs(normal[best][pivot]) < 1e-9:
+            return None
+        if best != pivot:
+            normal[pivot], normal[best] = normal[best], normal[pivot]
+            rhs[pivot], rhs[best] = rhs[best], rhs[pivot]
+        divisor = normal[pivot][pivot]
+        for column in range(pivot, columns):
+            normal[pivot][column] /= divisor
+        rhs[pivot] /= divisor
+        for row_index in range(columns):
+            if row_index == pivot:
+                continue
+            factor = normal[row_index][pivot]
+            if abs(factor) < 1e-12:
+                continue
+            for column in range(pivot, columns):
+                normal[row_index][column] -= factor * normal[pivot][column]
+            rhs[row_index] -= factor * rhs[pivot]
+    return rhs
+
+
+def _linear_encoder_fit(raw_unwrapped: list[float], joints: list[float]) -> dict[str, Any] | None:
+    coefficients = _solve_least_squares(
+        [[1.0, float(raw)] for raw in raw_unwrapped],
+        [float(joint) for joint in joints],
+    )
+    if coefficients is None:
+        return None
+    intercept, slope = coefficients
+    residuals = [
+        float(joint) - (intercept + slope * float(raw))
+        for raw, joint in zip(raw_unwrapped, joints, strict=True)
+    ]
+    return {
+        "model": "linear",
+        "intercept": intercept,
+        "slope": slope,
+        "residuals": residuals,
+        "max_residual_deg": max((abs(value) for value in residuals), default=0.0),
+    }
+
+
+def _sample_approach_directions(samples: list[dict[str, Any]], joints: list[float]) -> list[int]:
+    directions: list[int] = []
+    previous_joint: float | None = None
+    for index, sample in enumerate(samples):
+        raw_direction = sample.get("approach_direction")
+        direction = 0
+        try:
+            candidate = int(raw_direction)
+        except (TypeError, ValueError):
+            candidate = 0
+        if candidate in {-1, 1}:
+            direction = candidate
+        elif index > 0 and previous_joint is not None:
+            delta = float(joints[index]) - float(previous_joint)
+            if delta > 1e-6:
+                direction = 1
+            elif delta < -1e-6:
+                direction = -1
+        directions.append(direction)
+        previous_joint = float(joints[index])
+    return directions
+
+
+def _backlash_encoder_fit(
+    raw_unwrapped: list[float],
+    joints: list[float],
+    directions: list[int],
+) -> dict[str, Any] | None:
+    usable = [
+        (float(raw), float(joint), int(direction))
+        for raw, joint, direction in zip(raw_unwrapped, joints, directions, strict=True)
+        if int(direction) in {-1, 1}
+    ]
+    if len(usable) < 4 or {direction for _raw, _joint, direction in usable} != {-1, 1}:
+        return None
+    coefficients = _solve_least_squares(
+        [[1.0, raw, float(direction)] for raw, _joint, direction in usable],
+        [joint for _raw, joint, _direction in usable],
+    )
+    if coefficients is None:
+        return None
+    intercept, slope, approach_bias = coefficients
+    residuals = [
+        joint - (intercept + slope * raw + approach_bias * float(direction))
+        for raw, joint, direction in usable
+    ]
+    return {
+        "model": "linear_with_backlash",
+        "intercept": intercept,
+        "slope": slope,
+        "approach_bias_deg": approach_bias,
+        "backlash_estimate_deg": abs(2.0 * approach_bias),
+        "residuals": residuals,
+        "max_residual_deg": max((abs(value) for value in residuals), default=0.0),
+        "sample_count": len(usable),
+    }
+
+
+def _piecewise_encoder_fit(
+    raw_unwrapped: list[float],
+    joints: list[float],
+    directions: list[int],
+    *,
+    linear_fit: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    used_directions = {int(direction) for direction in directions if int(direction) in {-1, 1}}
+    if len(used_directions) > 1:
+        return None
+    if len(raw_unwrapped) < 5 or len(raw_unwrapped) != len(joints):
+        return None
+    pairs = sorted(
+        [(float(raw), float(joint)) for raw, joint in zip(raw_unwrapped, joints, strict=True)],
+        key=lambda item: item[0],
+    )
+    for first, second in zip(pairs, pairs[1:], strict=False):
+        if second[0] - first[0] < 0.05:
+            return None
+    joint_trend = pairs[-1][1] - pairs[0][1]
+    if abs(joint_trend) < 2.0:
+        return None
+    joint_sign = 1 if joint_trend > 0 else -1
+    for first, second in zip(pairs, pairs[1:], strict=False):
+        joint_step = second[1] - first[1]
+        if joint_sign * joint_step < -0.25:
+            return None
+    slope = float(linear_fit["slope"]) if linear_fit is not None else joint_trend / (pairs[-1][0] - pairs[0][0])
+    intercept = (
+        float(linear_fit["intercept"])
+        if linear_fit is not None
+        else pairs[0][1] - slope * pairs[0][0]
+    )
+    return {
+        "model": "piecewise_linear",
+        "intercept": intercept,
+        "slope": slope,
+        "residuals": [0.0 for _raw, _joint in pairs],
+        "max_residual_deg": 0.0,
+        "sample_count": len(pairs),
+    }
+
+
+def _localized_backlash_diagnostics(
+    samples: list[dict[str, Any]],
+    *,
+    sensor_turns_per_joint_turn: float | None = None,
+) -> dict[str, Any]:
+    grouped: dict[float, dict[int, list[float]]] = {}
+    for sample in samples:
+        try:
+            direction = int(sample.get("approach_direction"))
+            joint_angle = float(sample["joint_angle_deg"])
+            raw_angle = float(sample["raw_angle_deg"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if direction not in {-1, 1}:
+            continue
+        key = round(joint_angle, 3)
+        grouped.setdefault(key, {}).setdefault(direction, []).append(raw_angle)
+
+    best_raw_sep: float | None = None
+    best_joint_angle: float | None = None
+    pair_count = 0
+    for joint_angle, branches in grouped.items():
+        if -1 not in branches or 1 not in branches:
+            continue
+        pair_count += 1
+        reference_raw = branches[-1][0]
+
+        def branch_mean(values: list[float]) -> float:
+            unwrapped = [
+                reference_raw + wrapped_delta_deg(float(value), reference_raw, 360.0)
+                for value in values
+            ]
+            return sum(unwrapped) / len(unwrapped)
+
+        raw_sep = abs(branch_mean(branches[1]) - branch_mean(branches[-1]))
+        if best_raw_sep is None or raw_sep > best_raw_sep:
+            best_raw_sep = raw_sep
+            best_joint_angle = float(joint_angle)
+
+    joint_sep = None
+    if (
+        best_raw_sep is not None
+        and sensor_turns_per_joint_turn is not None
+        and abs(float(sensor_turns_per_joint_turn)) > 1e-9
+    ):
+        joint_sep = best_raw_sep / abs(float(sensor_turns_per_joint_turn))
+    return {
+        "localized_backlash_pair_count": pair_count,
+        "localized_backlash_estimate_raw_deg": best_raw_sep,
+        "localized_backlash_estimate_deg": joint_sep,
+        "localized_backlash_at_joint_deg": best_joint_angle,
+    }
+
+
+def validate_encoder_calibration_session(session: dict[str, Any]) -> dict[str, Any]:
+    all_samples = list(session.get("samples") or [])
+    samples = [sample for sample in all_samples if sample.get("use_for_fit", True) is not False]
+    errors: list[str] = []
+    warnings: list[str] = []
+    if len(samples) < 2:
+        errors.append("capture at least two known shoulder reference samples")
+        return {
+            "ok": False,
+            "errors": errors,
+            "warnings": warnings,
+            "sample_count": len(all_samples),
+            "fit_sample_count": len(samples),
+            "minimum_raw_span_deg": 1.0,
+            "minimum_joint_span_deg": 2.0,
+        }
+
+    shoulder_joint = config.joints[1]
+    for index, sample in enumerate(samples):
+        joint_angle = float(sample["joint_angle_deg"])
+        if not shoulder_joint.min_deg <= joint_angle <= shoulder_joint.max_deg:
+            errors.append(
+                f"sample {index + 1} shoulder angle {joint_angle:.3f} deg is outside "
+                f"{shoulder_joint.min_deg:.3f}..{shoulder_joint.max_deg:.3f} deg"
+            )
+
+    raw_unwrapped = [float(samples[0]["raw_angle_deg"])]
+    for previous, sample in zip(samples, samples[1:], strict=False):
+        raw_unwrapped.append(
+            raw_unwrapped[-1]
+            + wrapped_delta_deg(
+                float(sample["raw_angle_deg"]),
+                float(previous["raw_angle_deg"]),
+                360.0,
+            )
+        )
+    joints = [float(sample["joint_angle_deg"]) for sample in samples]
+    raw_span = max(raw_unwrapped) - min(raw_unwrapped)
+    joint_span = max(joints) - min(joints)
+    minimum_raw_span_deg = 1.0
+    minimum_joint_span_deg = 2.0
+    if raw_span < minimum_raw_span_deg:
+        errors.append(
+            "reference samples do not span enough encoder motion "
+            f"({raw_span:.3f} deg raw, need at least {minimum_raw_span_deg:.3f} deg)"
+        )
+    if joint_span < minimum_joint_span_deg:
+        errors.append(
+            "reference samples do not span enough shoulder motion "
+            f"({joint_span:.3f} deg, need at least {minimum_joint_span_deg:.3f} deg)"
+        )
+
+    shoulder = encoder_axis(encoder_settings(config)) or {}
+    residual_limit = max(0.25, float(shoulder.get("max_noise_deg", 0.5)) * 2.0)
+    linear_fit = _linear_encoder_fit(raw_unwrapped, joints)
+    fit = linear_fit
+    directions = _sample_approach_directions(samples, joints)
+    backlash_fit: dict[str, Any] | None = None
+    fit_model = "linear"
+    approach_bias_deg: float | None = None
+    backlash_estimate_deg: float | None = None
+    calibration_map: list[dict[str, float]] = []
+    provisional_turns = None
+    if linear_fit is not None and abs(float(linear_fit["slope"])) >= 1e-9:
+        provisional_turns = 1.0 / abs(float(linear_fit["slope"]))
+    localized_backlash = _localized_backlash_diagnostics(
+        samples,
+        sensor_turns_per_joint_turn=provisional_turns,
+    )
+    fit_sample_count = len(samples)
+    if fit is not None and abs(float(fit["slope"])) >= 1e-9:
+        linear_max_residual = float(fit["max_residual_deg"])
+        candidate = _backlash_encoder_fit(raw_unwrapped, joints, directions)
+        if (
+            linear_max_residual > residual_limit
+            and candidate is not None
+            and abs(float(candidate["slope"])) >= 1e-9
+            and float(candidate["max_residual_deg"]) <= residual_limit
+        ):
+            fit = candidate
+            backlash_fit = candidate
+            fit_model = "linear_with_backlash"
+            approach_bias_deg = float(candidate["approach_bias_deg"])
+            backlash_estimate_deg = float(candidate["backlash_estimate_deg"])
+            fit_sample_count = int(candidate["sample_count"])
+            warnings.append(
+                "direction-dependent shoulder backlash/lost motion detected; "
+                f"estimated branch separation is {backlash_estimate_deg:.3f} deg. "
+                "Calibration uses the neutral sensor slope and keeps backlash as diagnostics/correction evidence."
+            )
+        elif linear_max_residual > residual_limit:
+            piecewise_candidate = _piecewise_encoder_fit(
+                raw_unwrapped,
+                joints,
+                directions,
+                linear_fit=linear_fit,
+            )
+            if piecewise_candidate is not None:
+                fit = piecewise_candidate
+                fit_model = "piecewise_linear"
+                fit_sample_count = int(piecewise_candidate["sample_count"])
+                warnings.append(
+                    "repeatable nonlinear shoulder encoder map detected; using a piecewise calibration "
+                    "over the captured range. This compensates sensor/linkage nonlinearity for readback, "
+                    "but it does not hide backlash or enable continuous correction."
+                )
+
+    if fit is None or abs(float(fit["slope"])) < 1e-9:
+        errors.append("reference samples do not establish encoder direction and scale")
+        turns = None
+        direction_sign = None
+        residuals: list[float] = []
+        slope = 0.0
+        intercept = 0.0
+        max_residual = None
+        reference_index = 0
+        reference_raw_for_calibration = float(samples[0]["raw_angle_deg"])
+        reference_joint_for_calibration = float(samples[0]["joint_angle_deg"])
+    else:
+        slope = float(fit["slope"])
+        intercept = float(fit["intercept"])
+        direction_sign = 1 if slope > 0 else -1
+        turns = 1.0 / abs(slope)
+        residuals = [float(value) for value in fit["residuals"]]
+        max_residual = float(fit["max_residual_deg"])
+        if max_residual > residual_limit:
+            backlash_hint = ""
+            if any(direction in {-1, 1} for direction in directions):
+                localized_raw = localized_backlash.get("localized_backlash_estimate_raw_deg")
+                localized_joint = localized_backlash.get("localized_backlash_estimate_deg")
+                localized_at = localized_backlash.get("localized_backlash_at_joint_deg")
+                if localized_raw is not None:
+                    localized_text = (
+                        f"{localized_joint:.3f} deg"
+                        if localized_joint is not None
+                        else f"{localized_raw:.3f} raw deg"
+                    )
+                    backlash_hint = (
+                        f"; localized bidirectional backlash/lost motion of {localized_text} "
+                        f"detected near {localized_at:.3f} deg. "
+                        "Run a same-direction/preloaded sweep or calibrate from physical fixture marks"
+                    )
+                else:
+                    backlash_hint = (
+                        "; direction-aware backlash fit was not consistent enough. "
+                        "Run a same-direction/preloaded sweep or calibrate from physical fixture marks"
+                    )
+            errors.append(
+                f"reference samples are inconsistent; maximum fit residual "
+                f"{max_residual:.3f} deg exceeds {residual_limit:.3f} deg{backlash_hint}"
+            )
+
+        mounting = str(session.get("mounting_location") or "joint_output")
+        reference_index = 0
+        reference_joint_for_calibration = (
+            joints[0] if fit_model == "piecewise_linear" else intercept + slope * raw_unwrapped[0]
+        )
+        for index, raw in enumerate(raw_unwrapped):
+            candidate_joint = joints[index] if fit_model == "piecewise_linear" else intercept + slope * raw
+            if shoulder_joint.min_deg <= candidate_joint <= shoulder_joint.max_deg:
+                reference_index = index
+                reference_joint_for_calibration = candidate_joint
+                break
+        if mounting == "joint_output" and turns is not None:
+            first_reference_excursion = max(
+                abs((shoulder_joint.min_deg - reference_joint_for_calibration) * turns),
+                abs((shoulder_joint.max_deg - reference_joint_for_calibration) * turns),
+            )
+            if first_reference_excursion >= 180.0 or fit_model == "piecewise_linear":
+                center = (shoulder_joint.min_deg + shoulder_joint.max_deg) / 2.0
+                candidates: list[tuple[float, int, float]] = []
+                for index, raw in enumerate(raw_unwrapped):
+                    candidate_joint = joints[index] if fit_model == "piecewise_linear" else intercept + slope * raw
+                    if shoulder_joint.min_deg <= candidate_joint <= shoulder_joint.max_deg:
+                        candidates.append((abs(candidate_joint - center), index, candidate_joint))
+                if candidates:
+                    _distance, reference_index, reference_joint_for_calibration = min(candidates)
+        reference_raw_for_calibration = float(samples[reference_index]["raw_angle_deg"])
+        if not shoulder_joint.min_deg <= reference_joint_for_calibration <= shoulder_joint.max_deg:
+            errors.append(
+                "fitted encoder reference is outside shoulder limits; choose reference samples away from the limits"
+            )
+        if mounting == "joint_output":
+            max_sensor_excursion = max(
+                abs((shoulder_joint.min_deg - reference_joint_for_calibration) * turns),
+                abs((shoulder_joint.max_deg - reference_joint_for_calibration) * turns),
+            )
+            if max_sensor_excursion >= 180.0:
+                errors.append(
+                    "the configured shoulder range is ambiguous around this single-turn reference; "
+                    "choose another reference or establish multi-turn tracking"
+                )
+        else:
+            warnings.append(
+                "motor/gear-side mounting remains diagnostic-only; it cannot provide absolute "
+                "joint-output authority or validate gearbox backlash"
+            )
+        if fit_model == "piecewise_linear":
+            reference_raw_unwrapped = raw_unwrapped[reference_index]
+            calibration_map = [
+                {
+                    "raw_delta_deg": round(float(raw) - float(reference_raw_unwrapped), 9),
+                    "raw_deg": round(float(sample["raw_angle_deg"]), 9),
+                    "joint_deg": round(float(joint), 9),
+                }
+                for raw, joint, sample in sorted(
+                    zip(raw_unwrapped, joints, samples, strict=True),
+                    key=lambda item: float(item[0]),
+                )
+            ]
+
+    fit_points: list[dict[str, Any]] = []
+    if fit is not None and abs(float(fit.get("slope", 0.0))) >= 1e-9:
+        for index, sample in enumerate(samples):
+            joint = float(sample["joint_angle_deg"])
+            if fit_model == "piecewise_linear":
+                predicted = joint
+            else:
+                predicted = intercept + slope * raw_unwrapped[index]
+                if fit_model == "linear_with_backlash" and directions[index] in {-1, 1}:
+                    predicted += float(approach_bias_deg or 0.0) * float(directions[index])
+            fit_points.append(
+                {
+                    "index": index,
+                    "raw_angle_deg": float(sample["raw_angle_deg"]),
+                    "joint_angle_deg": joint,
+                    "predicted_joint_deg": float(predicted),
+                    "error_deg": float(joint - predicted),
+                    "approach_direction": directions[index] if index < len(directions) else 0,
+                }
+            )
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "sample_count": len(all_samples),
+        "fit_sample_count": fit_sample_count,
+        "raw_span_deg": raw_span,
+        "joint_span_deg": joint_span,
+        "minimum_raw_span_deg": minimum_raw_span_deg,
+        "minimum_joint_span_deg": minimum_joint_span_deg,
+        "fit_model": fit_model,
+        "direction_sign": direction_sign,
+        "sensor_turns_per_joint_turn": turns,
+        "max_residual_deg": max((abs(value) for value in residuals), default=None),
+        "linear_max_residual_deg": float(linear_fit["max_residual_deg"]) if linear_fit is not None else None,
+        "residual_limit_deg": residual_limit,
+        "approach_directions": directions,
+        "approach_bias_deg": approach_bias_deg,
+        "backlash_estimate_deg": backlash_estimate_deg,
+        **localized_backlash,
+        "calibration_map": calibration_map,
+        "calibration_map_point_count": len(calibration_map),
+        "fit_points": fit_points,
+        "reference_sample_index": reference_index,
+        "reference_raw_deg": reference_raw_for_calibration,
+        "reference_joint_deg": float(reference_joint_for_calibration),
+        "mounting_location": session.get("mounting_location"),
+    }
+
+
+async def _move_shoulder_for_encoder_helper(
+    target_shoulder_deg: float,
+    *,
+    source: str,
+    settings: dict[str, Any],
+) -> tuple[bool, str]:
+    current = state.reported_angles_deg.copy()
+    if len(current) < len(config.joints):
+        current = config.home_pose.copy()
+    current[1] = float(target_shoulder_deg)
+    response = await start_joint_target_trajectory(current, source, settings)
+    if not response.get("ok"):
+        return False, response.get("error") or "encoder helper move failed"
+    task = path_task
+    if task is not None:
+        await task
+    if state.motion_state == MotionState.FAULT or state.last_error:
+        return False, state.last_error or "encoder helper move faulted"
+    diagnostics = state.motion_diagnostics or {}
+    if diagnostics.get("result") not in {None, "reached"}:
+        return False, str(diagnostics.get("error") or diagnostics.get("result") or "encoder helper move failed")
+    return True, "reached"
+
+
+def encoder_backlash_check_ready() -> tuple[bool, str]:
+    if state.simulation:
+        return False, "backlash check requires connected hardware"
+    if not serial_client.is_connected or not state.connected:
+        return False, "connect the controller before backlash check"
+    if not state.hardware_armed:
+        return False, "arm hardware before running the backlash check"
+    if state.motion_state == MotionState.MOVING:
+        return False, "wait for the current motion to finish before backlash check"
+    if state.motion_state == MotionState.ESTOP:
+        return False, "clear ESTOP before backlash check"
+    if state.motion_state == MotionState.FAULT:
+        return False, state.last_error or "clear the robot fault before backlash check"
+    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+        return False, "stop live motion, tasks, and Cartesian jog before backlash check"
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish"
+    if not state.known_pose:
+        return False, "Set Pose first; backlash check needs a known planning pose"
+    _settings, shoulder, reason = _encoder_runtime_ready()
+    if reason:
+        return False, reason
+    if not shoulder or not shoulder.get("calibration_validated"):
+        return False, "quick-calibrate or commit shoulder encoder calibration before backlash check"
+    if str(shoulder.get("mounting_location")) != "joint_output":
+        return False, "backlash check requires joint-output encoder mounting"
+    ready, reason = hardware_ready_for_motion()
+    if not ready:
+        return False, reason
+    return True, ""
+
+
+async def run_encoder_backlash_check(request: EncoderBacklashCheckRequest) -> dict[str, Any]:
+    ready, reason = encoder_backlash_check_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    center = (
+        float(request.center_joint_angle_deg)
+        if request.center_joint_angle_deg is not None
+        else float(state.reported_angles_deg[1])
+    )
+    shoulder = config.joints[1]
+    travel = float(request.travel_deg)
+    repeats = int(request.repeats)
+    settle_ms = int(request.settle_ms)
+    if not isfinite(center) or not shoulder.min_deg <= center <= shoulder.max_deg:
+        return {"ok": False, "error": "backlash check center is outside shoulder limits", "state": state.to_dict()}
+    if not isfinite(travel) or travel < 2.0 or travel > 30.0:
+        return {"ok": False, "error": "backlash check travel must be between 2 and 30 degrees", "state": state.to_dict()}
+    if repeats < 1 or repeats > 5:
+        return {"ok": False, "error": "backlash check repeats must be between 1 and 5", "state": state.to_dict()}
+    if settle_ms < 100 or settle_ms > 5000:
+        return {"ok": False, "error": "settle time must be between 100 and 5000 ms", "state": state.to_dict()}
+    low = center - travel
+    high = center + travel
+    if low < shoulder.min_deg or high > shoulder.max_deg:
+        return {
+            "ok": False,
+            "error": (
+                f"backlash check needs {travel:.1f} deg on both sides of {center:.1f} deg; "
+                f"choose a center within {shoulder.min_deg + travel:.1f}..{shoulder.max_deg - travel:.1f} deg"
+            ),
+            "state": state.to_dict(),
+        }
+    settings = _encoder_sweep_path_settings(float(request.speed_deg_s), 24.0)
+    verification = encoder_settings(config).get("verification", {})
+    required_samples = max(1, int(verification.get("required_stable_samples", 3)))
+    settle_s = settle_ms / 1000.0
+    samples: list[dict[str, Any]] = []
+
+    async def move_and_capture(preload_target: float, approach_direction: int, label: str) -> tuple[bool, str]:
+        ok, message = await _move_shoulder_for_encoder_helper(
+            preload_target,
+            source="encoder_backlash_check",
+            settings=settings,
+        )
+        if not ok:
+            return False, message
+        ok, message = await _move_shoulder_for_encoder_helper(
+            center,
+            source="encoder_backlash_check",
+            settings=settings,
+        )
+        if not ok:
+            return False, message
+        await asyncio.sleep(settle_s)
+        measured, stable_reason = await _stable_shoulder_measurement(required_samples)
+        if measured is None:
+            return False, stable_reason
+        evidence = _shoulder_evidence()
+        samples.append(
+            {
+                "label": label,
+                "center_joint_angle_deg": center,
+                "approach_direction": approach_direction,
+                "preload_target_deg": preload_target,
+                "measured_angle_deg": measured,
+                "error_deg": measured - center,
+                "raw_angle_deg": evidence.get("raw_angle_deg"),
+                "raw_count": evidence.get("raw_count"),
+                "age_ms": evidence.get("age_ms"),
+                "noise_deg": evidence.get("noise_deg"),
+                "captured_at": time(),
+            }
+        )
+        return True, "captured"
+
+    for repeat in range(1, repeats + 1):
+        ok, message = await move_and_capture(low, 1, f"repeat {repeat} from below")
+        if not ok:
+            return {"ok": False, "error": message, "samples": samples, "state": state.to_dict()}
+        ok, message = await move_and_capture(high, -1, f"repeat {repeat} from above")
+        if not ok:
+            return {"ok": False, "error": message, "samples": samples, "state": state.to_dict()}
+
+    below = [sample["measured_angle_deg"] for sample in samples if sample["approach_direction"] == 1]
+    above = [sample["measured_angle_deg"] for sample in samples if sample["approach_direction"] == -1]
+    below_mean = sum(below) / len(below)
+    above_mean = sum(above) / len(above)
+    backlash = abs(above_mean - below_mean)
+    midpoint = (above_mean + below_mean) / 2.0
+    result = {
+        "status": "measured",
+        "center_joint_angle_deg": center,
+        "travel_deg": travel,
+        "repeats": repeats,
+        "from_below_mean_deg": below_mean,
+        "from_above_mean_deg": above_mean,
+        "backlash_estimate_deg": backlash,
+        "midpoint_error_deg": midpoint - center,
+        "samples": samples,
+        "checked_at": time(),
+        "interpretation": (
+            "backlash/lost motion is large enough that post-move correction is useful"
+            if backlash >= 1.0
+            else "backlash at this target is small"
+        ),
+    }
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "status": "backlash_measured",
+        "source": "encoder_backlash_check",
+        "measured_deg": midpoint,
+        "error_deg": midpoint - center,
+        "backlash_estimate_deg": backlash,
+        "checked_at": result["checked_at"],
+    }
+    log_event(
+        "encoder",
+        "shoulder backlash check completed",
+        center_joint_angle_deg=center,
+        travel_deg=travel,
+        backlash_estimate_deg=backlash,
+        midpoint_error_deg=midpoint - center,
+    )
+    await broadcast_state()
+    return {"ok": True, "backlash": result, "samples": samples, "state": state.to_dict()}
+
+
+def persist_encoder_calibration(settings: dict[str, Any]) -> dict[str, Any]:
+    config_path = ensure_local_config()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        draft_path = Path(tmp_dir) / "robot.local.yaml"
+        shutil.copyfile(config_path, draft_path)
+        save_calibration_updates(draft_path, {"encoders": settings})
+        draft_config = load_config(draft_path)
+        errors = validate_encoder_settings(draft_config, encoder_settings(draft_config))
+        if errors:
+            raise ValueError("; ".join(errors))
+        change = classify_config_change(config, draft_config)
+        ready, reason = config_change_ready(change)
+        if not ready:
+            raise ValueError(reason)
+    save_calibration_updates(config_path, {"encoders": settings})
+    saved_config = load_config(config_path)
+    reload_runtime_config(saved_config, change)
+    return change
+
+
+def _controller_supports_encoder_config() -> bool:
+    capabilities = state.controller_capabilities or {}
+    return bool(capabilities.get("encoder_config"))
+
+
+def _encoder_runtime_requested(settings: dict[str, Any]) -> bool:
+    return bool(settings.get("enabled"))
+
+
+def _encoder_unsupported_message(settings: dict[str, Any]) -> str:
+    capabilities = state.controller_capabilities or {}
+    protocol = capabilities.get("protocol")
+    raw = capabilities.get("raw") or state.last_command or "unknown controller"
+    if _encoder_runtime_requested(settings):
+        return (
+            "controller firmware does not advertise protocol-v4 encoder config support; "
+            "disable the encoder bus or flash the current arm_controller firmware. "
+            f"Controller hello: {raw}"
+        )
+    protocol_text = f"protocol {protocol}" if protocol is not None else "legacy protocol"
+    return (
+        f"encoder config is disabled locally and was skipped for {protocol_text} controller compatibility"
+    )
+
+
 def sync_hardware_config() -> dict[str, Any]:
     evaluation = apply_hardware_evaluation()
     ready, reason = config_sync_ready()
@@ -2602,9 +4537,23 @@ def sync_hardware_config() -> dict[str, Any]:
         state.config_sync_message = "; ".join(evaluation["errors"]) or "hardware config is invalid"
         return {"ok": False, "status": state.config_sync_status, "evaluation": evaluation, "message": state.config_sync_message}
 
+    encoders = encoder_settings(config)
+    encoder_supported = _controller_supports_encoder_config()
+    if _encoder_runtime_requested(encoders) and not encoder_supported:
+        state.config_sync_status = "unsupported"
+        state.config_sync_message = _encoder_unsupported_message(encoders)
+        log_event("controller", "encoder config sync unsupported", detail=state.config_sync_message)
+        return {
+            "ok": False,
+            "status": state.config_sync_status,
+            "evaluation": evaluation,
+            "message": state.config_sync_message,
+        }
+    encoders_for_sync = encoders if encoder_supported else None
+
     try:
         serial_client.clear_input()
-        for line in format_config_lines(config.joints, tools_settings(config)):
+        for line in format_config_lines(config.joints, tools_settings(config), encoders_for_sync):
             serial_client.send_line(line)
         response = read_serial_until_any(("OK command=CONFIG", "ERR"), timeout_s=2.0)
     except SerialClientError as exc:
@@ -2621,6 +4570,9 @@ def sync_hardware_config() -> dict[str, Any]:
             )
         else:
             state.config_sync_message = response
+        if not encoder_supported:
+            compatibility_note = _encoder_unsupported_message(encoders)
+            state.config_sync_message = f"{state.config_sync_message}; {compatibility_note}"
         state.last_command = response
         state.clear_error()
         log_event(
@@ -2628,6 +4580,7 @@ def sync_hardware_config() -> dict[str, Any]:
             response,
             pose_revalidation_required=bool(state.config_change.get("pose_revalidation_required")),
             known_pose=state.known_pose,
+            encoder_config_sent=encoder_supported,
         )
         return {
             "ok": True,
@@ -2761,11 +4714,12 @@ def build_preview(
             config.joints,
             state.reported_angles_deg,
             branch,
+            selection_policy=ik_selection_policy(settings),
         )
         if not ik_result["ok"] or not ik_result["selected"]:
             return {
                 "ok": False,
-                "error": "IK target has no valid solution",
+                "error": ik_result.get("failure_reason") or "IK target has no valid solution",
                 "diagnostic_category": "ik_reachability",
                 "requested_target": requested_target,
                 "command_target": command_target,
@@ -2980,6 +4934,11 @@ async def start_joint_target_trajectory(
             state.set_error(reason)
             await broadcast_state()
             return {"ok": False, "error": reason, "state": state.to_dict()}
+        reason = hardware_trajectory_start_blocking_reason()
+        if reason:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
 
     can_move = validate_can_move(state)
     if not can_move.ok:
@@ -3042,7 +5001,7 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
     speed = settings.get("global_speed_deg_s")
     accel = settings.get("global_accel_deg_s2")
     expected_duration = float(trajectory.get("duration_s", 0.0))
-    command_contract_name = "SIM_TRAJ" if state.simulation else "MOVEJ"
+    command_contract_name = "SIM_TRAJ" if state.simulation else "TRAJ"
     runtime_motion_contract = motion_contract_for_controller(
         trajectory.get("motion_contract") or preview.get("motion_contract"),
         command_contract_name,
@@ -3050,10 +5009,10 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
     )
     run_id = start_motion_diagnostics(
         source=str(preview.get("source", "joint")),
-        mode="joint_timed_simulation" if state.simulation else "joint_endpoint",
+        mode="joint_timed_simulation" if state.simulation else "joint_timed_trajectory",
         target_deg=target,
         expected_duration_s=expected_duration,
-        waypoint_count=1,
+        waypoint_count=len(waypoints),
         motion_contract=runtime_motion_contract,
         step_label=str(preview.get("task_step_label", "")),
         step_index=int(preview.get("task_step_index", 0) or 0),
@@ -3064,7 +5023,7 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
         execution_state="executing",
         result="executing",
         current_waypoint_index=1,
-        current_waypoint_total=1,
+        current_waypoint_total=len(waypoints),
         active_target_deg=target,
     )
 
@@ -3074,27 +5033,89 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
             await execute_simulated_waypoint_trajectory(trajectory, run_id)
             return
 
-        response = set_targets(
-            target,
-            f"{preview.get('source', 'joint')}_endpoint",
-            speed_deg_s=speed,
-            accel_deg_s2=accel,
+        if len(waypoints) < 2:
+            if has_reached_target(state.reported_angles_deg, target, tolerance_deg=0.08):
+                state.target_angles_deg = target.copy()
+                limiter.reset(target)
+                state.motion_state = MotionState.IDLE
+                state.clear_error()
+                finish_motion_diagnostics("reached", run_id=run_id)
+            else:
+                message = "hardware joint trajectory requires at least two timed waypoints"
+                state.set_error(message, fault=True)
+                finish_motion_diagnostics("failed", message, run_id)
+            return
+
+        speed_value = (
+            float(speed)
+            if speed is not None and float(speed) > 0
+            else min(joint.max_speed_deg_s for joint in config.joints)
+        )
+        accel_value = (
+            float(accel)
+            if accel is not None and float(accel) > 0
+            else config.motion.acceleration_deg_s2
+        )
+        if not serial_client.is_connected:
+            raise SerialClientError("trajectory execution requires serial hardware connection")
+        reason = hardware_trajectory_start_blocking_reason(preview)
+        if reason:
+            state.set_error(reason)
+            finish_motion_diagnostics("failed", reason, run_id)
+            return
+
+        update_motion_diagnostics(
+            run_id,
+            execution_state="uploading",
+            result="executing",
+            current_waypoint_index=0,
+            current_waypoint_total=len(waypoints),
+            active_target_deg=target,
+        )
+        state.motion_state = MotionState.MOVING
+        state.last_command = f"TRAJ_UPLOAD {len(waypoints)}"
+        state.clear_error()
+        await broadcast_state()
+
+        upload = send_trajectory_and_read_response(trajectory, speed_value, accel_value)
+        state.target_angles_deg = target.copy()
+        limiter.current_deg = state.reported_angles_deg.copy()
+        limiter.set_target(state.target_angles_deg)
+        state.last_command = format_traj_start()
+        state.motion_state = MotionState.MOVING
+        update_motion_diagnostics(
+            run_id,
+            execution_state="executing",
+            result="executing",
+            current_waypoint_index=len(waypoints),
+            current_waypoint_total=len(waypoints),
+            active_target_deg=target,
+            uploaded_waypoint_count=upload["point_count"],
+            uploaded_duration_s=upload["duration_s"],
         )
         await broadcast_state()
-        if not response["ok"]:
-            finish_motion_diagnostics("failed", response.get("error", "joint endpoint failed"), run_id)
-            return
 
         ok, message = await wait_for_hardware_target(
             target,
-            timeout_s=max(1.0, expected_duration * 2.0 + 1.0),
+            timeout_s=max(1.0, expected_duration * 2.0 + 2.0),
             tolerance_deg=float(calibration_settings(config).get("movement_tolerance_deg", 0.2)),
+            poll_interval_s=0.20,
         )
         if ok:
-            finish_motion_diagnostics("reached", run_id=run_id)
+            verified, verification_message = await verify_shoulder_after_motion(
+                str(preview.get("source", "joint")),
+                target,
+            )
+            if verified:
+                finish_motion_diagnostics("reached", verification_message, run_id)
+            else:
+                finish_motion_diagnostics("failed", verification_message, run_id)
         else:
             state.set_error(message, fault=True)
             finish_motion_diagnostics("failed", message, run_id)
+    except (SerialClientError, ValueError) as exc:
+        state.set_error(str(exc), fault=True)
+        finish_motion_diagnostics("failed", str(exc), run_id)
     except asyncio.CancelledError:
         finish_motion_diagnostics("stopped", "cancelled", run_id)
         raise
@@ -3247,6 +5268,11 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
         try:
             if not serial_client.is_connected:
                 raise SerialClientError("trajectory execution requires serial hardware connection")
+            reason = hardware_trajectory_start_blocking_reason(preview)
+            if reason:
+                state.set_error(reason)
+                finish_motion_diagnostics("failed", reason, run_id)
+                return
             update_motion_diagnostics(
                 run_id,
                 execution_state="uploading",
@@ -3292,7 +5318,14 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
                 poll_interval_s=0.20,
             )
             if ok:
-                finish_motion_diagnostics("reached", run_id=run_id)
+                verified, verification_message = await verify_shoulder_after_motion(
+                    str(preview.get("source", "path")),
+                    final_target,
+                )
+                if verified:
+                    finish_motion_diagnostics("reached", verification_message, run_id)
+                else:
+                    finish_motion_diagnostics("failed", verification_message, run_id)
             else:
                 state.set_error(message, fault=True)
                 finish_motion_diagnostics("failed", message, run_id)
@@ -3369,6 +5402,13 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
                         state.set_error(message, fault=True)
                         finish_motion_diagnostics("failed", message, run_id)
                         break
+                    verified, verification_message = await verify_shoulder_after_motion(
+                        str(preview.get("source", "path")),
+                        waypoint_values,
+                    )
+                    if not verified:
+                        finish_motion_diagnostics("failed", verification_message, run_id)
+                        break
     except asyncio.CancelledError:
         finish_motion_diagnostics("stopped", "cancelled", run_id)
         raise
@@ -3415,19 +5455,22 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
 
     if normalized in {"open", "close"}:
         command = format_tool(normalized)
-        state.tool_state = "open" if normalized == "open" else "closed"
-        state.tool_value = preset.get("open_value" if normalized == "open" else "closed_value")
+        next_tool_state = "open" if normalized == "open" else "closed"
+        next_tool_value = preset.get("open_value" if normalized == "open" else "closed_value")
     elif normalized in {"on", "off"}:
         command = format_tool(normalized)
-        state.tool_state = normalized
-        state.tool_value = 1.0 if normalized == "on" else 0.0
+        next_tool_state = normalized
+        next_tool_value = 1.0 if normalized == "on" else 0.0
     else:
         command = format_tool("set", value)
-        state.tool_state = "set"
-        state.tool_value = max(0.0, min(1.0, float(value if value is not None else 0.0)))
+        next_tool_state = "set"
+        next_tool_value = max(0.0, min(1.0, float(value if value is not None else 0.0)))
 
     state.last_command = command
     if state.simulation:
+        state.tool_state = next_tool_state
+        state.tool_value = next_tool_value
+        state.clear_error()
         log_event("tool", command, simulation=True)
         state.updated_at = time()
         await broadcast_state()
@@ -3455,8 +5498,20 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
             state.set_error(response)
             await broadcast_state()
             return {"ok": False, "error": response, "state": state.to_dict()}
+        response_fields = {
+            key: raw_value
+            for token in response.split()[1:]
+            if "=" in token
+            for key, raw_value in [token.split("=", 1)]
+        }
+        state.last_controller_response = response
+        state.tool_state = response_fields.get("state", next_tool_state)
+        try:
+            state.tool_value = float(response_fields["value"]) if "value" in response_fields else next_tool_value
+        except ValueError:
+            state.tool_value = next_tool_value
+        state.clear_error()
         log_event("tool", command, response=response)
-        refresh_serial_status()
     except SerialClientError as exc:
         state.set_error(str(exc), fault=True)
         await broadcast_state()
@@ -3704,6 +5759,16 @@ async def execute_task_sequence(
         if terminal_on_finish:
             finish_task_execution("stopped", "task cancelled")
         raise
+    except Exception as exc:
+        failed_reason = f"task execution error: {exc}"
+        state.set_error(failed_reason)
+        log_event(
+            "task",
+            "task execution failed",
+            error=str(exc),
+            step=(state.task_execution or {}).get("current_step"),
+        )
+        return {"ok": False, "error": failed_reason}
     finally:
         if terminal_on_finish and not cancelled:
             if failed_reason:
@@ -3719,10 +5784,69 @@ async def execute_task_sequence(
         await broadcast_state()
 
 
+def _named_position_resolution_error(name: str) -> str:
+    position_name = str(name or "").strip()
+    if not position_name:
+        return "named position is empty"
+    position = named_positions(config).get(position_name)
+    if not isinstance(position, dict):
+        return f"named position {position_name} is missing"
+    try:
+        errors = validate_named_position(config, position_name, position)
+    except Exception as exc:
+        return f"named position {position_name} is invalid: {exc}"
+    if errors:
+        return f"named position {position_name} is invalid: {'; '.join(str(error) for error in errors)}"
+    if str(position.get("type", "joint")).lower() == "joint" and not isinstance(position.get("angles_deg"), list):
+        return f"named position {position_name} is missing angles_deg"
+    return f"named position {position_name} could not be converted to a task waypoint"
+
+
+def check_task_named_position_motion(name: str, settings: dict[str, Any], branch: str, label: str) -> dict[str, Any]:
+    waypoint = named_position_waypoint(config, name)
+    if waypoint is None:
+        return {"ok": False, "error": _named_position_resolution_error(name)}
+    try:
+        prepared_program, corrections = correct_waypoint_program(
+            [waypoint],
+            config,
+            apply_enabled=True,
+            validation_trial=False,
+        )
+        trajectory = build_program_trajectory(
+            state.reported_angles_deg,
+            prepared_program,
+            config.links,
+            config.joints,
+            settings,
+            branch,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"{label} could not be planned: {exc}"}
+    if not trajectory.get("ok"):
+        return {
+            "ok": False,
+            "error": f"{label} cannot be planned: {'; '.join(str(error) for error in trajectory.get('errors', [])) or 'motion preview failed'}",
+            "trajectory": trajectory,
+            "calibration": corrections,
+        }
+    return {
+        "ok": True,
+        "position": str(name),
+        "label": label,
+        "trajectory": {
+            "mode": trajectory.get("mode"),
+            "duration_s": trajectory.get("duration_s", 0.0),
+            "waypoint_count": trajectory.get("waypoint_count", 0),
+        },
+        "calibration": corrections,
+    }
+
+
 async def move_task_named_position(name: str, settings: dict[str, Any], branch: str, label: str) -> dict[str, Any]:
     waypoint = named_position_waypoint(config, name)
     if waypoint is None:
-        return {"ok": False, "error": f"named position {name} is missing"}
+        return {"ok": False, "error": _named_position_resolution_error(name)}
     sequence = {
         "ok": True,
         "task": "task_position",
@@ -3846,13 +5970,15 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             )
             await broadcast_state()
             clear_result = await move_task_named_position(
-                str(task_settings.get("camera_clear_position") or task_settings.get("safe_position") or "safe"),
+                str(task_settings.get("camera_clear_position") or task_settings.get("safe_position") or "home"),
                 path_settings,
                 branch,
                 "camera clear",
             )
             if not clear_result.get("ok"):
                 reason = clear_result.get("error") or "camera-clear move failed"
+                if not str(reason).lower().startswith("camera clear"):
+                    reason = f"camera clear failed: {reason}"
                 state.set_error(reason)
                 finish_task_execution("failed", reason)
                 await broadcast_state()
@@ -3979,7 +6105,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                 ]
                 if not candidate_ids:
                     reason = preflight.get("error", "closed-loop cycle preflight failed")
-                    if reason == "no task objects have a reachable IK path":
+                    if reason.startswith("no task objects have a safe continuous IK path"):
                         terminal_reason = "no reachable task objects"
                         finish_task_execution("completed", terminal_reason)
                         await broadcast_state()
@@ -4079,7 +6205,7 @@ def reload_runtime_config(
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
     state.active_tool = str(tools_settings(config).get("active", "gripper"))
     state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
-    state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
+    state.closed_loop_mode = str(encoder_settings(config).get("mode", "diagnostic"))
     camera = camera_settings(config)
     april_tag_session.configure(camera, preserve_frames=True)
     workspace_calibration_session.configure(
@@ -4095,6 +6221,19 @@ def reload_runtime_config(
         **config_change,
         "applied_at": time(),
     }
+    if config_change.get("encoder_measurement_invalidated"):
+        state.update_encoder_evidence(
+            [
+                empty_evidence(index + 1, joint.name)
+                for index, joint in enumerate(config.joints)
+            ]
+        )
+        state.encoder_available = "0000"
+        state.encoder_angles_deg = [None] * len(config.joints)
+        state.encoder_errors_deg = [None] * len(config.joints)
+        state.encoder_fault = False
+        state.encoder_mismatch = {}
+        encoder_calibration_sessions.clear()
     if not state.simulation:
         if config_change.get("pose_invalidated"):
             state.homed = False
@@ -4139,23 +6278,35 @@ def apply_controller_status(status_line: str) -> None:
     reported_angles = [float(value) for value in status.joints_deg]
     known_pose = status.known_pose
     pose_source = status.pose_source
+    legacy_encoder_authority = (
+        "known_mask=" not in status_line
+        and pose_source in {"encoder", "mixed"}
+    )
+    if legacy_encoder_authority and not status.homed:
+        trusted_existing_estimate = (
+            state.known_pose
+            and state.pose_source in {"setpose", "open_loop_estimate", "manual", "home"}
+        )
+        known_pose = trusted_existing_estimate
+        status_known_mask = state.pose_known_mask if trusted_existing_estimate else "0000"
+        pose_source = state.pose_source if trusted_existing_estimate else "unknown"
+    else:
+        status_known_mask = status.known_mask
     state.hardware_armed = status.armed
     if status.hardware_mode != "unknown":
         state.hardware_mode = status.hardware_mode
     if status.enabled_axes:
         state.hardware_enabled_axes = status.enabled_axes
     state.encoder_available = status.encoder_available
-    state.encoder_angles_deg = status.encoder_angles_deg or [None] * len(config.joints)
-    for index, angle in enumerate(state.encoder_angles_deg[: len(reported_angles)]):
-        if index < len(state.encoder_available) and state.encoder_available[index] == "1" and angle is not None:
-            reported_angles[index] = float(angle)
-            known_pose = True
-            if pose_source in {"unknown", ""}:
-                pose_source = "encoder"
+    known_mask = status_known_mask
+    if state.encoder_fault and len(known_mask) >= 2:
+        known_mask = f"{known_mask[0]}0{known_mask[2:]}"
+        known_pose = False
     state.update_reported_pose(
         reported_angles,
         source=pose_source,
         known_pose=known_pose,
+        known_mask=known_mask,
     )
     state.closed_loop_mode = status.closed_loop_mode
     if status.tool_type != "unknown":
@@ -4163,10 +6314,19 @@ def apply_controller_status(status_line: str) -> None:
     state.tool_state = status.tool_state
     if status.tool_value is not None:
         state.tool_value = status.tool_value
-    if status.state in {item.value for item in MotionState}:
+    if not state.encoder_fault and status.state in {item.value for item in MotionState}:
         state.motion_state = MotionState(status.state)
-    state.last_error = "" if status.fault == "OK" else status.fault
-    update_encoder_verification()
+    if not state.encoder_fault:
+        state.last_error = "" if status.fault == "OK" else status.fault
+    update_encoder_evidence(status)
+    state.correction_state = {
+        "state": status.correction_state,
+        "transaction_id": status.correction_transaction_id,
+        "requested_delta_deg": status.correction_requested_delta_deg,
+        "emitted_steps": status.correction_emitted_steps,
+        "attempts": status.correction_attempts,
+        "bias_deg": status.correction_bias_deg or [None] * len(config.joints),
+    }
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
     record_motion_sample(active_motion_run_id)
     maybe_finish_reached_motion()
@@ -4186,6 +6346,20 @@ def refresh_serial_status() -> None:
     serial_client.send_line(format_status())
     status_line = serial_client.read_until_prefix("STATUS", timeout_s=1.0)
     apply_controller_status(status_line)
+
+
+def hardware_trajectory_start_blocking_reason(preview: dict[str, Any] | None = None) -> str | None:
+    if state.simulation or not serial_client.is_connected:
+        return None
+    try:
+        refresh_serial_status()
+    except SerialClientError as exc:
+        return str(exc)
+    if state.motion_state == MotionState.MOVING:
+        return "controller is still moving; wait for STATUS state=idle or press Stop before starting a trajectory"
+    if preview is not None and "start_pose_revision" in preview:
+        return preview_stale_reason(preview)
+    return None
 
 
 @app.on_event("startup")
@@ -5378,6 +7552,10 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         state.set_error("SETPOSE requires hardware to be disarmed")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.encoder_fault:
+        state.set_error("clear the latched encoder fault before Set Pose")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     pose_revision_before = state.pose_revision
     try:
         serial_client.clear_input()
@@ -5410,6 +7588,545 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "state": state.to_dict()}
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/encoder/fault/clear")
+async def clear_encoder_fault(request: EncoderFaultClearRequest) -> dict[str, Any]:
+    if not state.encoder_fault:
+        return {"ok": True, "state": state.to_dict()}
+    if state.simulation:
+        state.set_error("encoder fault clearing is a hardware-only operation")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.hardware_armed:
+        state.set_error("disarm hardware before clearing an encoder fault")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.motion_state == MotionState.ESTOP:
+        state.set_error("clear ESTOP before clearing the encoder fault")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not request.acknowledge_pose_unknown:
+        state.set_error("acknowledge that the shoulder planning pose remains unknown until Set Pose")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    state.encoder_fault = False
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "status": "cleared",
+        "cleared_at": time(),
+        "requires_setpose": True,
+    }
+    state.motion_state = MotionState.STOPPED
+    state.last_error = ""
+    state.last_command = "ENCODER_FAULT_CLEAR"
+    log_event(
+        "encoder",
+        "latched shoulder encoder fault cleared; Set Pose is still required",
+    )
+    await broadcast_state()
+    return {"ok": True, "requires_setpose": True, "state": state.to_dict()}
+
+
+@app.post("/api/encoder/calibration/quick")
+async def quick_calibrate_encoder(request: EncoderQuickCalibrationRequest) -> dict[str, Any]:
+    ready, reason = encoder_calibration_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if not request.confirm_one_to_one_output_mount:
+        return {
+            "ok": False,
+            "error": (
+                "quick calibration assumes the AS5048A is mounted at the shoulder output with "
+                "one sensor turn per joint turn; explicit confirmation is required"
+            ),
+            "state": state.to_dict(),
+        }
+    if request.mounting_location != "joint_output":
+        return {
+            "ok": False,
+            "error": "quick calibration and backlash correction require joint-output encoder mounting",
+            "state": state.to_dict(),
+        }
+    joint_angle, reason = _validate_encoder_known_joint_angle(request.joint_angle_deg)
+    if joint_angle is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    direction_sign = int(request.direction_sign)
+    if direction_sign not in {-1, 1}:
+        return {"ok": False, "error": "direction sign must be +1 or -1", "state": state.to_dict()}
+    turns = float(request.sensor_turns_per_joint_turn)
+    if not isfinite(turns) or turns <= 0.0:
+        return {"ok": False, "error": "sensor turns per joint turn must be positive", "state": state.to_dict()}
+    sample, reason = current_raw_shoulder_sample()
+    if sample is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings)
+    if shoulder is None:
+        return {"ok": False, "error": "shoulder encoder configuration is missing", "state": state.to_dict()}
+    calibration_id = str(uuid4())
+    shoulder.update(
+        {
+            "reference_raw_deg": sample["raw_angle_deg"],
+            "reference_joint_deg": joint_angle,
+            "direction_sign": direction_sign,
+            "sensor_turns_per_joint_turn": turns,
+            "mounting_location": request.mounting_location,
+            "reference_description": request.reference_description.strip(),
+            "calibration_validated": True,
+            "calibration_id": calibration_id,
+            "calibration_validated_at": datetime.now(timezone.utc).isoformat(),
+            "calibration_model": "single_point",
+            "calibration_map": [],
+            "calibration_map_extrapolate_deg": 2.0,
+            "fit_max_residual_deg": None,
+            "backlash_estimate_deg": None,
+            "backlash_approach_bias_deg": None,
+            "localized_backlash_estimate_deg": None,
+            "localized_backlash_at_joint_deg": None,
+        }
+    )
+    settings["mode"] = "diagnostic"
+    settings.setdefault("correction", {})
+    settings["correction"]["enabled"] = False
+    settings["correction"]["validation_id"] = ""
+    try:
+        change = persist_encoder_calibration(settings)
+    except Exception as exc:
+        state.set_error(f"could not save quick shoulder encoder calibration: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    state.last_command = "QUICK_SHOULDER_ENCODER_CALIBRATION"
+    state.clear_error()
+    validation = {
+        "ok": True,
+        "fit_model": "single_point",
+        "reference_raw_deg": sample["raw_angle_deg"],
+        "reference_joint_deg": joint_angle,
+        "direction_sign": direction_sign,
+        "sensor_turns_per_joint_turn": turns,
+        "sample_count": 1,
+        "fit_sample_count": 1,
+        "warnings": [
+            "quick calibration uses one known shoulder angle plus the configured direction and 1:1 scale; "
+            "run backlash check or assisted sweep to verify the range"
+        ],
+        "errors": [],
+    }
+    log_event(
+        "encoder",
+        "quick shoulder encoder calibration committed",
+        calibration_id=calibration_id,
+        reference_raw_deg=sample["raw_angle_deg"],
+        reference_joint_deg=joint_angle,
+        direction_sign=direction_sign,
+        sensor_turns_per_joint_turn=turns,
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "calibration_id": calibration_id,
+        "sample": sample,
+        "validation": validation,
+        "config_change": change,
+        "config": public_config(),
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/backlash/check")
+async def check_encoder_backlash(request: EncoderBacklashCheckRequest) -> dict[str, Any]:
+    return await run_encoder_backlash_check(request)
+
+
+@app.post("/api/encoder/calibration/start")
+async def start_encoder_calibration(request: EncoderCalibrationStartRequest) -> dict[str, Any]:
+    ready, reason = encoder_calibration_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if request.mounting_location not in {"joint_output", "gearbox_input", "motor_shaft"}:
+        return {"ok": False, "error": "unsupported encoder mounting location", "state": state.to_dict()}
+    initial_joint_angle: float | None = None
+    if request.capture_initial:
+        initial_joint_angle, reason = _validate_encoder_known_joint_angle(request.joint_angle_deg)
+        if initial_joint_angle is None:
+            return {"ok": False, "error": reason, "state": state.to_dict()}
+    sample, reason = current_raw_shoulder_sample()
+    if sample is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    session_id = str(uuid4())
+    session = {
+        "id": session_id,
+        "joint": 2,
+        "created_at": time(),
+        "mounting_location": request.mounting_location,
+        "reference_description": request.reference_description.strip(),
+        "samples": [],
+        "initial_raw_sample": sample,
+    }
+    captured = None
+    validation = None
+    if request.capture_initial and initial_joint_angle is not None:
+        captured = _encoder_calibration_capture(sample, initial_joint_angle, "reference 1")
+        session["samples"].append(captured)
+        validation = validate_encoder_calibration_session(session)
+    encoder_calibration_sessions[session_id] = session
+    log_event(
+        "encoder",
+        "shoulder encoder calibration session started",
+        session_id=session_id,
+        mounting_location=request.mounting_location,
+        initial_sample_captured=bool(captured),
+    )
+    response = {
+        "ok": True,
+        "session": deepcopy(encoder_calibration_sessions[session_id]),
+        "state": state.to_dict(),
+    }
+    if captured is not None:
+        response["sample"] = captured
+    if validation is not None:
+        response["validation"] = validation
+    return response
+
+
+@app.post("/api/encoder/calibration/sample")
+async def capture_encoder_calibration_sample(request: EncoderCalibrationSampleRequest) -> dict[str, Any]:
+    ready, reason = encoder_calibration_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    session = encoder_calibration_sessions.get(request.session_id)
+    if session is None:
+        return {"ok": False, "error": "encoder calibration session not found", "state": state.to_dict()}
+    if time() - float(session.get("created_at", 0.0)) > 1800.0:
+        encoder_calibration_sessions.pop(request.session_id, None)
+        return {"ok": False, "error": "encoder calibration session expired", "state": state.to_dict()}
+    joint_angle, reason = _validate_encoder_known_joint_angle(request.joint_angle_deg)
+    if joint_angle is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    sample, reason = current_raw_shoulder_sample()
+    if sample is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    captured = _encoder_calibration_capture(sample, joint_angle, request.label)
+    session["samples"].append(captured)
+    validation = validate_encoder_calibration_session(session)
+    log_event(
+        "encoder",
+        "shoulder encoder calibration sample captured",
+        session_id=request.session_id,
+        sample_count=len(session["samples"]),
+        raw_angle_deg=sample["raw_angle_deg"],
+        joint_angle_deg=joint_angle,
+    )
+    return {
+        "ok": True,
+        "sample": captured,
+        "session": deepcopy(session),
+        "validation": validation,
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/calibration/validate")
+async def validate_encoder_calibration(request: EncoderCalibrationSessionRequest) -> dict[str, Any]:
+    session = encoder_calibration_sessions.get(request.session_id)
+    if session is None:
+        return {"ok": False, "error": "encoder calibration session not found", "state": state.to_dict()}
+    validation = validate_encoder_calibration_session(session)
+    return {
+        "ok": validation["ok"],
+        "validation": validation,
+        "session": deepcopy(session),
+        "error": "; ".join(validation["errors"]) if validation["errors"] else "",
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/calibration/commit")
+async def commit_encoder_calibration(request: EncoderCalibrationCommitRequest) -> dict[str, Any]:
+    ready, reason = encoder_calibration_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if not request.confirm:
+        return {
+            "ok": False,
+            "error": "explicit confirmation is required to commit shoulder encoder calibration",
+            "state": state.to_dict(),
+        }
+    session = encoder_calibration_sessions.get(request.session_id)
+    if session is None:
+        return {"ok": False, "error": "encoder calibration session not found", "state": state.to_dict()}
+    validation = validate_encoder_calibration_session(session)
+    if not validation["ok"]:
+        return {
+            "ok": False,
+            "error": "; ".join(validation["errors"]),
+            "validation": validation,
+            "state": state.to_dict(),
+        }
+
+    settings = encoder_settings(config)
+    shoulder = encoder_axis(settings)
+    if shoulder is None:
+        return {"ok": False, "error": "shoulder encoder configuration is missing", "state": state.to_dict()}
+    calibration_id = str(uuid4())
+    shoulder.update(
+        {
+            "reference_raw_deg": validation["reference_raw_deg"],
+            "reference_joint_deg": validation["reference_joint_deg"],
+            "direction_sign": validation["direction_sign"],
+            "sensor_turns_per_joint_turn": validation["sensor_turns_per_joint_turn"],
+            "mounting_location": session["mounting_location"],
+            "reference_description": session.get("reference_description", ""),
+            "calibration_validated": True,
+            "calibration_id": calibration_id,
+            "calibration_validated_at": datetime.now(timezone.utc).isoformat(),
+            "calibration_model": validation.get("fit_model", "linear"),
+            "calibration_map": validation.get("calibration_map") or [],
+            "calibration_map_extrapolate_deg": 2.0,
+            "fit_max_residual_deg": validation.get("max_residual_deg"),
+            "backlash_estimate_deg": validation.get("backlash_estimate_deg"),
+            "backlash_approach_bias_deg": validation.get("approach_bias_deg"),
+            "localized_backlash_estimate_deg": validation.get("localized_backlash_estimate_deg"),
+            "localized_backlash_at_joint_deg": validation.get("localized_backlash_at_joint_deg"),
+        }
+    )
+    settings["mode"] = "diagnostic"
+    settings["correction"]["enabled"] = False
+    settings["correction"]["validation_id"] = ""
+    try:
+        change = persist_encoder_calibration(settings)
+    except Exception as exc:
+        state.set_error(f"could not save shoulder encoder calibration: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    encoder_calibration_sessions.pop(request.session_id, None)
+    state.last_command = "SAVE_SHOULDER_ENCODER_CALIBRATION"
+    state.clear_error()
+    log_event(
+        "encoder",
+        "shoulder encoder calibration committed",
+        calibration_id=calibration_id,
+        mounting_location=session["mounting_location"],
+        direction_sign=validation["direction_sign"],
+        sensor_turns_per_joint_turn=validation["sensor_turns_per_joint_turn"],
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "calibration_id": calibration_id,
+        "validation": validation,
+        "config_change": change,
+        "config": public_config(),
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/calibration/sweep/start")
+async def start_encoder_calibration_sweep(request: EncoderCalibrationSweepStartRequest) -> dict[str, Any]:
+    global encoder_calibration_sweep_task
+    if not request.confirm_open_loop_sweep:
+        return {
+            "ok": False,
+            "error": (
+                "assisted sweep uses normal open-loop planned shoulder targets after the first "
+                "physical reference; explicit confirmation is required"
+            ),
+            "state": state.to_dict(),
+        }
+    if encoder_calibration_sweep_task is not None and not encoder_calibration_sweep_task.done():
+        return {"ok": False, "error": "an assisted encoder sweep is already running", "state": state.to_dict()}
+    ready, reason = encoder_calibration_sweep_ready()
+    if not ready:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if request.mounting_location not in {"joint_output", "gearbox_input", "motor_shaft"}:
+        return {"ok": False, "error": "unsupported encoder mounting location", "state": state.to_dict()}
+    start_angle, reason = _validate_encoder_known_joint_angle(request.start_joint_angle_deg)
+    if start_angle is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    planning_start = float(state.reported_angles_deg[1])
+    if abs(planning_start - start_angle) > 0.25:
+        return {
+            "ok": False,
+            "error": (
+                "current planning shoulder angle does not match the known sweep start "
+                f"({planning_start:.2f} deg planning vs {start_angle:.2f} deg entered). "
+                "Disarm and Set Pose to the known start angle before running the sweep."
+            ),
+            "state": state.to_dict(),
+        }
+    try:
+        final_approach_direction = int(request.final_approach_direction)
+        preload_deg = float(request.preload_deg)
+        targets = _encoder_unidirectional_sweep_targets(
+            sweep_min_deg=float(request.sweep_min_deg),
+            sweep_max_deg=float(request.sweep_max_deg),
+            step_deg=float(request.step_deg),
+            final_approach_direction=final_approach_direction,
+        )
+        preload_target = _encoder_sweep_preload_target(
+            targets[0],
+            final_approach_direction=final_approach_direction,
+            preload_deg=preload_deg,
+        )
+        settings = _encoder_sweep_path_settings(
+            float(request.speed_deg_s),
+            float(request.accel_deg_s2),
+        )
+        settle_ms = int(request.settle_ms)
+        if settle_ms < 100 or settle_ms > 5000:
+            raise ValueError("settle time must be between 100 and 5000 ms")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "state": state.to_dict()}
+    sample, reason = current_raw_shoulder_sample()
+    if sample is None:
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+
+    session_id = str(uuid4())
+    captured = _encoder_calibration_capture(sample, start_angle, "start check", use_for_fit=False)
+    session = {
+        "id": session_id,
+        "joint": 2,
+        "created_at": time(),
+        "mounting_location": request.mounting_location,
+        "reference_description": request.reference_description.strip(),
+        "samples": [captured],
+        "initial_raw_sample": sample,
+        "assisted_sweep": True,
+        "sweep": {
+            "status": "queued",
+            "mode": "same_direction_preloaded",
+            "targets_deg": targets,
+            "final_approach_direction": final_approach_direction,
+            "preload_deg": preload_deg,
+            "preload_target_deg": preload_target,
+            "settle_ms": settle_ms,
+            "path_settings": settings,
+            "started_at": time(),
+            "completed": 0,
+            "total": len(targets),
+            "note": (
+                "preloads backlash once, then captures stopped samples from one final approach direction; "
+                "the start sample is a sanity check and is not used for the fit"
+            ),
+        },
+    }
+    session["validation"] = validate_encoder_calibration_session(session)
+    encoder_calibration_sessions[session_id] = session
+    encoder_calibration_sweep_task = asyncio.create_task(run_encoder_calibration_sweep(session_id))
+    log_event(
+        "encoder",
+        "assisted shoulder encoder sweep queued",
+        session_id=session_id,
+        start_joint_angle_deg=start_angle,
+        target_count=len(targets),
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "session": deepcopy(session),
+        "validation": session["validation"],
+        "state": state.to_dict(),
+    }
+
+
+@app.get("/api/encoder/calibration/session/{session_id}")
+async def get_encoder_calibration_session(session_id: str) -> dict[str, Any]:
+    session = encoder_calibration_sessions.get(session_id)
+    if session is None:
+        return {"ok": False, "error": "encoder calibration session not found", "state": state.to_dict()}
+    validation = validate_encoder_calibration_session(session)
+    session["validation"] = validation
+    return {
+        "ok": True,
+        "session": deepcopy(session),
+        "validation": validation,
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/calibration/sweep/cancel")
+async def cancel_encoder_calibration_sweep(request: EncoderCalibrationSweepSessionRequest) -> dict[str, Any]:
+    global encoder_calibration_sweep_task
+    session = encoder_calibration_sessions.get(request.session_id)
+    if session is None:
+        return {"ok": False, "error": "encoder calibration session not found", "state": state.to_dict()}
+    _set_encoder_sweep_status(session, cancel_requested=True, status="cancel_requested")
+    task = encoder_calibration_sweep_task
+    if task is not None and not task.done():
+        task.cancel()
+    if state.motion_state == MotionState.MOVING:
+        await stop()
+    await broadcast_state()
+    return {
+        "ok": True,
+        "session": deepcopy(session),
+        "validation": validate_encoder_calibration_session(session),
+        "state": state.to_dict(),
+    }
+
+
+@app.post("/api/encoder/correction/policy")
+async def set_encoder_correction_policy(request: EncoderCorrectionPolicyRequest) -> dict[str, Any]:
+    if request.enabled and not request.confirm:
+        return {
+            "ok": False,
+            "error": "explicit confirmation is required to enable bounded shoulder correction",
+            "state": state.to_dict(),
+        }
+    settings = encoder_settings(config)
+    settings.setdefault("correction", {})
+    settings.setdefault("verification", {})
+    if request.enabled:
+        ok, reason, details = await validate_encoder_correction_enablement()
+        if not ok:
+            return {"ok": False, "error": reason, "details": details, "state": state.to_dict()}
+        settings["correction"]["enabled"] = True
+        settings["correction"]["validation_id"] = f"shoulder-correction-{uuid4()}"
+        settings["mode"] = "bounded_correction"
+        if str(settings["verification"].get("policy", "diagnostic")) == "diagnostic":
+            settings["verification"]["policy"] = "warning"
+    else:
+        if not request.confirm:
+            return {
+                "ok": False,
+                "error": "explicit confirmation is required to change bounded shoulder correction",
+                "state": state.to_dict(),
+            }
+        settings["correction"]["enabled"] = False
+        settings["correction"]["validation_id"] = ""
+        settings["mode"] = (
+            "diagnostic"
+            if str(settings["verification"].get("policy", "diagnostic")) == "diagnostic"
+            else "verification"
+        )
+        details = {"disabled": True}
+    try:
+        change = persist_encoder_calibration(settings)
+    except Exception as exc:
+        state.set_error(f"could not save shoulder encoder correction policy: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    state.last_command = "SAVE_SHOULDER_ENCODER_CORRECTION_POLICY"
+    state.clear_error()
+    log_event(
+        "encoder",
+        "shoulder encoder bounded correction policy changed",
+        enabled=bool(settings["correction"].get("enabled")),
+        validation_id=settings["correction"].get("validation_id"),
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "enabled": bool(settings["correction"].get("enabled")),
+        "details": details,
+        "config_change": change,
+        "config": public_config(),
+        "state": state.to_dict(),
+    }
 
 
 @app.get("/api/kinematics/dh")
@@ -5732,11 +8449,6 @@ def _calibration_capture_contract(
             for axis in ["x_mm", "y_mm", "z_mm"]
         ):
             raise ValueError(f"{key} changed after preview; preview and execute the measurement move again")
-    all_encoder_measured = (
-        len(state.encoder_available) >= len(config.joints)
-        and all(bit == "1" for bit in state.encoder_available[: len(config.joints)])
-        and all(value is not None for value in state.encoder_angles_deg[: len(config.joints)])
-    )
     return {
         "preview_id": preview_id,
         "preview_source": preview.get("source"),
@@ -5744,8 +8456,12 @@ def _calibration_capture_contract(
         "execution_started_at": preview.get("execution_started_at"),
         "captured_pose_revision": int(state.pose_revision),
         "captured_pose_source": state.pose_source,
-        "joint_authority": "measured_encoder" if all_encoder_measured else "estimated_open_loop",
-        "reported_pose_is_estimated": not all_encoder_measured,
+        "joint_authority": "simulation" if state.simulation else "estimated_open_loop",
+        "per_joint_authority": list(state.joint_authority),
+        "measurement_valid_mask": state.measurement_valid_mask,
+        "measured_angles_deg": list(state.measured_angles_deg),
+        "encoder_evidence": deepcopy(state.encoder_evidence),
+        "reported_pose_is_estimated": True,
         "model_fingerprint": preview.get("model_fingerprint"),
         "config_id": preview.get("config_id"),
         "context": kinematics_calibration_context(config),
@@ -6177,14 +8893,34 @@ async def set_active_tool_dimensions_validation(
 @app.post("/api/ik/solve")
 async def solve_ik(request: IkSolveRequest) -> dict[str, Any]:
     links = links_from_override(request.links_mm)
+    requested_target = request.target.__dict__
+    calibration_compatible = links == config.links
+    command_target, correction = correct_cartesian_target(
+        requested_target,
+        config,
+        apply_enabled=bool(request.apply_calibration and calibration_compatible),
+    )
+    if request.apply_calibration and not calibration_compatible:
+        correction["reason"] = "kinematics_override"
+        correction["warnings"] = [
+            *correction.get("warnings", []),
+            "Cartesian calibration is not applied while solving with overridden link geometry",
+        ]
     result = inverse_kinematics(
-        request.target.__dict__,
+        command_target,
         links,
         config.joints,
         state.reported_angles_deg,
         request.branch,
+        selection_policy=ik_selection_policy({}),
     )
-    return {"ok": result["ok"], "ik": result}
+    return {
+        "ok": result["ok"],
+        "ik": result,
+        "requested_target": requested_target,
+        "command_target": command_target,
+        "calibration": correction,
+    }
 
 
 @app.post("/api/path/preview")
@@ -6262,6 +8998,21 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
         state.set_error("program changed since preview; preview the current sequence again")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.simulation and not state.hardware_armed:
+        state.set_error("hardware moves require the Armed toggle")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.simulation:
+        ready, reason = hardware_ready_for_motion()
+        if not ready:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
+        reason = hardware_trajectory_start_blocking_reason()
+        if reason:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
     stale_reason = preview_stale_reason(preview)
     if stale_reason:
         state.set_error(stale_reason)
@@ -6275,16 +9026,6 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
         )
         await broadcast_state()
         return {"ok": False, "error": stale_reason, "state": state.to_dict()}
-    if not state.simulation and not state.hardware_armed:
-        state.set_error("hardware moves require the Armed toggle")
-        await broadcast_state()
-        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if not state.simulation:
-        ready, reason = hardware_ready_for_motion()
-        if not ready:
-            state.set_error(reason)
-            await broadcast_state()
-            return {"ok": False, "error": reason, "state": state.to_dict()}
     if path_task is not None and not path_task.done():
         state.set_error("a path is already executing")
         await broadcast_state()
@@ -6467,6 +9208,37 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
         }
     task_preview = dict(sequence.get("task_preview", {}))
     normalized_task_settings = task_preview.get("normalized_settings") or request.task_settings or {}
+    if (
+        request.task in {"sorting", "color_sorting"}
+        and normalized_task_settings.get("execution_strategy") == "closed_loop"
+    ):
+        camera_clear_position = str(
+            normalized_task_settings.get("camera_clear_position")
+            or normalized_task_settings.get("safe_position")
+            or "home"
+        )
+        camera_clear_check = check_task_named_position_motion(
+            camera_clear_position,
+            path_settings,
+            request.branch,
+            "camera clear",
+        )
+        task_preview["camera_clear_position"] = camera_clear_position
+        task_preview["camera_clear_check"] = camera_clear_check
+        sequence["task_preview"] = task_preview
+        if not camera_clear_check.get("ok"):
+            reason = str(camera_clear_check.get("error") or "camera clear move failed")
+            if not reason.lower().startswith("camera clear"):
+                reason = f"camera clear is not available: {reason}"
+            state.set_error(reason)
+            await broadcast_state()
+            return {
+                "ok": False,
+                "error": reason,
+                "sequence": sequence,
+                "task_preview": task_preview,
+                "state": state.to_dict(),
+            }
     settings_revision = task_contract_fingerprint(
         task_settings=normalized_task_settings,
         path_settings=path_settings,
@@ -6520,7 +9292,9 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             request.task in {"sorting", "color_sorting"}
             and normalized_task_settings.get("execution_strategy") == "closed_loop"
             and not request.selected_detection_ids
-            and preview_result.get("error") == "no task objects have a reachable IK path"
+            and str(preview_result.get("error") or "").startswith(
+                "no task objects have a safe continuous IK path"
+            )
         ):
             metadata = sequence.get("task_preview", {})
             candidate_ids = [
@@ -6673,6 +9447,9 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
         state.set_error("closed-loop task execution requires an enabled camera")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    state.clear_error()
+    if state.motion_state == MotionState.STOPPED:
+        state.motion_state = MotionState.IDLE
     sequence = preview.get("sequence", {})
     total_objects = int(
         sequence.get("object_count")
@@ -7084,8 +9861,20 @@ async def stop_cartesian_jog_internal(reason: str = "cartesian jog stopped") -> 
                 await broadcast_state()
                 return {"ok": False, "error": str(exc), "state": state.to_dict()}
     state.last_command = "CARTESIAN_JOG_STOP"
+    verified = True
+    verification_message = ""
+    if not state.simulation and serial_client.is_connected and not state.encoder_fault:
+        verified, verification_message = await verify_shoulder_after_motion(
+            "cartesian_jog_stop",
+            state.estimated_angles_deg.copy(),
+            allow_correction=False,
+        )
     await broadcast_state()
-    return {"ok": state.motion_state != MotionState.FAULT, "state": state.to_dict()}
+    return {
+        "ok": verified and state.motion_state != MotionState.FAULT,
+        "verification": verification_message,
+        "state": state.to_dict(),
+    }
 
 
 @app.post("/api/cartesian-jog")
@@ -7251,6 +10040,8 @@ def _coerce_task_destination_updates(updates: dict[str, Any]) -> bool:
 async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
     config_path = ensure_local_config()
     updates = request.__dict__
+    if isinstance(updates.get("encoders"), dict):
+        updates["encoders"] = normalize_encoder_settings(updates["encoders"])
     if isinstance(updates.get("color_profiles"), dict):
         updates["color_profiles"] = _persisted_color_profiles(updates["color_profiles"])
     try:
@@ -7281,6 +10072,19 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
             shutil.copyfile(config_path, draft_path)
             save_calibration_updates(draft_path, updates)
             draft_config = load_config(draft_path)
+            encoder_errors = validate_encoder_settings(
+                draft_config,
+                encoder_settings(draft_config),
+            )
+            if encoder_errors:
+                state.set_error("; ".join(encoder_errors))
+                await broadcast_state()
+                return {
+                    "ok": False,
+                    "errors": encoder_errors,
+                    "error": state.last_error,
+                    "state": state.to_dict(),
+                }
             if task_destinations_changed:
                 destination_errors = task_destination_errors(draft_config, named_positions(draft_config))
                 if destination_errors:
@@ -7340,6 +10144,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.simulation = True
         state.connected = True
         state.serial_port = None
+        state.controller_capabilities = {"simulation": True}
         state.hardware_armed = False
         state.update_reported_pose(
             state.reported_angles_deg,
@@ -7366,6 +10171,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.connected = False
         state.simulation = False
         state.hardware_armed = False
+        state.controller_capabilities = {}
         state.update_reported_pose(
             state.reported_angles_deg,
             source="unknown",
@@ -7377,6 +10183,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
 
     state.connected = True
     state.serial_port = request.port or config.serial.port
+    state.controller_capabilities = parse_hello_capabilities(hello)
     state.hardware_armed = False
     state.motion_state = MotionState.IDLE
     state.last_command = hello
@@ -7410,6 +10217,7 @@ async def disconnect() -> dict[str, Any]:
     state.simulation = False
     state.hardware_armed = False
     state.live_motion_enabled = False
+    state.controller_capabilities = {}
     state.update_reported_pose(
         state.reported_angles_deg,
         source="unknown",
@@ -7475,8 +10283,20 @@ async def stop() -> dict[str, Any]:
         known_pose=state.known_pose,
         force_revision=state.pose_revision == pose_revision_before,
     )
+    verified = True
+    verification_message = ""
+    if not state.simulation and serial_client.is_connected and not state.encoder_fault:
+        verified, verification_message = await verify_shoulder_after_motion(
+            "stop",
+            state.estimated_angles_deg.copy(),
+            allow_correction=False,
+        )
     await broadcast_state()
-    return {"ok": True, "state": state.to_dict()}
+    return {
+        "ok": verified,
+        "verification": verification_message,
+        "state": state.to_dict(),
+    }
 
 
 @app.post("/api/estop")

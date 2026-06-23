@@ -189,7 +189,7 @@
                     </label>
                     <label class="task-legacy-field">Ordering
                       <select id="objectSelectionPolicySelect">
-                        <option value="nearest_to_safe">Nearest to safe</option>
+                        <option value="nearest_to_home">Nearest to home</option>
                       </select>
                     </label>
                     <label>Max objects
@@ -230,15 +230,16 @@
                   </div>
                   <details class="advanced-block task-advanced">
                     <summary>
-                      <span>Advanced TCP Z, phi, and cycle modes</span>
-                      <small>Task-specific targets; path limits remain in Motion settings</small>
+                      <span>Advanced pickup/drop motion</span>
+                      <small>TCP heights, vertical clearances, orientation, and cycle timing</small>
                     </summary>
                     <div class="advanced-block-body">
+                      <p class="hint">Pickup/drop Z are active-TCP heights in the robot base frame. Clearances are vertical distances above those Z values for approach and lift. A 0 mm clearance removes that separate vertical gap; linear mode remains selected, but a zero-distance segment is treated as a no-op.</p>
                       <div class="control-grid">
-                        <label>Pickup Z <input id="pickupZInput" type="number" min="0" step="1" required /></label>
-                        <label>Dropoff Z <input id="dropoffZInput" type="number" min="0" step="1" required /></label>
-                        <label>Pickup clearance <input id="approachClearanceInput" type="number" min="0" step="1" /></label>
-                        <label>Drop clearance <input id="dropApproachClearanceInput" type="number" min="0" step="1" /></label>
+                        <label>Pickup Z (TCP) <input id="pickupZInput" type="number" min="0" step="1" required /></label>
+                        <label>Drop Z (TCP) <input id="dropoffZInput" type="number" min="0" step="1" required /></label>
+                        <label>Pickup clearance above Z <input id="approachClearanceInput" type="number" min="0" step="1" /></label>
+                        <label>Drop clearance above Z <input id="dropApproachClearanceInput" type="number" min="0" step="1" /></label>
                         <label>Orientation
                           <select id="orientationPolicySelect">
                             <option value="prefer_downward">Automatic, prefer &phi; below &minus;90&deg;</option>
@@ -577,15 +578,6 @@
                   </div>
                   <div id="jointCalibration" class="joint-calibration"></div>
                   <p class="field-help">Direction is positive when a positive software command increases the physical joint angle. Choose Inverted if the mechanism moves the opposite way.</p>
-                  <details class="advanced-block">
-                    <summary>
-                      <span>Encoder readback</span>
-                      <small>Current staged AS5048A diagnostics</small>
-                    </summary>
-                    <div class="advanced-block-body">
-                      <div id="encoderCalibration" class="path-summary"></div>
-                    </div>
-                  </details>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsMotion">
@@ -869,7 +861,7 @@
                     </label>
                   </div>
                   <div class="button-row calibration-actions">
-                    <button id="tcpCalSaveManualOffsetsBtn" type="button">Save manual reach/Z offsets</button>
+                    <button id="tcpCalSaveManualOffsetsBtn" type="button">Save and apply manual offsets</button>
                     <button id="tcpCalFitBtn" class="primary" type="button">Fit and save</button>
                     <button id="tcpCalApplyEnableBtn" type="button">Apply enable state</button>
                   </div>
@@ -889,6 +881,15 @@
                   </div>
                   <div id="hardwareStatus" class="path-summary"></div>
                   <div id="hardwareIo" class="hardware-io"></div>
+                  <details class="advanced-block" open>
+                    <summary>
+                      <span>Shoulder encoder hardware</span>
+                      <small>SPI readback, calibrated evidence, verification policy, and disabled-by-default correction</small>
+                    </summary>
+                    <div class="advanced-block-body">
+                      <div id="encoderCalibration" class="path-summary"></div>
+                    </div>
+                  </details>
                 </section>
               </section>
             </div>

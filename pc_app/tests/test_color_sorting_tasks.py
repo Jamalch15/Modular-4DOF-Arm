@@ -4,7 +4,8 @@ import pytest
 
 from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import color_profiles
-from app.motion import build_program_trajectory
+from app.kinematics import inverse_kinematics
+from app.motion import build_program_trajectory, ik_selection_policy
 from app.tasks import (
     build_color_sorting_plan,
     filter_sorting_detections,
@@ -51,6 +52,9 @@ def test_color_sorting_defaults_prefer_downward_orientation():
 
     settings = normalize_color_sorting_settings(config)
 
+    assert settings["safe_position"] == "home"
+    assert settings["camera_clear_position"] == "home"
+    assert settings["ordering"]["policy"] == "nearest_to_home"
     assert settings["orientation_policy"] == "prefer_downward"
     assert settings["pickup_preferred_phi_deg"] == -100.0
     assert settings["drop_preferred_phi_deg"] == -100.0
@@ -126,6 +130,42 @@ def test_plan_uses_configured_tcp_z_phi_and_linear_near_object_modes():
     assert modes["lift"] == "linear"
     assert modes["above dropoff"] == "joint"
     assert modes["dropoff"] == "linear"
+
+
+def test_task_above_pickup_uses_same_ik_solution_as_kinematics():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    current = [20.0, 45.0, -20.0, -20.0]
+    plan = build_color_sorting_plan(
+        config,
+        [detection("red", -120, 150, detection_id="r1")],
+        color_profiles(config),
+        task_settings={"execution_strategy": "batch_once", "max_objects": 1},
+    )
+
+    assert plan["ok"]
+    waypoint = next(item for item in plan["waypoints"] if item["label"] == "above pickup")
+    ik = inverse_kinematics(
+        waypoint["target"],
+        config.links,
+        config.joints,
+        current,
+        "auto",
+        selection_policy=ik_selection_policy(
+            {"global_speed_deg_s": 25.0, "global_accel_deg_s2": 120.0}
+        ),
+    )
+    trajectory = build_program_trajectory(
+        current,
+        [waypoint],
+        config.links,
+        config.joints,
+        {"global_speed_deg_s": 25.0, "global_accel_deg_s2": 120.0},
+        "auto",
+    )
+
+    assert ik["ok"] and ik["selected"]
+    assert trajectory["ok"], trajectory.get("errors")
+    assert trajectory["waypoints"][-1] == pytest.approx(ik["selected"]["angles_deg"])
 
 
 def test_every_generated_move_exposes_frame_mode_height_and_recovery_phase():
@@ -224,6 +264,27 @@ def test_missing_drop_zone_errors_only_for_detected_relevant_color():
     assert "missing drop zone" in with_missing["error"]
     assert ignore_missing["ok"]
     assert any(item["reason_code"] == "missing_drop_zone" for item in ignore_missing["ignored_detections"])
+
+
+def test_live_color_profile_overrides_stale_detection_drop_zone():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    profiles = {
+        **color_profiles(config),
+        "red": {"enabled": True, "drop_zone": "dropoff_b"},
+    }
+    stale_detection = detection("red", -120, 150, detection_id="r1")
+    stale_detection["drop_zone"] = "new_cartesian_position"
+
+    result = filter_sorting_detections(
+        config,
+        [stale_detection],
+        profiles,
+        normalize_color_sorting_settings(config, {"execution_strategy": "batch_once"}),
+    )
+
+    assert result["errors"] == []
+    assert result["candidates"][0]["drop_zone"] == "dropoff_b"
+    assert result["ignored"] == []
 
 
 def test_fixed_and_grid_assignment_capacity_are_deterministic():
@@ -351,18 +412,21 @@ def test_invalid_task_settings_are_rejected_instead_of_silently_coerced(override
         normalize_color_sorting_settings(config, overrides)
 
 
-def test_missing_safe_position_is_a_planning_error():
+def test_legacy_safe_position_setting_returns_home_without_forcing_a_home_start():
     config = load_config(EXAMPLE_CONFIG_PATH)
 
     plan = build_color_sorting_plan(
         config,
         [detection("red", -120, 150)],
         color_profiles(config),
-        task_settings={"execution_strategy": "batch_once", "safe_position": "missing"},
+        task_settings={"execution_strategy": "batch_once", "safe_position": "safe"},
     )
 
-    assert not plan["ok"]
-    assert plan["error"] == "safe position missing is missing or invalid"
+    assert plan["ok"]
+    assert plan["steps"][0]["kind"] == "tool"
+    assert not any(step.get("phase") == "home" for step in plan["steps"])
+    assert plan["steps"][-1]["phase"] == "return_home"
+    assert plan["steps"][-1]["waypoint"]["angles_deg"] == config.home_pose
 
 
 def test_missing_active_tool_preset_is_a_planning_error():

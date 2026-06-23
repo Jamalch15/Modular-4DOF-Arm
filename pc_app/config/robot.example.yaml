@@ -403,7 +403,7 @@ task_destinations:
       position_id: dropoff_b
 
 task_defaults:
-  safe_position: safe
+  safe_position: home
   approach_height_mm: 80.0
   pickup_height_mm: 25.0
   dropoff_height_mm: 45.0
@@ -420,10 +420,10 @@ tasks:
       include_colors: []
       require_robot_coordinates: true
     ordering:
-      policy: nearest_to_safe
+      policy: nearest_to_home
       color_priority: [red, blue]
-    safe_position: safe
-    camera_clear_position: safe
+    safe_position: home
+    camera_clear_position: home
     pickup_z_mm: 25.0
     dropoff_z_mm: 45.0
     approach_clearance_mm: 55.0
@@ -498,36 +498,57 @@ tools:
         active_high: true
 
 encoders:
-  enabled: true
-  closed_loop_mode: settle_correction
-  settle_tolerance_deg: 1.0
-  fault_tolerance_deg: 5.0
-  max_correction_attempts: 2
+  # Encoder evidence is disabled by default. Enable only after resolving GPIO
+  # conflicts and validating the physical mounting/reference.
+  schema_version: 2
+  enabled: false
+  mode: diagnostic
+  bus:
+    type: spi
+    sck_pin: 12
+    miso_pin: 13
+    mosi_pin: 14
+    clock_hz: 1000000
+    sample_interval_ms: 100
+  verification:
+    policy: diagnostic
+    settle_delay_ms: 300
+    required_stable_samples: 3
+    warning_tolerance_deg: 2.0
+    fault_tolerance_deg: 5.0
+    hysteresis_deg: 0.25
+    require_encoder: false
+  correction:
+    enabled: false
+    validation_id: ""
+    deadband_deg: 0.75
+    max_delta_deg: 8.0
+    joint_limit_margin_deg: 2.0
+    speed_deg_s: 2.0
+    accel_deg_s2: 10.0
+    max_attempts: 2
+    allowed_sources: [set_joint_target, set_all_joint_targets, home, encoder_shoulder_align]
   axes:
-    - joint: 1
-      name: base
-      cs_pin: 5
-      zero_offset_deg: 0.0
-      direction_sign: 1
-      enabled: true
     - joint: 2
       name: shoulder
-      cs_pin: 7
-      zero_offset_deg: 0.0
-      direction_sign: 1
-      enabled: true
-    - joint: 3
-      name: elbow
-      cs_pin: -1
-      zero_offset_deg: 0.0
-      direction_sign: 1
+      sensor: as5048a
       enabled: false
-    - joint: 4
-      name: wrist
-      cs_pin: -1
-      zero_offset_deg: 0.0
+      cs_pin: 15
+      sensor_units: count14
+      angle_units: deg
+      reference_raw_deg: 0.0
+      reference_joint_deg: 20.0
       direction_sign: 1
-      enabled: false
+      wrap_period_deg: 360.0
+      unwrap_policy: shortest_reference
+      mounting_location: joint_output
+      sensor_turns_per_joint_turn: 1.0
+      reference_description: ""
+      freshness_timeout_ms: 500
+      max_noise_deg: 0.5
+      calibration_validated: false
+      calibration_id: ""
+      calibration_validated_at:
 
 calibration:
   movement_tolerance_deg: 0.2

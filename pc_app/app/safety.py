@@ -30,8 +30,10 @@ def validate_joint_targets(config: RobotConfig, targets: list[float]) -> SafetyR
 def validate_can_move(state: RobotState) -> SafetyResult:
     if state.motion_state == MotionState.ESTOP:
         return SafetyResult(False, "emergency stop is active")
+    if state.motion_state == MotionState.FAULT:
+        return SafetyResult(False, state.last_error or "robot fault is active")
     if not state.connected and not state.simulation:
         return SafetyResult(False, "not connected to hardware and simulation is disabled")
     if not state.simulation and not state.known_pose:
-        return SafetyResult(False, "robot pose is unknown; use SETPOSE or encoder readback before motion")
+        return SafetyResult(False, "robot planning pose is unknown; use Set Pose while disarmed before motion")
     return SafetyResult(True)

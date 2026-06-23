@@ -53,7 +53,7 @@ void setup() {
 
   Serial.println();
   Serial.println("AS5048A ESP32-WROVER-E test");
-  Serial.println("Wiring: CLK=GPIO18 MISO=GPIO19 MOSI=GPIO23 CS=GPIO5 3V3=3V3 GND=GND");
+  Serial.println("Wiring: CLK=GPIO12 MISO=GPIO13 MOSI=GPIO14 CS=GPIO15 3V3=3V3 GND=GND");
   Serial.println("Rotate the magnet/shaft slowly and check that raw and deg change smoothly.");
 }
 

@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 from .config import DEFAULT_GEOMETRY_CONFIG, RobotConfig, matlab_geometry_to_dh_rows
+from .encoder import normalize_encoder_settings
 from .kinematics import forward_kinematics, inverse_kinematics
 from .position_library import legacy_named_positions_from_position_library
 from .task_destinations import task_destinations
@@ -58,15 +59,17 @@ def default_named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
 
 def named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
     defaults = default_named_positions(config)
+    if isinstance(config.raw.get("position_library"), dict):
+        positions = legacy_named_positions_from_position_library(config)
+        positions["home"] = defaults["home"]
+        return positions
     raw = config.raw.get("named_positions")
     if isinstance(raw, dict) and raw:
         merged = deepcopy(defaults)
         merged.update(deepcopy(raw))
-        merged.update(legacy_named_positions_from_position_library(config))
         merged["home"] = defaults["home"]
         return merged
     merged = deepcopy(defaults)
-    merged.update(legacy_named_positions_from_position_library(config))
     merged["home"] = defaults["home"]
     return merged
 
@@ -296,29 +299,7 @@ def active_tool_dimensions_validated(config: RobotConfig) -> bool:
 
 
 def encoder_settings(config: RobotConfig) -> dict[str, Any]:
-    defaults: dict[str, Any] = {
-        "enabled": True,
-        "closed_loop_mode": "settle_correction",
-        "settle_tolerance_deg": 1.0,
-        "fault_tolerance_deg": 5.0,
-        "max_correction_attempts": 2,
-        "axes": [
-            {"joint": 1, "name": "base", "cs_pin": 5, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": True},
-            {"joint": 2, "name": "shoulder", "cs_pin": 7, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": True},
-            {"joint": 3, "name": "elbow", "cs_pin": -1, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": False},
-            {"joint": 4, "name": "wrist", "cs_pin": -1, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": False},
-        ],
-    }
-    raw = config.raw.get("encoders")
-    if isinstance(raw, dict):
-        defaults.update({key: deepcopy(value) for key, value in raw.items() if key != "axes"})
-        if isinstance(raw.get("axes"), list):
-            axes = deepcopy(defaults["axes"])
-            for index, patch in enumerate(raw["axes"]):
-                if index < len(axes) and isinstance(patch, dict):
-                    axes[index].update(deepcopy(patch))
-            defaults["axes"] = axes
-    return defaults
+    return normalize_encoder_settings(config)
 
 
 def calibration_settings(config: RobotConfig) -> dict[str, Any]:
@@ -369,7 +350,7 @@ def geometry_settings(config: RobotConfig) -> dict[str, Any]:
 
 def task_defaults(config: RobotConfig) -> dict[str, Any]:
     defaults = {
-        "safe_position": "safe",
+        "safe_position": "home",
         "approach_height_mm": 80.0,
         "pickup_height_mm": 25.0,
         "dropoff_height_mm": 45.0,
@@ -378,6 +359,10 @@ def task_defaults(config: RobotConfig) -> dict[str, Any]:
     raw = config.raw.get("task_defaults")
     if isinstance(raw, dict):
         defaults.update(deepcopy(raw))
+    if str(defaults.get("safe_position") or "").strip() in {"", "safe"}:
+        defaults["safe_position"] = "home"
+    if str(defaults.get("camera_clear_position") or "").strip() in {"", "safe"}:
+        defaults["camera_clear_position"] = "home"
     return defaults
 
 
@@ -406,11 +391,11 @@ def color_sorting_task_defaults(config: RobotConfig) -> dict[str, Any]:
             "require_robot_coordinates": True,
         },
         "ordering": {
-            "policy": "nearest_to_safe",
+            "policy": "nearest_to_home",
             "color_priority": [],
         },
-        "safe_position": str(legacy.get("safe_position", "safe")),
-        "camera_clear_position": str(legacy.get("camera_clear_position", legacy.get("safe_position", "safe"))),
+        "safe_position": str(legacy.get("safe_position", "home")),
+        "camera_clear_position": str(legacy.get("camera_clear_position", legacy.get("safe_position", "home"))),
         "pickup_z_mm": pickup_z,
         "dropoff_z_mm": dropoff_z,
         "approach_clearance_mm": approach_clearance,
@@ -444,6 +429,12 @@ def color_sorting_task_defaults(config: RobotConfig) -> dict[str, Any]:
     raw = config.raw.get("color_sorting")
     if isinstance(raw, dict):
         _merge_task_settings(defaults, raw)
+    if str(defaults.get("safe_position") or "").strip() in {"", "safe"}:
+        defaults["safe_position"] = "home"
+    if str(defaults.get("camera_clear_position") or "").strip() in {"", "safe"}:
+        defaults["camera_clear_position"] = "home"
+    if str(defaults.get("ordering", {}).get("policy") or "") == "nearest_to_safe":
+        defaults["ordering"]["policy"] = "nearest_to_home"
     return defaults
 
 

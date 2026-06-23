@@ -233,18 +233,24 @@ def test_manual_radial_offsets_can_enable_without_samples(tmp_path):
     assert command["z_mm"] == approx(42.0)
 
 
-def test_manual_radial_offsets_reject_enable_when_magnitude_is_too_large():
+def test_manual_radial_offsets_allow_explicit_large_value_with_warning():
     config = load_config(EXAMPLE_CONFIG_PATH)
     settings = calibration_settings(config)
 
-    with pytest.raises(ValueError, match="not eligible"):
-        save_manual_radial_offsets(
-            settings,
-            config,
-            reach_offset_mm=250.0,
-            z_offset_mm=0.0,
-            enabled=True,
-        )
+    updated, result = save_manual_radial_offsets(
+        settings,
+        config,
+        reach_offset_mm=0.0,
+        z_offset_mm=-60.0,
+        enabled=True,
+    )
+
+    assert updated["enabled"] is True
+    assert result["activation"]["eligible"] is True
+    assert result["activation"]["reasons"] == []
+    assert result["activation"]["warnings"] == [
+        "Z offset exceeds the 20.0 mm automatic-enable limit"
+    ]
 
 
 def test_manual_radial_offsets_endpoint_saves_operator_entered_offsets(monkeypatch):
@@ -272,6 +278,31 @@ def test_manual_radial_offsets_endpoint_saves_operator_entered_offsets(monkeypat
     assert saved["settings"]["enabled"] is True
     assert profile["enabled"] is True
     assert profile["samples"] == []
+
+
+def test_standalone_ik_solver_applies_enabled_cartesian_calibration(monkeypatch, tmp_path):
+    config, _ = config_with_calibration(
+        tmp_path,
+        fitted_radial_settings(reach_offset_mm=6.0, z_offset_mm=2.5),
+    )
+    captured: dict[str, dict] = {}
+
+    def fake_inverse_kinematics(target, *args, **kwargs):
+        captured["target"] = deepcopy(target)
+        return {"ok": True, "selected": {"angles_deg": list(config.home_pose)}}
+
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "inverse_kinematics", fake_inverse_kinematics)
+    client = TestClient(main.app)
+    intended = {"x_mm": 120.0, "y_mm": 160.0, "z_mm": 45.0, "phi_deg": -100.0}
+
+    payload = client.post("/api/ik/solve", json={"target": intended}).json()
+
+    assert payload["ok"] is True
+    assert payload["calibration"]["applied"] is True
+    assert hypot(captured["target"]["x_mm"], captured["target"]["y_mm"]) == approx(194.0)
+    assert captured["target"]["z_mm"] == approx(42.5)
+    assert payload["command_target"] == captured["target"]
 
 
 def test_stale_model_signature_blocks_correction(tmp_path):

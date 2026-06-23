@@ -421,17 +421,48 @@ def _continuous_ik_branch(branch: str) -> str:
     return branch if branch in {"elbow_up", "elbow_down"} else "auto"
 
 
+def ik_selection_policy(
+    settings: dict[str, Any] | None = None,
+    *,
+    linear: bool = False,
+) -> dict[str, Any]:
+    settings = settings or {}
+    max_joint_delta = float(settings.get("ik_max_joint_delta_deg", 270.0))
+    max_base_delta = float(settings.get("ik_max_base_delta_deg", 180.0))
+    max_tool_winding = float(settings.get("ik_max_tool_winding_delta_deg", 200.0))
+    if bool(settings.get("preserve_tool_orientation", False)):
+        max_tool_winding = min(max_tool_winding, 60.0)
+    if linear:
+        jump_limit = float(settings.get("ik_jump_threshold_deg", 35.0))
+        max_joint_delta = min(max_joint_delta, jump_limit)
+        max_base_delta = min(max_base_delta, jump_limit)
+        max_tool_winding = min(max_tool_winding, 45.0)
+    return {
+        "enabled": True,
+        "max_joint_delta_deg": max_joint_delta,
+        "max_base_delta_deg": max_base_delta,
+        "max_tool_winding_delta_deg": max_tool_winding,
+        "joint_weights": [2.5, 1.0, 1.0, 1.0],
+        "prefer_forward_posture": bool(settings.get("prefer_forward_posture", True)),
+    }
+
+
 def _select_continuous_ik_candidate(ik: dict[str, Any], previous_deg: list[float], branch: str) -> dict[str, Any] | None:
     if branch in {"elbow_up", "elbow_down"}:
         return ik.get("selected")
-    valid_candidates = [candidate for candidate in ik.get("candidates", []) if candidate.get("valid")]
+    valid_candidates = [
+        candidate
+        for candidate in ik.get("candidates", [])
+        if candidate.get("valid") and candidate.get("configuration_continuous", True)
+    ]
     if not valid_candidates:
         return None
     return min(
         valid_candidates,
         key=lambda candidate: (
+            1 if candidate.get("posture") == "backward" else 0,
             sum(
-                angle_distance_deg(float(angle), float(previous_deg[index]))
+                abs(float(angle) - float(previous_deg[index]))
                 for index, angle in enumerate(candidate.get("angles_deg", []))
             ),
             float(candidate.get("position_error_mm", 0.0)),
@@ -578,8 +609,10 @@ def build_linear_cartesian_trajectory(
             joints,
             start_deg,
             branch,
+            selection_policy=ik_selection_policy(settings),
         )
         if not final_ik["ok"] or not final_ik["selected"]:
+            failure_reason = final_ik.get("failure_reason") or "linear target has no reachable auto-phi solution"
             return {
                 "ok": False,
                 "mode": "linear",
@@ -593,7 +626,7 @@ def build_linear_cartesian_trajectory(
                         "notes": final_ik.get("notes", []),
                     }
                 ],
-                "errors": ["linear target has no reachable auto-phi solution"],
+                "errors": [failure_reason],
             }
         end_phi_deg = float(final_ik["selected"]["fk"]["tool_phi_deg"])
     else:
@@ -615,9 +648,61 @@ def build_linear_cartesian_trajectory(
         hypot(end_pose["x_mm"] - start_pose["x_mm"], end_pose["y_mm"] - start_pose["y_mm"]),
         end_pose["z_mm"] - start_pose["z_mm"],
     )
+    phi_distance_deg = angle_distance_deg(end_pose["phi_deg"], start_pose["phi_deg"])
+    waypoint_rate_hz = _limit_value(settings.get("waypoint_rate_hz"), 12.0)
+    speed_limits = _joint_speed_limits(
+        joints,
+        settings.get("global_speed_deg_s"),
+        settings.get("per_joint_speed_deg_s"),
+    )
+    accel_limits = _joint_accel_limits(
+        joints,
+        settings.get("global_accel_deg_s2"),
+        settings.get("per_joint_accel_deg_s2"),
+    )
+    profile = _profile_name(settings)
+    ramp_fraction = _trapezoid_ramp_fraction(settings)
+    if distance_mm <= 1e-9 and phi_distance_deg <= 1e-9:
+        path_deltas = [0.0 for _ in start_deg]
+        limit_summary = _motion_limit_summary(
+            path_mode="linear",
+            target_type="cartesian_pose",
+            joints=joints,
+            deltas_deg=path_deltas,
+            speed_limits_deg_s=speed_limits,
+            accel_limits_deg_s2=accel_limits,
+            profile=profile,
+            ramp_fraction=ramp_fraction,
+            settings=settings,
+        )
+        contract = _motion_contract(
+            path_mode="linear",
+            target_type="cartesian_pose",
+            profile=profile,
+            duration_s=0.0,
+            waypoint_count=1,
+            limit_summary=limit_summary,
+        )
+        return {
+            "ok": True,
+            "mode": "linear",
+            "profile": profile,
+            "duration_s": 0.0,
+            "waypoint_count": 1,
+            "waypoints": [[float(value) for value in start_deg]],
+            "cartesian_waypoints": [start_pose],
+            "segment_durations_s": [0.0],
+            "time_from_start_s": [0.0],
+            "speed_limits_deg_s": speed_limits,
+            "accel_limits_deg_s2": accel_limits,
+            "limit_summary": limit_summary,
+            "motion_contract": contract,
+            "ik_results": [],
+            "errors": [],
+        }
     max_step_mm = _limit_value(settings.get("cartesian_step_mm"), 10.0)
     steps = max(2, int(ceil(distance_mm / max_step_mm)) + 1)
-    if distance_mm <= 1e-9 and angle_distance_deg(end_pose["phi_deg"], start_pose["phi_deg"]) > 1e-9:
+    if distance_mm <= 1e-9 and phi_distance_deg > 1e-9:
         steps = max(steps, 8)
 
     waypoints: list[list[float]] = []
@@ -635,13 +720,22 @@ def build_linear_cartesian_trajectory(
             "z_mm": start_pose["z_mm"] + (end_pose["z_mm"] - start_pose["z_mm"]) * t,
             "phi_deg": start_pose["phi_deg"] + phi_delta * t,
         }
-        ik = inverse_kinematics(pose, links, joints, previous, ik_branch)
+        ik = inverse_kinematics(
+            pose,
+            links,
+            joints,
+            previous,
+            ik_branch,
+            selection_policy=ik_selection_policy(settings, linear=True),
+        )
         selected = _select_continuous_ik_candidate(ik, previous, ik_branch)
         ik_results.append(
             {
                 "index": index,
                 "ok": selected is not None,
                 "selected_branch": selected["branch"] if selected else ik["selected_branch"],
+                "selected_posture": selected.get("posture") if selected else None,
+                "radial_reach_mm": selected.get("radial_reach_mm") if selected else None,
                 "notes": ik["notes"],
             }
         )
@@ -658,19 +752,6 @@ def build_linear_cartesian_trajectory(
         waypoints.append(previous)
         cartesian_waypoints.append(pose)
 
-    waypoint_rate_hz = _limit_value(settings.get("waypoint_rate_hz"), 12.0)
-    speed_limits = _joint_speed_limits(
-        joints,
-        settings.get("global_speed_deg_s"),
-        settings.get("per_joint_speed_deg_s"),
-    )
-    accel_limits = _joint_accel_limits(
-        joints,
-        settings.get("global_accel_deg_s2"),
-        settings.get("per_joint_accel_deg_s2"),
-    )
-    profile = _profile_name(settings)
-    ramp_fraction = _trapezoid_ramp_fraction(settings)
     path_deltas = _joint_path_deltas(waypoints)
     duration_floor_s = (len(waypoints) - 1) / waypoint_rate_hz
     duration_s = _joint_delta_duration_s(path_deltas, speed_limits, accel_limits, profile, ramp_fraction)
@@ -1104,9 +1185,16 @@ def build_program_trajectory(
                     waypoint_branch,
                 )
             else:
-                ik = inverse_kinematics(target, links, joints, current, waypoint_branch)
+                ik = inverse_kinematics(
+                    target,
+                    links,
+                    joints,
+                    current,
+                    waypoint_branch,
+                    selection_policy=ik_selection_policy(waypoint_settings),
+                )
                 if not ik["ok"] or not ik["selected"]:
-                    error = f"no valid IK solution at {_format_cartesian_target(target)}"
+                    error = ik.get("failure_reason") or f"no valid IK solution at {_format_cartesian_target(target)}"
                     step_results.append(
                         {
                             "index": index,

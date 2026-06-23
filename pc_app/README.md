@@ -2,8 +2,10 @@
 
 This is a local control dashboard for the provisional 4DOF robot arm architecture.
 
-The operator-facing Cartesian TCP calibration workflow and its command-layer
-semantics are documented in [../docs/kinematics_calibration.md](../docs/kinematics_calibration.md).
+The operator-facing Cartesian TCP calibration workflow is documented in
+[../docs/kinematics_calibration.md](../docs/kinematics_calibration.md). Shoulder
+encoder authority and correction semantics are documented in
+[../docs/shoulder_encoder_integration.md](../docs/shoulder_encoder_integration.md).
 
 Current scope:
 
@@ -41,7 +43,7 @@ These are assumptions, not final design decisions.
 - Bluetooth may be added later as another transport implementation
 - Exact link lengths, gear ratios, zero offsets, pin assignments, servo pulse ranges, and homing hardware are not decided
 - Hardware feedback is open-loop for now: steppers report commanded step counts and servos report commanded angles
-- AS5048A base/shoulder encoder readback is staged for known-pose and verification before any full closed-loop control.
+- Shoulder AS5048A readback is calibrated per-joint evidence. It does not establish the full pose; bounded post-move correction remains disabled until locally validated.
 
 ## Quick Start After Restart
 
@@ -429,6 +431,7 @@ Core commands:
 HELLO
 STATUS
 CONFIG BEGIN / CONFIG JOINT / CONFIG END
+CONFIG ENCODER_BUS / CONFIG ENCODER / CONFIG ENCODER_POLICY
 ARM 0|1
 SETPOSE j1 j2 j3 j4
 MOVEJ j1 j2 j3 j4 speed accel
@@ -440,6 +443,7 @@ TRAJ BEGIN count=N duration=seconds speed=deg_per_s accel=deg_per_s2
 TRAJ POINT index=i t=seconds j1=deg j2=deg j3=deg j4=deg
 TRAJ START
 TRAJ CLEAR
+CORRECTJ joint=2 delta=deg speed=deg_per_s accel=deg_per_s2 id=transaction
 STOP
 ESTOP
 HOME
@@ -451,14 +455,37 @@ TOOL ON|OFF
 Current status response:
 
 ```text
-STATUS state=idle homed=0 known=0 pose_source=unknown armed=0 hw=mixed enabled=1000 enc=0000 e1=0.0 e2=0.0 j1=0.0 j2=20.0 j3=20.0 j4=0.0 closed_loop=off tool_type=generic tool=unknown tool_value=0.000 fault=OK
+STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 er2=8192 ea2=180.0 em2=20.0 eage2=40 enoise2=0.08 evalidn2=4 ef2=none j1=0.0 j2=20.0 j3=20.0 j4=0.0 closed_loop=diagnostic correction=idle correction_id=none correction_delta=0 correction_steps=0 correction_attempts=0 cb1=0 cb2=0 cb3=0 cb4=0 tool_type=generic tool=unknown tool_value=0.000 fault=OK
 ```
 
-Optional/newer status fields include `known=0|1`, `pose_source=<manual|setpose|encoder|mixed>`, `enc=1100`, `e1=<deg>`,
-`e2=<deg>`, `closed_loop=<off|readback|settle_correction>`, `tool_type=<generic|servo_gripper|electromagnet>`,
-`tool=<open|closed|on|off|moving|unknown>`, and `tool_value=<0.000..1.000>`.
+Protocol v4 keeps `j1..j4` as open-loop estimates. `er2`, `ea2`, and `em2` are raw count, raw angle, and calibrated shoulder angle. `enc_valid`, consecutive-valid count, sample age, noise, and flags determine whether the measurement has authority. Encoder fields never overwrite the planning pose or make the complete robot pose known.
 
-Working assumption: the PC remains the planner. Single endpoint moves use `MOVEJ`; multi-waypoint Cartesian/program paths upload a timed `TRAJ` queue. Live Cartesian jog runs one fixed-rate PC servo loop: it ramps TCP velocity, solves a direction-preserving bounded differential IK problem, and streams synchronized short-duration joint position segments with `SERVOJ`, followed by `JOG STOP` on release. The firmware does not apply a second independent joint-velocity ramp to these segments. Preview-only IK target editing does not send motion. `JOGJ` and `JOGV` remain compatibility commands. This is still open-loop target following for axes without encoders, not final measured closed-loop Cartesian control.
+See `../docs/shoulder_encoder_integration.md` for the state contract, calibration workflow, fault semantics, and disabled-by-default bounded correction rules.
+
+Operator workflow for the shoulder encoder:
+
+1. In Settings, enable encoder readback and the shoulder AS5048A, use the recommended ESP32-S3 pins unless your wiring differs, save, and sync while disarmed.
+2. Confirm Diagnostics shows a stable raw AS5048A angle. This raw angle is magnet degrees, not a calibrated shoulder angle.
+3. Put the shoulder at one physically known angle, enter that angle, and use **Set Pose to known angle** if the planner does not already match the real mark.
+4. Disarm and use **Quick calibrate**. This stores the current raw AS5048A angle as the calibrated reference for that known shoulder angle. The fast path assumes joint-output mounting and one sensor turn per shoulder turn.
+5. Arm and use **Run backlash check**. The app approaches the same shoulder angle from below and above and reports the output-side branch separation.
+6. Enable post-move correction only with **Validate + enable post-move correction** after the encoder is stable and the current mismatch is within the configured correction limit.
+7. Use the optional assisted sweep only when you need range validation or a `piecewise_linear` sensor map.
+
+Post-move correction is not continuous closed-loop control. It only runs after eligible manual joint endpoint moves or Go Home, within configured limits. `deadband_deg` is the small-error zone where no correction is attempted; `max_delta_deg` is the hard safety cap where correction is refused. `fault_tolerance_deg` controls warning/fault behavior only; raising it does not increase the correction movement range. Go Home remains a planned move to the configured home pose; a single shoulder encoder does not auto-home the robot or make the full TCP pose known.
+
+Working assumption: the PC remains the planner. Previewed joint-space,
+Cartesian, and program moves upload a timed `TRAJ` queue so the controller
+follows the planned waypoint timestamps. `MOVEJ` remains a low-level endpoint
+protocol command, but the normal dashboard execution path does not collapse a
+previewed joint trajectory to one endpoint. Live Cartesian jog runs one
+fixed-rate PC servo loop: it ramps TCP velocity, solves a direction-preserving
+bounded differential IK problem, and streams synchronized short-duration joint
+position segments with `SERVOJ`, followed by `JOG STOP` on release. The firmware
+does not apply a second independent joint-velocity ramp to these segments.
+Preview-only IK target editing does not send motion. `JOGJ` and `JOGV` remain
+compatibility commands. This is still open-loop target following for axes
+without encoders, not final measured closed-loop Cartesian control.
 
 ## Bluetooth Notes
 

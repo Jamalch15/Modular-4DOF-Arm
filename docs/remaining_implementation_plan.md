@@ -28,7 +28,7 @@ Currently present at a rough level:
 - The 3D view has DH-based rendering and object marker plumbing.
 - The backend has basic color/blob vision helpers and task sequence builders.
 - Firmware/backend protocol parsing includes some newer status fields.
-- Firmware/backend now have a timed `TRAJ` upload/start path for multi-waypoint motion, replacing repeated hardware `MOVEJ` waypoint streaming for linear/program paths.
+- Firmware/backend now have a timed `TRAJ` upload/start path for previewed joint-space and multi-waypoint motion, replacing repeated hardware `MOVEJ` waypoint streaming for normal planned execution.
 - The viewport faders use a fixed-rate, direction-constrained Cartesian servo and synchronized `SERVOJ` firmware position segments.
 - Encoder readback fields exist in software, but are not a real hardware workflow yet.
 - Analytic IK seed generation exists as a backend first pass and has regression tests.
@@ -629,16 +629,16 @@ Acceptance:
 Status: implemented as a first pass for joint-space previews and execution.
 
 Reality note: joint targets are checked against limits, per-joint speed and
-acceleration limits feed the generated waypoint profile, and direct joint
-execution uses configured speed/acceleration. Cartesian previews still depend
-on generated IK waypoints and should not be treated as firmware-level blended
-Cartesian control.
+acceleration limits feed the generated waypoint profile, and previewed joint
+execution uploads the timed joint trajectory instead of one unsynchronized
+endpoint. Cartesian previews still depend on generated IK waypoints and should
+not be treated as firmware-level blended Cartesian control.
 
 Work:
 
 - Add per-joint velocity and acceleration limits.
 - Add stepper/servo command-rate constraints.
-- Add synchronized joint arrival for joint-space moves.
+- Validate synchronized joint arrival for joint-space moves on the physical arm.
 - Add bounded Cartesian preview that respects motor limits.
 - Make units explicit.
 
@@ -706,7 +706,10 @@ from the actual reported TCP trail. Actual TCP points are sampled from
 path summary labels joint moves as joint-space TCP estimates instead of
 guaranteed Cartesian paths.
 
-Problem: the current blue path is the preview waypoint TCP trace. In joint mode, execution may send only the final joint endpoint, so the blue path is not necessarily the path the physical arm will take. This is confusing and should be fixed before trusting Cartesian workflows.
+Status: the dashboard now executes previewed joint-space paths through the timed
+`TRAJ` upload path instead of collapsing them to one final `MOVEJ` endpoint.
+The blue path is still a joint-space TCP estimate rather than a guaranteed
+Cartesian line, and real hardware tracking still needs validation.
 
 Work:
 
@@ -1536,13 +1539,20 @@ Status: partial.
 
 Problem: sending many independent `MOVEJ` commands can create stop-start behavior if the controller treats each waypoint as its own target. Smooth Cartesian motion needs a queued path or a higher-rate target-following mode with clear timing.
 
-Reality note: the dashboard now uploads multi-waypoint hardware paths with `TRAJ BEGIN`, sequential `TRAJ POINT` lines containing `time_from_start_s`, and `TRAJ START`. The full-arm controller stores the timed queue, interpolates between points with a clamped cubic Hermite segment, and clears the queue on stop, E-stop, home, set-pose, disarm, config changes, or a new `MOVEJ`. The no-motor protocol stub accepts the same commands for safe integration testing. This has compiled, but real hardware smoothness still needs validation.
+Reality note: the dashboard now uploads previewed joint-space and multi-waypoint
+hardware paths with `TRAJ BEGIN`, sequential `TRAJ POINT` lines containing
+`time_from_start_s`, and `TRAJ START`. The full-arm controller stores the timed
+queue, interpolates between points with a clamped cubic Hermite segment, and
+clears the queue on stop, E-stop, home, set-pose, disarm, config changes, or a
+new `MOVEJ`. The no-motor protocol stub accepts the same commands for safe
+integration testing. This has compiled, but real hardware smoothness still
+needs validation.
 
 Work:
 
 - Validate the queued timestamp protocol on real hardware.
 - Tune controller-side interpolation/blending so the arm does not fully decelerate at every intermediate waypoint unless commanded.
-- Support synchronized joint arrival across axes.
+- Validate and tune synchronized joint arrival across axes on hardware.
 - Apply speed and acceleration limits consistently for steppers and servos.
 - Add queue progress reporting if the UI needs it.
 - Add stale-stream safety:

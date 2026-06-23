@@ -117,14 +117,17 @@ void clearJogMotion(bool freezeTarget = false) {
 }
 
 void printHello() {
-  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=3");
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=4 encoder=1");
 }
 
 void printStatus() {
   ARM_SERIAL.printf(
-      "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=simulated enabled=0000 enc=0000 e1=0.00 e2=0.00 "
-      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=off tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
-      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, poseSourceText, armed ? 1 : 0, currentJointsDeg[0],
+      "STATUS state=%s homed=%d known=%d known_mask=%s pose_source=%s armed=%d hw=simulated enabled=0000 "
+      "enc=0000 enc_valid=0000 j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=off correction=idle "
+      "evalidn2=0 correction_id=none correction_delta=0 correction_steps=0 correction_attempts=0 "
+      "cb1=0 cb2=0 cb3=0 cb4=0 tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
+      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, knownPose ? "1111" : "0000", poseSourceText,
+      armed ? 1 : 0, currentJointsDeg[0],
       currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, toolValue, faultText);
 }
 
@@ -515,6 +518,12 @@ void handleConfig(const String& upperCommand) {
     }
     return;
   }
+  if (upperCommand.startsWith("CONFIG ENCODER")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+    }
+    return;
+  }
   if (upperCommand.startsWith("CONFIG END")) {
     if (!configInProgress) {
       printError("CONFIG", "begin_required");
@@ -618,6 +627,8 @@ void handleCommand(String rawCommand) {
     handleArm(buffer);
   } else if (strcasecmp(command, "SETPOSE") == 0) {
     handleSetPose(buffer);
+  } else if (strcasecmp(command, "CORRECTJ") == 0) {
+    printError("CORRECTION", "not_supported_by_protocol_stub");
   } else if (strcasecmp(command, "STOP") == 0) {
     handleStop();
   } else if (strcasecmp(command, "ESTOP") == 0) {

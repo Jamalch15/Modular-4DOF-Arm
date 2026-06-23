@@ -118,6 +118,12 @@ const state = {
   tcpCalibrationMove: null,
   tcpCalibrationMeasurementSource: { xy: "manual", z: "manual" },
   tcpCalibrationPhysicalResult: null,
+  encoderCalibrationSession: null,
+  encoderCalibrationValidation: null,
+  encoderCalibrationMessage: "",
+  encoderSweepPollTimer: null,
+  encoderLiveSamples: [],
+  encoderBacklashResult: null,
   versionTimer: null,
 };
 
@@ -138,6 +144,29 @@ const geometrySignFields = [
   ["s6", "Elbow offset direction"],
   ["s8", "Wrist offset direction"],
 ];
+
+const ENCODER_RECOMMENDED_PINS = {
+  sck_pin: 12,
+  miso_pin: 13,
+  mosi_pin: 14,
+  cs_pin: 15,
+};
+
+const ENCODER_STANDARD_LIMITS = {
+  clock_hz: 1000000,
+  sample_interval_ms: 100,
+  freshness_timeout_ms: 500,
+  max_noise_deg: 0.5,
+  settle_delay_ms: 300,
+  required_stable_samples: 3,
+  warning_tolerance_deg: 2.0,
+  fault_tolerance_deg: 10.0,
+  hysteresis_deg: 0.25,
+  correction_deadband_deg: 0.75,
+  correction_max_delta_deg: 8.0,
+};
+
+const ENCODER_BACKLASH_PRELOAD_DEG = 8.0;
 
 const targetDefs = [
   ["x", "X", "x_mm", "mm", 1],
@@ -635,7 +664,8 @@ function buildJointControls() {
         <input class="joint-slider" type="range" min="${joint.min_deg}" max="${joint.max_deg}" step="0.1" data-index="${index}" />
         <div class="joint-values">
           <span>Preview <strong id="target-${index}">0.0 deg</strong></span>
-          <span>Reported <strong id="reported-${index}">0.0 deg</strong></span>
+          <span>Estimated/planning <strong id="reported-${index}">0.0 deg</strong></span>
+          <span>Measured <strong id="measured-${index}">unknown</strong></span>
         </div>
       </div>
       <input class="angle-input" type="number" min="${joint.min_deg}" max="${joint.max_deg}" step="0.1" data-index="${index}" aria-label="${joint.name} angle" />
@@ -742,6 +772,18 @@ function ensurePositionLibraryDraft() {
 function positionLibraryDirty() {
   if (!state.config) return false;
   return JSON.stringify(state.positionLibraryDraft || savedPositionLibraryRecords()) !== JSON.stringify(savedPositionLibraryRecords());
+}
+
+function planningPoseMetadata(robotState = state.robotState) {
+  if (!robotState) return {};
+  return {
+    pose_basis: "planning_estimate",
+    pose_source: robotState.pose_source || "unknown",
+    planning_known_mask: robotState.pose_known_mask || "0000",
+    joint_authority: clonePlain(robotState.joint_authority || []),
+    measurement_valid_mask: robotState.measurement_valid_mask || "0000",
+    shoulder_measurement: clonePlain(robotState.encoder_evidence?.[1] || {}),
+  };
 }
 
 function setPositionLibraryStatus(text = null, mode = "") {
@@ -890,6 +932,7 @@ function addPositionLibraryRecord(kind) {
       type: "cartesian",
       units: { length: "mm", angle: "deg" },
       source: "operator",
+      metadata: planningPoseMetadata(),
       target: {
         x_mm: Number(fk.x_mm ?? 0),
         y_mm: Number(fk.y_mm ?? 180),
@@ -909,6 +952,7 @@ function addPositionLibraryRecord(kind) {
       type: "joint",
       units: { length: "mm", angle: "deg" },
       source: "operator",
+      metadata: planningPoseMetadata(),
       angles_deg: angles,
     };
   }
@@ -1037,6 +1081,7 @@ async function saveCurrentReportedPosition() {
     type: "joint",
     units: { length: "mm", angle: "deg" },
     source: "operator",
+    metadata: planningPoseMetadata(),
     angles_deg: angles,
   };
   renderPositionLibrary();
@@ -1551,6 +1596,994 @@ function readToolsPayload() {
   return current;
 }
 
+function rememberEncoderLiveSample(robotState = state.robotState) {
+  if (!robotState) return;
+  const evidence = robotState.encoder_evidence?.[1] || {};
+  const estimated = Number(robotState.estimated_angles_deg?.[1] ?? robotState.reported_angles_deg?.[1]);
+  const measured = Number(evidence.measured_angle_deg);
+  const raw = Number(evidence.raw_angle_deg);
+  if (![estimated, measured, raw].some(Number.isFinite)) return;
+  const stamp = Number(robotState.updated_at ?? Date.now() / 1000);
+  const last = state.encoderLiveSamples[state.encoderLiveSamples.length - 1];
+  if (last && Math.abs(last.stamp - stamp) < 1e-6) return;
+  state.encoderLiveSamples.push({
+    stamp,
+    estimated: Number.isFinite(estimated) ? estimated : null,
+    measured: Number.isFinite(measured) ? measured : null,
+    raw: Number.isFinite(raw) ? raw : null,
+    fresh: Boolean(evidence.fresh),
+    error: Number.isFinite(measured) && Number.isFinite(estimated) ? measured - estimated : null,
+  });
+  if (state.encoderLiveSamples.length > 120) {
+    state.encoderLiveSamples.splice(0, state.encoderLiveSamples.length - 120);
+  }
+}
+
+function encoderEvidenceHealthText(evidence = {}) {
+  if (!evidence || Object.keys(evidence).length === 0) return "unknown";
+  if (evidence.fresh) return "fresh";
+  if (evidence.valid) return evidence.health || "stale";
+  if (evidence.sensor_valid) return evidence.calibration_validated ? "sensor valid" : "uncalibrated";
+  if (evidence.raw_angle_deg != null) return evidence.health || "raw only";
+  return evidence.health || (evidence.sensor_available ? "invalid" : "unavailable");
+}
+
+function encoderMeasuredText(evidence = {}, { precision = 1, rawFallback = true } = {}) {
+  const health = encoderEvidenceHealthText(evidence);
+  if (evidence?.measured_angle_deg != null) {
+    return `${format(evidence.measured_angle_deg, precision)} deg (${health})`;
+  }
+  if (rawFallback && evidence?.raw_angle_deg != null) {
+    return `raw ${format(evidence.raw_angle_deg, precision)} deg (${health})`;
+  }
+  return health;
+}
+
+function encoderRawText(evidence = {}, { precision = 2 } = {}) {
+  if (evidence?.raw_angle_deg == null) return "unavailable";
+  return `${format(evidence.raw_angle_deg, precision)} deg raw${evidence.raw_count == null ? "" : ` / ${evidence.raw_count} count`}`;
+}
+
+function encoderSampleQualityText(evidence = {}) {
+  const parts = [
+    encoderEvidenceHealthText(evidence),
+    evidence?.age_ms == null ? null : `${evidence.age_ms} ms old`,
+    evidence?.noise_deg == null ? null : `noise ${format(evidence.noise_deg, 3)} deg`,
+    evidence?.consecutive_valid_samples == null
+      ? null
+      : `${evidence.consecutive_valid_samples}/${evidence.required_health_samples || 1} stable`,
+  ].filter(Boolean);
+  return parts.join(" / ") || "unknown";
+}
+
+function svgPoint(value, minValue, maxValue, lowPixel, highPixel) {
+  if (!Number.isFinite(value)) return null;
+  const span = Math.max(1e-9, maxValue - minValue);
+  return highPixel - ((value - minValue) / span) * (highPixel - lowPixel);
+}
+
+function svgPolyline(points, xForIndex, yForValue) {
+  return points
+    .map((point, index) => {
+      const y = yForValue(point);
+      if (y == null) return "";
+      return `${format(xForIndex(index), 1)},${format(y, 1)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function renderEncoderLiveChart(robotState = state.robotState) {
+  rememberEncoderLiveSample(robotState);
+  const samples = state.encoderLiveSamples.filter((sample) => sample.estimated != null || sample.measured != null);
+  if (samples.length < 2) {
+    return `<div class="encoder-chart empty-state compact-empty">Live chart will appear after a few encoder status updates.</div>`;
+  }
+  const values = samples.flatMap((sample) => [sample.estimated, sample.measured]).filter(Number.isFinite);
+  const minValue = Math.min(...values) - 1;
+  const maxValue = Math.max(...values) + 1;
+  const width = 460;
+  const height = 170;
+  const pad = 24;
+  const xForIndex = (index) => pad + (index / Math.max(1, samples.length - 1)) * (width - pad * 2);
+  const yFor = (field) => (sample) => svgPoint(sample[field], minValue, maxValue, pad, height - pad);
+  const measuredPoints = svgPolyline(samples, xForIndex, yFor("measured"));
+  const estimatedPoints = svgPolyline(samples, xForIndex, yFor("estimated"));
+  const latest = samples[samples.length - 1];
+  return `
+    <div class="encoder-chart">
+      <div class="encoder-chart-title">
+        <strong>Live shoulder readback</strong>
+        <span>estimate ${latest.estimated == null ? "-" : `${format(latest.estimated, 2)}°`} · measured ${latest.measured == null ? "-" : `${format(latest.measured, 2)}°`} · error ${latest.error == null ? "-" : `${format(latest.error, 2)}°`}</span>
+      </div>
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Live shoulder encoder diagnostic chart">
+        <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis" />
+        <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" class="chart-axis" />
+        <text x="${pad}" y="14" class="chart-label">${format(maxValue, 1)}°</text>
+        <text x="${pad}" y="${height - 5}" class="chart-label">${format(minValue, 1)}°</text>
+        <polyline points="${estimatedPoints}" class="chart-line chart-estimated" />
+        <polyline points="${measuredPoints}" class="chart-line chart-measured" />
+      </svg>
+      <div class="encoder-chart-legend">
+        <span><i class="legend-estimated"></i>software estimate</span>
+        <span><i class="legend-measured"></i>encoder measured</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderEncoderFitChart(validation) {
+  const points = (validation?.fit_points || []).filter((point) =>
+    Number.isFinite(Number(point.joint_angle_deg)) && Number.isFinite(Number(point.predicted_joint_deg))
+  );
+  if (points.length < 2) {
+    return `<div class="encoder-chart empty-state compact-empty">Calibration fit chart appears after two or more fit samples.</div>`;
+  }
+  const width = 460;
+  const height = 170;
+  const pad = 26;
+  const values = points.flatMap((point) => [Number(point.joint_angle_deg), Number(point.predicted_joint_deg)]);
+  const minValue = Math.min(...values) - 1;
+  const maxValue = Math.max(...values) + 1;
+  const xFor = (value) => pad + ((value - minValue) / Math.max(1e-9, maxValue - minValue)) * (width - pad * 2);
+  const yFor = (value) => svgPoint(value, minValue, maxValue, pad, height - pad);
+  const circles = points.map((point) => {
+    const x = xFor(Number(point.joint_angle_deg));
+    const y = yFor(Number(point.predicted_joint_deg));
+    const cls = Math.abs(Number(point.error_deg || 0)) > Number(validation?.residual_limit_deg || 1) ? "chart-point warn" : "chart-point";
+    return `<circle cx="${format(x, 1)}" cy="${format(y, 1)}" r="3.5" class="${cls}"><title>actual ${format(point.joint_angle_deg, 2)}°, calibrated ${format(point.predicted_joint_deg, 2)}°, error ${format(point.error_deg, 3)}°</title></circle>`;
+  }).join("");
+  return `
+    <div class="encoder-chart">
+      <div class="encoder-chart-title">
+        <strong>Calibration fit</strong>
+        <span>actual known angle vs calibrated readback</span>
+      </div>
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Encoder calibration fit chart">
+        <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis" />
+        <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" class="chart-axis" />
+        <line x1="${xFor(minValue)}" y1="${yFor(minValue)}" x2="${xFor(maxValue)}" y2="${yFor(maxValue)}" class="chart-ideal" />
+        ${circles}
+      </svg>
+      <div class="encoder-chart-legend">
+        <span><i class="legend-ideal"></i>perfect calibration</span>
+        <span><i class="legend-measured"></i>fit samples</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderBacklashChart(result = state.encoderBacklashResult) {
+  const samples = (result?.samples || []).filter((sample) => Number.isFinite(Number(sample.measured_angle_deg)));
+  if (!result || samples.length < 2) {
+    return `<div class="encoder-chart empty-state compact-empty">Run backlash check to compare the same target approached from both directions.</div>`;
+  }
+  const center = Number(result.center_joint_angle_deg);
+  const width = 460;
+  const height = 150;
+  const pad = 26;
+  const values = samples.map((sample) => Number(sample.measured_angle_deg)).concat([center]);
+  const minValue = Math.min(...values) - 1;
+  const maxValue = Math.max(...values) + 1;
+  const yFor = (value) => svgPoint(value, minValue, maxValue, pad, height - pad);
+  const bars = samples.map((sample, index) => {
+    const x = pad + 34 + index * 42;
+    const y = yFor(Number(sample.measured_angle_deg));
+    const cls = Number(sample.approach_direction) === 1 ? "chart-bar below" : "chart-bar above";
+    return `<line x1="${x}" y1="${height - pad}" x2="${x}" y2="${format(y, 1)}" class="${cls}"><title>${escapeHtml(sample.label || "")}: ${format(sample.measured_angle_deg, 3)}°</title></line>`;
+  }).join("");
+  return `
+    <div class="encoder-chart">
+      <div class="encoder-chart-title">
+        <strong>Backlash check</strong>
+        <span>${format(result.backlash_estimate_deg, 2)}° branch separation at ${format(center, 1)}°</span>
+      </div>
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Shoulder backlash check chart">
+        <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis" />
+        <line x1="${pad}" y1="${format(yFor(center), 1)}" x2="${width - pad}" y2="${format(yFor(center), 1)}" class="chart-ideal" />
+        ${bars}
+      </svg>
+      <div class="encoder-chart-legend">
+        <span><i class="legend-below"></i>from below</span>
+        <span><i class="legend-above"></i>from above</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderEncoderStatus(robotState = state.robotState) {
+  const status = $("#encoderReadbackStatus");
+  const actionStatus = $("#encoderActionStatus");
+  const sessionStatus = $("#encoderCalibrationSessionStatus");
+  if (actionStatus) {
+    const dirty = state.settingsDirtyScopes.size > 0;
+    const message = state.encoderCalibrationMessage
+      || (dirty
+        ? "Unsaved settings are present. Save and sync before calibration, backlash check, or correction."
+        : "Ready. Fast path: set one known shoulder angle, quick-calibrate, then run backlash check.");
+    const lowered = message.toLowerCase();
+    const tone = lowered.includes("failed")
+      || lowered.includes("error")
+      || lowered.includes("could not")
+      || lowered.includes("requires")
+      || lowered.includes("must")
+      || lowered.includes("first")
+      || lowered.includes("unknown")
+      || lowered.includes("invalid")
+      || lowered.includes("not ")
+      ? "warn-callout"
+      : lowered.includes("saved")
+        || lowered.includes("running")
+        || lowered.includes("queued")
+        || lowered.includes("captured")
+        || lowered.includes("enabled")
+        ? "ok-callout"
+        : "muted-callout";
+    actionStatus.innerHTML = `
+      <div class="encoder-callout ${tone}">
+        <strong>Encoder workflow status</strong>
+        <span>${escapeHtml(message)}</span>
+      </div>
+    `;
+  }
+  if (status && robotState) {
+    const evidence = robotState.encoder_evidence?.[1] || {};
+    const mismatch = robotState.encoder_mismatch || {};
+    const correction = robotState.correction_state || {};
+    const encoders = state.config?.encoders || {};
+    const axis = (encoders.axes || []).find((item) => Number(item.joint) === 2) || {};
+    const readbackEnabled = Boolean(encoders.enabled && axis.enabled);
+    const measured = evidence.measured_angle_deg == null
+      ? "not calibrated"
+      : `${format(evidence.measured_angle_deg, 3)} deg shoulder (${evidence.fresh ? "fresh" : evidence.health || "not authoritative"})`;
+    const raw = evidence.raw_angle_deg == null
+      ? "unavailable"
+      : `${format(evidence.raw_angle_deg, 3)} deg raw magnet angle${evidence.raw_count == null ? "" : ` (${evidence.raw_count}/16383 count)`}`;
+    const rawHealth = evidence.sensor_valid
+      ? `valid sample${evidence.consecutive_valid_samples == null ? "" : `, ${evidence.consecutive_valid_samples}/${evidence.required_health_samples || 1} stable`}`
+      : evidence.sensor_available
+        ? "invalid sample"
+        : readbackEnabled
+          ? "no sensor response"
+          : "readback disabled";
+    const planning = robotState.estimated_angles_deg?.[1] == null
+      ? "unknown"
+      : `${format(robotState.estimated_angles_deg[1], 3)} deg (${robotState.joint_authority?.[1] || "planning estimate"})`;
+    const calibratedState = axis.calibration_validated
+      ? `calibrated ${axis.calibration_model || "linear"}${axis.backlash_estimate_deg == null ? "" : `, backlash ${format(axis.backlash_estimate_deg, 2)} deg`}${axis.calibration_id ? ` (${axis.calibration_id})` : ""}`
+      : "not calibrated";
+    const correctionGate = mismatch.correction_status
+      ? `${mismatch.correction_status}${mismatch.correction_skip_reason ? `: ${mismatch.correction_skip_reason}` : ""}`
+      : "not evaluated";
+    const correctionLimits = mismatch.correction_deadband_deg == null && mismatch.correction_max_delta_deg == null
+      ? "not configured"
+      : `deadband ${format(mismatch.correction_deadband_deg ?? 0, 2)} deg / max ${format(mismatch.correction_max_delta_deg ?? 0, 2)} deg`;
+    status.innerHTML = `
+      <div class="encoder-callout ${readbackEnabled ? "" : "muted-callout"}">
+        <strong>${readbackEnabled ? "Shoulder encoder readback" : "Shoulder encoder disabled"}</strong>
+        <span>Raw AS5048A angle is only sensor evidence. It does not move the 3D arm or make the full robot pose known.</span>
+      </div>
+      <div class="log-line"><span>Planning shoulder</span><code>${planning}</code></div>
+      <div class="log-line"><span>Raw sensor</span><code>${raw}</code></div>
+      <div class="log-line"><span>Raw health</span><code>${rawHealth}</code></div>
+      <div class="log-line"><span>Calibrated shoulder</span><code>${measured}</code></div>
+      <div class="log-line"><span>Calibration</span><code>${calibratedState}</code></div>
+      <div class="log-line"><span>Freshness / noise</span><code>${evidence.age_ms == null ? "-" : `${evidence.age_ms} ms`} / ${evidence.noise_deg == null ? "-" : `${format(evidence.noise_deg, 3)} deg`}</code></div>
+      <div class="log-line"><span>Diagnostic flags</span><code>${(evidence.flags || []).join(", ") || "none"}</code></div>
+      <div class="log-line"><span>Post-move mismatch</span><code>${mismatch.status || "not checked"}${mismatch.error_deg == null ? "" : ` / ${format(mismatch.error_deg, 3)} deg`}</code></div>
+      <div class="log-line"><span>Correction gate</span><code>${escapeHtml(correctionGate)}</code></div>
+      <div class="log-line"><span>Correction limits</span><code>${escapeHtml(correctionLimits)}</code></div>
+      <div class="log-line"><span>Correction transaction</span><code>${correction.state || "idle"}${correction.transaction_id && correction.transaction_id !== "none" ? ` / ${correction.transaction_id}` : ""}</code></div>
+      ${renderEncoderLiveChart(robotState)}
+    `;
+  }
+  if (sessionStatus) {
+    const session = state.encoderCalibrationSession;
+    const validation = state.encoderCalibrationValidation;
+    const samples = session?.samples || [];
+    const fitSampleCount = validation?.fit_sample_count ?? samples.filter((sample) => sample.use_for_fit !== false).length;
+    const rawSpan = validation?.raw_span_deg;
+    const jointSpan = validation?.joint_span_deg;
+    const rawNeed = validation?.minimum_raw_span_deg ?? 1;
+    const jointNeed = validation?.minimum_joint_span_deg ?? 2;
+    const messages = [
+      state.encoderCalibrationMessage,
+      ...(validation?.errors || []),
+      ...(validation?.warnings || []),
+    ].filter(Boolean);
+    const sampleRows = samples.length
+      ? samples.map((sample, index) => `
+          <div class="encoder-sample-row">
+            <span>${index + 1}</span>
+            <code>${format(sample.joint_angle_deg, 3)} deg shoulder</code>
+            <code>${format(sample.raw_angle_deg, 3)} deg raw${sample.raw_count == null ? "" : ` / ${sample.raw_count}`}${sample.use_for_fit === false ? " / check only" : ""}</code>
+          </div>
+        `).join("")
+      : `<div class="empty-state compact-empty">No samples yet. Start captures reference 1 at the known angle above.</div>`;
+    const spanText = fitSampleCount >= 2
+      ? `raw ${format(rawSpan, 3)} / ${format(rawNeed, 3)} deg, shoulder ${format(jointSpan, 3)} / ${format(jointNeed, 3)} deg`
+      : `need two references; move shoulder at least ${format(jointNeed, 1)} deg and raw sensor at least ${format(rawNeed, 1)} deg`;
+    const localizedBacklash = validation?.localized_backlash_estimate_deg ?? validation?.localized_backlash_estimate_raw_deg;
+    const backlashText = validation?.backlash_estimate_deg != null
+      ? `${format(validation.backlash_estimate_deg, 3)} deg constant branch separation`
+      : localizedBacklash != null
+        ? `${format(localizedBacklash, 3)} ${validation?.localized_backlash_estimate_deg == null ? "raw " : ""}deg localized near ${format(validation.localized_backlash_at_joint_deg, 2)} deg`
+        : "no paired approach samples";
+    const fitText = validation?.ok
+      ? `valid ${validation.fit_model || "linear"}${validation.calibration_map_point_count ? `, map ${validation.calibration_map_point_count} pts` : ""}, sign ${validation.direction_sign}, turns ${format(validation.sensor_turns_per_joint_turn, 6)}, residual ${format(validation.max_residual_deg, 3)} deg`
+      : "not yet valid";
+    const sweep = session?.sweep || null;
+    const approachText = sweep?.final_approach_direction === -1
+      ? "from above / decreasing"
+      : sweep?.final_approach_direction === 1
+        ? "from below / increasing"
+        : "mixed/manual";
+    const sweepStatus = sweep
+      ? `
+        <div class="log-line"><span>Assisted sweep</span><code>${escapeHtml(sweep.status || "queued")} ${sweep.completed ?? 0}/${sweep.total ?? 0}${sweep.current_target_deg == null ? "" : ` @ ${format(sweep.current_target_deg, 2)} deg`}</code></div>
+        <div class="log-line"><span>Sweep approach</span><code>${escapeHtml(approachText)}${sweep.preload_deg == null ? "" : `, preload ${format(sweep.preload_deg, 2)} deg`}</code></div>
+        <div class="log-line"><span>Sweep note</span><code>${escapeHtml(sweep.error || sweep.note || "captures stopped samples only")}</code></div>
+      `
+      : "";
+    const nextStep = !session
+      ? "Enter the real shoulder angle, then Start + capture reference 1."
+      : encoderSweepIsActive(session)
+        ? "Sweep is running. Keep clear of the arm; samples are captured only after each settled move."
+        : samples.length < 2
+        ? "Move to a second known shoulder angle, disarm, enter that angle, then Capture reference; or run the assisted sweep while armed."
+        : validation?.ok
+          ? "Fit is valid. Commit calibration if the sign/scale and physical setup are correct."
+          : "Fit is not valid yet. Move farther or fix the known shoulder angle values.";
+    sessionStatus.innerHTML = session
+      ? `
+        <div class="encoder-callout ${validation?.ok ? "ok-callout" : "warn-callout"}">
+          <strong>${validation?.ok ? "Calibration fit valid" : "Calibration in progress"}</strong>
+          <span>${escapeHtml(nextStep)}</span>
+        </div>
+        <div class="log-line"><span>Session</span><code>${session.id}</code></div>
+        <div class="log-line"><span>Samples</span><code>${samples.length} total / ${fitSampleCount} fit</code></div>
+        ${sweepStatus}
+        <div class="log-line"><span>Motion span</span><code>${spanText}</code></div>
+        <div class="log-line"><span>Fit</span><code>${fitText}</code></div>
+        <div class="log-line"><span>Backlash</span><code>${backlashText}</code></div>
+        ${renderEncoderFitChart(validation)}
+        <div class="encoder-sample-list">${sampleRows}</div>
+        <div class="log-line"><span>Notes</span><code>${escapeHtml(messages.join("; ") || "capture at least two references")}</code></div>
+      `
+      : `
+        <div class="encoder-callout muted-callout">
+          <strong>No calibration session</strong>
+          <span>${escapeHtml(nextStep)}</span>
+        </div>
+        <div class="log-line"><span>Session</span><code>${state.encoderCalibrationMessage || "not started"}</code></div>
+      `;
+  }
+}
+
+function markEncoderDraftDirty(event = {}) {
+  if (
+    event.target?.matches?.(
+      "[data-encoder-field], [data-encoder-bus-field], [data-encoder-axis-field], [data-encoder-verification-field], [data-encoder-correction-field], #encoderReferenceDescription"
+    )
+  ) {
+    markSettingsDirty(
+      "hardware",
+      "Encoder hardware, calibration, or policy settings changed. Save while disarmed, then sync the controller."
+    );
+  }
+}
+
+function readEncoderPayload() {
+  const settings = clonePlain(state.config?.encoders || {});
+  settings.schema_version = 2;
+  settings.bus ||= {};
+  settings.verification ||= {};
+  settings.correction ||= { enabled: false };
+  const savedBus = clonePlain(settings.bus || {});
+  const savedVerification = clonePlain(settings.verification || {});
+  const savedCorrection = clonePlain(settings.correction || {});
+  const savedAxis = (settings.axes || []).find((axis) => Number(axis.joint) === 2) || {};
+  const axis = { ...savedAxis, joint: 2, name: "shoulder", sensor: "as5048a" };
+
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-field]").forEach((input) => {
+    settings[input.dataset.encoderField] = input.type === "checkbox" ? input.checked : input.value;
+  });
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-bus-field]").forEach((input) => {
+    settings.bus[input.dataset.encoderBusField] = readNumber(input, settings.bus[input.dataset.encoderBusField] ?? 0);
+  });
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-verification-field]").forEach((input) => {
+    const field = input.dataset.encoderVerificationField;
+    settings.verification[field] = input.type === "checkbox"
+      ? input.checked
+      : input.tagName === "SELECT"
+        ? input.value
+        : readNumber(input, settings.verification[field] ?? 0);
+  });
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-correction-field]").forEach((input) => {
+    const field = input.dataset.encoderCorrectionField;
+    settings.correction[field] = input.type === "checkbox"
+      ? input.checked
+      : input.tagName === "SELECT"
+        ? input.value
+        : readNumber(input, settings.correction[field] ?? 0);
+  });
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-axis-field]").forEach((input) => {
+    const field = input.dataset.encoderAxisField;
+    axis[field] = input.type === "checkbox"
+      ? input.checked
+      : input.tagName === "SELECT"
+        ? (field === "direction_sign" ? Number(input.value) : input.value)
+        : readNumber(input, axis[field] ?? 0);
+  });
+  axis.reference_description = $("#encoderReferenceDescription")?.value?.trim() || axis.reference_description || "";
+
+  const calibrationFields = [
+    "reference_raw_deg",
+    "reference_joint_deg",
+    "direction_sign",
+    "mounting_location",
+    "sensor_turns_per_joint_turn",
+  ];
+  const calibrationChanged = calibrationFields.some((field) => String(axis[field]) !== String(savedAxis[field]));
+  const fieldChanged = (current, saved, field) => String(current?.[field] ?? "") !== String(saved?.[field] ?? "");
+  const runtimeChanged = [
+    "sck_pin",
+    "miso_pin",
+    "mosi_pin",
+    "clock_hz",
+    "sample_interval_ms",
+  ].some((field) => fieldChanged(settings.bus, savedBus, field));
+  const axisRuntimeChanged = [
+    "enabled",
+    "cs_pin",
+    "freshness_timeout_ms",
+    "max_noise_deg",
+  ].some((field) => fieldChanged(axis, savedAxis, field));
+  const correctionRelevantVerificationChanged = [
+    "settle_delay_ms",
+    "required_stable_samples",
+    "require_encoder",
+  ].some((field) => fieldChanged(settings.verification, savedVerification, field));
+  const verificationChanged = [
+    "policy",
+    "settle_delay_ms",
+    "required_stable_samples",
+    "warning_tolerance_deg",
+    "fault_tolerance_deg",
+    "hysteresis_deg",
+    "require_encoder",
+  ].some((field) => fieldChanged(settings.verification, savedVerification, field));
+  const correctionLimitsChanged = [
+    "deadband_deg",
+    "max_delta_deg",
+    "joint_limit_margin_deg",
+    "speed_deg_s",
+    "accel_deg_s2",
+    "max_attempts",
+  ].some((field) => fieldChanged(settings.correction, savedCorrection, field));
+  if (calibrationChanged) {
+    axis.calibration_validated = false;
+    axis.calibration_id = "";
+    axis.calibration_validated_at = null;
+  }
+  if (calibrationChanged || runtimeChanged || axisRuntimeChanged || correctionRelevantVerificationChanged || correctionLimitsChanged) {
+    settings.correction.enabled = false;
+    settings.correction.validation_id = "";
+  }
+  if (!settings.enabled || !axis.enabled) {
+    settings.correction.enabled = false;
+  }
+  settings.axes = [axis];
+  settings.mode = settings.correction.enabled
+    ? "bounded_correction"
+    : settings.verification.policy === "diagnostic"
+      ? "diagnostic"
+      : "verification";
+  return settings;
+}
+
+function encoderKnownShoulderAngleInput() {
+  return $("#encoderKnownJointAngle");
+}
+
+function currentPlanningShoulderAngle() {
+  const candidates = [
+    state.robotState?.estimated_angles_deg?.[1],
+    state.robotState?.reported_angles_deg?.[1],
+    state.robotState?.target_angles_deg?.[1],
+    state.config?.joints?.[1]?.home_deg,
+  ];
+  const value = candidates.map(Number).find(Number.isFinite);
+  return value == null ? 0 : value;
+}
+
+function setEncoderKnownShoulderAngle(value) {
+  const input = encoderKnownShoulderAngleInput();
+  if (!input) return;
+  input.value = format(value, 3);
+}
+
+async function setPlanningShoulderToKnownAngle() {
+  let knownAngle;
+  try {
+    knownAngle = readRequiredNumber(encoderKnownShoulderAngleInput(), "Known shoulder angle");
+  } catch (error) {
+    state.encoderCalibrationMessage = error?.message || String(error);
+    renderEncoderStatus();
+    return;
+  }
+  if (state.robotState?.hardware_armed && !state.robotState?.simulation) {
+    state.encoderCalibrationMessage = "disarm hardware before Set Pose";
+    renderEncoderStatus();
+    return;
+  }
+  const current = normalizeJointAngles(state.robotState?.reported_angles_deg)
+    || normalizeJointAngles(state.robotState?.target_angles_deg)
+    || normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg));
+  if (!current) {
+    state.encoderCalibrationMessage = "cannot build Set Pose payload from the current displayed pose";
+    renderEncoderStatus();
+    return;
+  }
+  const shoulder = state.config?.joints?.[1];
+  if (shoulder && (knownAngle < Number(shoulder.min_deg) || knownAngle > Number(shoulder.max_deg))) {
+    state.encoderCalibrationMessage = `known shoulder angle must be within ${format(shoulder.min_deg, 1)}..${format(shoulder.max_deg, 1)} deg`;
+    renderEncoderStatus();
+    return;
+  }
+  const next = current.slice();
+  next[1] = knownAngle;
+  const confirmed = window.confirm(
+    `Set the software planning pose shoulder to ${format(knownAngle, 3)} deg now?\n\n` +
+    "This is an operator Set Pose assertion. It does not come from the encoder, and it keeps the other displayed joints unchanged."
+  );
+  if (!confirmed) return;
+  const payload = await postJson("/api/hardware/setpose", { angles_deg: next });
+  state.encoderCalibrationMessage = payload.ok
+    ? "planning shoulder set to the known start angle; arm before running the assisted sweep"
+    : payload.error || "Set Pose failed";
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+function conservativeEncoderCalibrationMoveSettings() {
+  const settings = pathSettings();
+  const shoulderIndex = 1;
+  const maxSpeed = 8.0;
+  const maxAccel = 30.0;
+  settings.global_speed_deg_s = Math.min(Number(settings.global_speed_deg_s || maxSpeed), maxSpeed);
+  settings.global_accel_deg_s2 = Math.min(Number(settings.global_accel_deg_s2 || maxAccel), maxAccel);
+  settings.per_joint_speed_deg_s = Array.isArray(settings.per_joint_speed_deg_s)
+    ? settings.per_joint_speed_deg_s.slice()
+    : [];
+  settings.per_joint_accel_deg_s2 = Array.isArray(settings.per_joint_accel_deg_s2)
+    ? settings.per_joint_accel_deg_s2.slice()
+    : [];
+  settings.per_joint_speed_deg_s[shoulderIndex] = Math.min(
+    Number(settings.per_joint_speed_deg_s[shoulderIndex] || maxSpeed),
+    maxSpeed
+  );
+  settings.per_joint_accel_deg_s2[shoulderIndex] = Math.min(
+    Number(settings.per_joint_accel_deg_s2[shoulderIndex] || maxAccel),
+    maxAccel
+  );
+  return settings;
+}
+
+async function moveShoulderForEncoderCalibration() {
+  let target;
+  try {
+    target = readRequiredNumber(encoderKnownShoulderAngleInput(), "Known shoulder angle");
+  } catch (error) {
+    state.encoderCalibrationMessage = error?.message || String(error);
+    renderEncoderStatus();
+    return;
+  }
+  if (!state.robotState?.hardware_armed && !state.robotState?.simulation) {
+    state.encoderCalibrationMessage = "arm hardware before the helper move; disarm again before capture";
+    renderEncoderStatus();
+    return;
+  }
+  const current = normalizeJointAngles(state.robotState?.target_angles_deg)
+    || normalizeJointAngles(state.robotState?.reported_angles_deg)
+    || normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg));
+  if (!current) {
+    state.encoderCalibrationMessage = "cannot move shoulder: current planning pose is unknown";
+    renderEncoderStatus();
+    return;
+  }
+  const shoulder = state.config?.joints?.[1];
+  if (shoulder && (target < Number(shoulder.min_deg) || target > Number(shoulder.max_deg))) {
+    state.encoderCalibrationMessage = `known shoulder angle must be within ${format(shoulder.min_deg, 1)}..${format(shoulder.max_deg, 1)} deg`;
+    renderEncoderStatus();
+    return;
+  }
+  const next = current.slice();
+  next[1] = target;
+  state.encoderCalibrationMessage = `moving shoulder to ${format(target, 2)} deg using the normal planner`;
+  renderEncoderStatus();
+  const payload = await postJson("/api/joints", {
+    angles_deg: next,
+    settings: conservativeEncoderCalibrationMoveSettings(),
+  });
+  if (payload.ok) {
+    state.encoderCalibrationMessage = "move accepted; wait until idle, disarm, then capture the reference";
+    invalidatePendingIkPreview();
+    releaseJointControlIntent();
+    clearViewPreview();
+  } else {
+    state.encoderCalibrationMessage = payload.error || "shoulder calibration move failed";
+  }
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+function encoderSweepIsActive(session = state.encoderCalibrationSession) {
+  const status = session?.sweep?.status;
+  return ["queued", "running", "preloading", "moving", "settling", "sampling", "cancel_requested"].includes(status);
+}
+
+function scheduleEncoderSweepPoll(sessionId) {
+  if (state.encoderSweepPollTimer) window.clearTimeout(state.encoderSweepPollTimer);
+  state.encoderSweepPollTimer = window.setTimeout(() => {
+    void pollEncoderCalibrationSession(sessionId);
+  }, 700);
+}
+
+function showEncoderWorkflowMessage(message) {
+  state.encoderCalibrationMessage = message;
+  renderEncoderStatus();
+  $("#encoderActionStatus")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+async function pollEncoderCalibrationSession(sessionId = state.encoderCalibrationSession?.id) {
+  if (!sessionId) return;
+  try {
+    const response = await fetch(`/api/encoder/calibration/session/${encodeURIComponent(sessionId)}?t=${Date.now()}`, {
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    if (payload.session) state.encoderCalibrationSession = payload.session;
+    if (payload.validation) state.encoderCalibrationValidation = payload.validation;
+    if (payload.state) renderState(payload.state);
+    if (!payload.ok) state.encoderCalibrationMessage = payload.error || "could not refresh assisted sweep status";
+    renderEncoderStatus();
+    if (payload.ok && encoderSweepIsActive(payload.session)) {
+      scheduleEncoderSweepPoll(sessionId);
+    }
+  } catch (error) {
+    state.encoderCalibrationMessage = error?.message || "could not poll assisted sweep";
+    renderEncoderStatus();
+  }
+}
+
+function readEncoderSweepPayload() {
+  const start = readRequiredNumber(encoderKnownShoulderAngleInput(), "Known shoulder angle");
+  return {
+    start_joint_angle_deg: start,
+    sweep_min_deg: readRequiredNumber($("#encoderSweepMin"), "Sweep minimum"),
+    sweep_max_deg: readRequiredNumber($("#encoderSweepMax"), "Sweep maximum"),
+    step_deg: readRequiredNumber($("#encoderSweepStep"), "Sweep step", { min: 1, max: 45 }),
+    final_approach_direction: Number($("#encoderSweepApproach")?.value || 1),
+    preload_deg: readRequiredNumber($("#encoderSweepPreload"), "Backlash preload", { min: 0, max: 45 }),
+    speed_deg_s: readRequiredNumber($("#encoderSweepSpeed"), "Sweep speed", { min: 0.1, max: 8 }),
+    accel_deg_s2: 24.0,
+    settle_ms: readRequiredNumber($("#encoderSweepSettleMs"), "Settle time", { min: 100, max: 5000 }),
+    mounting_location: $("[data-encoder-axis-field='mounting_location']")?.value || "joint_output",
+    reference_description: $("#encoderReferenceDescription")?.value?.trim() || "",
+    confirm_open_loop_sweep: true,
+  };
+}
+
+function readQuickEncoderCalibrationPayload() {
+  return {
+    joint_angle_deg: readRequiredNumber(encoderKnownShoulderAngleInput(), "Known shoulder angle"),
+    direction_sign: Number($("#encoderQuickDirection")?.value || $("[data-encoder-axis-field='direction_sign']")?.value || 1),
+    sensor_turns_per_joint_turn: 1.0,
+    mounting_location: $("[data-encoder-axis-field='mounting_location']")?.value || "joint_output",
+    reference_description: $("#encoderReferenceDescription")?.value?.trim() || "",
+    confirm_one_to_one_output_mount: true,
+  };
+}
+
+async function quickCalibrateEncoder() {
+  if (state.settingsDirtyScopes.size) {
+    const saved = await saveAllSettings();
+    if (!saved) return;
+  }
+  let request;
+  try {
+    request = readQuickEncoderCalibrationPayload();
+  } catch (error) {
+    showEncoderWorkflowMessage(error?.message || String(error));
+    return;
+  }
+  state.encoderCalibrationMessage = "quick calibration reading current raw sensor sample";
+  renderEncoderStatus();
+  const payload = await postJson("/api/encoder/calibration/quick", request);
+  if (payload.validation) state.encoderCalibrationValidation = payload.validation;
+  if (payload.ok) {
+    state.encoderCalibrationSession = null;
+    state.encoderCalibrationMessage = "quick encoder calibration saved; save/sync is handled, now run backlash check while armed";
+  } else {
+    state.encoderCalibrationMessage = payload.error || "quick calibration failed";
+  }
+  if (payload.config) applyConfig(payload.config);
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+async function runEncoderBacklashCheck() {
+  let request;
+  try {
+    request = {
+      center_joint_angle_deg: readRequiredNumber($("#encoderBacklashCenter"), "Backlash center"),
+      travel_deg: readRequiredNumber($("#encoderBacklashTravel"), "Backlash travel", { min: 2, max: 30 }),
+      repeats: Math.round(readRequiredNumber($("#encoderBacklashRepeats"), "Backlash repeats", { min: 1, max: 5 })),
+      speed_deg_s: readRequiredNumber($("#encoderBacklashSpeed"), "Backlash check speed", { min: 0.1, max: 8 }),
+      settle_ms: readRequiredNumber($("#encoderBacklashSettleMs"), "Backlash settle time", { min: 100, max: 5000 }),
+    };
+  } catch (error) {
+    showEncoderWorkflowMessage(error?.message || String(error));
+    return;
+  }
+  state.encoderCalibrationMessage = "backlash check running; the shoulder will approach the same angle from both directions";
+  renderEncoderStatus();
+  const payload = await postJson("/api/encoder/backlash/check", request);
+  if (payload.backlash) state.encoderBacklashResult = payload.backlash;
+  if (payload.ok) {
+    state.encoderCalibrationMessage = `backlash check complete: ${format(payload.backlash?.backlash_estimate_deg, 2)} deg branch separation`;
+  } else {
+    state.encoderCalibrationMessage = payload.error || "backlash check failed";
+  }
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+async function runAssistedEncoderSweep() {
+  if (state.settingsDirtyScopes.size) {
+    updateSettingsSaveBar({
+      mode: "error",
+      title: "Save + sync required",
+      detail: "The assisted sweep uses live controller encoder pins and limits. Save all settings, then sync the controller while disarmed before running it.",
+    });
+    showEncoderWorkflowMessage("Save and sync settings first. The assisted sweep must use the active controller encoder pins and limits.");
+    return;
+  }
+  let request;
+  try {
+    request = readEncoderSweepPayload();
+  } catch (error) {
+    showEncoderWorkflowMessage(error?.message || String(error));
+    return;
+  }
+  state.encoderCalibrationMessage = "assisted sweep queued";
+  renderEncoderStatus();
+  const payload = await postJson("/api/encoder/calibration/sweep/start", request);
+  if (payload.session) state.encoderCalibrationSession = payload.session;
+  if (payload.validation) state.encoderCalibrationValidation = payload.validation;
+  if (payload.ok) {
+    state.encoderCalibrationMessage = "assisted sweep running; samples are captured after each settled move";
+    scheduleEncoderSweepPoll(payload.session?.id);
+  } else {
+    state.encoderCalibrationMessage = payload.error || "assisted sweep could not start";
+  }
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+async function cancelAssistedEncoderSweep() {
+  const sessionId = state.encoderCalibrationSession?.id;
+  if (!sessionId) {
+    state.encoderCalibrationMessage = "no assisted sweep session is active";
+    renderEncoderStatus();
+    return;
+  }
+  const payload = await postJson("/api/encoder/calibration/sweep/cancel", { session_id: sessionId });
+  if (payload.session) state.encoderCalibrationSession = payload.session;
+  if (payload.validation) state.encoderCalibrationValidation = payload.validation;
+  state.encoderCalibrationMessage = payload.ok ? "assisted sweep cancellation requested" : payload.error || "could not cancel assisted sweep";
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
+async function setEncoderCorrectionPolicy(enabled) {
+  if (state.settingsDirtyScopes.size) {
+    state.encoderCalibrationMessage = "save and sync settings before changing correction; correction validation must use the active saved encoder calibration";
+    renderEncoderStatus();
+    return;
+  }
+  const confirmed = window.confirm(
+    enabled
+      ? "Enable bounded post-move shoulder correction?\n\nThis is not continuous control. It only runs after eligible moves, uses strict limits, and faults instead of rebasing the software pose if it cannot converge."
+      : "Disable bounded shoulder correction?"
+  );
+  if (!confirmed) return;
+  const payload = await postJson("/api/encoder/correction/policy", { enabled, confirm: true });
+  if (payload.config) applyConfig(payload.config);
+  if (payload.state) renderState(payload.state);
+  if (payload.ok) {
+    state.encoderCalibrationMessage = enabled
+      ? "bounded correction enabled locally; sync the controller while disarmed before relying on it"
+      : "bounded correction disabled";
+  } else {
+    state.encoderCalibrationMessage = payload.error || "could not change correction policy";
+  }
+  renderEncoderStatus();
+}
+
+async function handleEncoderUiAction(action) {
+  if (!action) return;
+  if (action === "recommended-pins") {
+    const values = {
+      "[data-encoder-bus-field='sck_pin']": ENCODER_RECOMMENDED_PINS.sck_pin,
+      "[data-encoder-bus-field='miso_pin']": ENCODER_RECOMMENDED_PINS.miso_pin,
+      "[data-encoder-bus-field='mosi_pin']": ENCODER_RECOMMENDED_PINS.mosi_pin,
+      "[data-encoder-axis-field='cs_pin']": ENCODER_RECOMMENDED_PINS.cs_pin,
+    };
+    Object.entries(values).forEach(([selector, value]) => {
+      const input = elements.encoderCalibration?.querySelector(selector);
+      if (input) input.value = String(value);
+    });
+    state.encoderCalibrationMessage = "recommended ESP32-S3 pins applied; save and sync while disarmed";
+    markEncoderDraftDirty({ target: elements.encoderCalibration?.querySelector("[data-encoder-bus-field='sck_pin']") });
+    renderEncoderStatus();
+  } else if (action === "disable-readback") {
+    const bus = elements.encoderCalibration?.querySelector("[data-encoder-field='enabled']");
+    const axis = elements.encoderCalibration?.querySelector("[data-encoder-axis-field='enabled']");
+    if (bus) bus.checked = false;
+    if (axis) axis.checked = false;
+    state.encoderCalibrationMessage = "encoder readback disabled in the draft; save and sync while disarmed";
+    markEncoderDraftDirty({ target: bus || axis });
+    renderEncoderStatus();
+  } else if (action === "standard-limits") {
+    const values = {
+      "[data-encoder-bus-field='clock_hz']": ENCODER_STANDARD_LIMITS.clock_hz,
+      "[data-encoder-bus-field='sample_interval_ms']": ENCODER_STANDARD_LIMITS.sample_interval_ms,
+      "[data-encoder-axis-field='freshness_timeout_ms']": ENCODER_STANDARD_LIMITS.freshness_timeout_ms,
+      "[data-encoder-axis-field='max_noise_deg']": ENCODER_STANDARD_LIMITS.max_noise_deg,
+      "[data-encoder-verification-field='settle_delay_ms']": ENCODER_STANDARD_LIMITS.settle_delay_ms,
+      "[data-encoder-verification-field='required_stable_samples']": ENCODER_STANDARD_LIMITS.required_stable_samples,
+      "[data-encoder-verification-field='warning_tolerance_deg']": ENCODER_STANDARD_LIMITS.warning_tolerance_deg,
+      "[data-encoder-verification-field='fault_tolerance_deg']": ENCODER_STANDARD_LIMITS.fault_tolerance_deg,
+      "[data-encoder-verification-field='hysteresis_deg']": ENCODER_STANDARD_LIMITS.hysteresis_deg,
+      "[data-encoder-correction-field='deadband_deg']": ENCODER_STANDARD_LIMITS.correction_deadband_deg,
+      "[data-encoder-correction-field='max_delta_deg']": ENCODER_STANDARD_LIMITS.correction_max_delta_deg,
+    };
+    Object.entries(values).forEach(([selector, value]) => {
+      const input = elements.encoderCalibration?.querySelector(selector);
+      if (input) input.value = String(value);
+    });
+    state.encoderCalibrationMessage = "standard diagnostic limits applied; save and sync while disarmed";
+    markEncoderDraftDirty({ target: elements.encoderCalibration?.querySelector("[data-encoder-bus-field='clock_hz']") });
+    renderEncoderStatus();
+  } else if (action === "use-planning-angle") {
+    setEncoderKnownShoulderAngle(currentPlanningShoulderAngle());
+    state.encoderCalibrationMessage = "known angle field filled from the current planning shoulder estimate; verify it physically before capture";
+    renderEncoderStatus();
+  } else if (action === "set-known-pose") {
+    await setPlanningShoulderToKnownAngle();
+  } else if (action === "arm") {
+    const payload = await postJson("/api/hardware-arm", { armed: true });
+    state.encoderCalibrationMessage = payload.ok
+      ? "hardware armed; use Move shoulder, then disarm before capture"
+      : payload.error || "could not arm hardware";
+    if (payload.state) renderState(payload.state);
+    renderEncoderStatus();
+  } else if (action === "disarm") {
+    const payload = await postJson("/api/hardware-arm", { armed: false });
+    state.encoderCalibrationMessage = payload.ok
+      ? "hardware disarmed; capture is allowed if the encoder sample is fresh"
+      : payload.error || "could not disarm hardware";
+    if (payload.state) renderState(payload.state);
+    renderEncoderStatus();
+  } else if (action === "move-shoulder") {
+    await moveShoulderForEncoderCalibration();
+  } else if (action === "quick-calibrate") {
+    await quickCalibrateEncoder();
+  } else if (action === "run-backlash-check") {
+    await runEncoderBacklashCheck();
+  } else if (action === "run-sweep") {
+    await runAssistedEncoderSweep();
+  } else if (action === "cancel-sweep") {
+    await cancelAssistedEncoderSweep();
+  } else if (action === "enable-correction") {
+    await setEncoderCorrectionPolicy(true);
+  } else if (action === "disable-correction") {
+    await setEncoderCorrectionPolicy(false);
+  }
+}
+
+async function handleEncoderCalibrationAction(action) {
+  if (!action) return;
+  if (action === "start" && state.settingsDirtyScopes.has("hardware")) {
+    state.encoderCalibrationMessage = "save and sync controller before calibration; unsynced encoder pins cannot be used for capture";
+    renderEncoderStatus();
+    return;
+  }
+  if (action === "start" && state.settingsDirtyScopes.size) {
+    const saved = await saveAllSettings();
+    if (!saved) return;
+  }
+  const sessionId = state.encoderCalibrationSession?.id;
+  let payload;
+  if (action === "start") {
+    let knownJointAngle;
+    try {
+      knownJointAngle = readRequiredNumber(
+        encoderKnownShoulderAngleInput(),
+        "Known shoulder angle"
+      );
+    } catch (error) {
+      state.encoderCalibrationMessage = error?.message || String(error);
+      renderEncoderStatus();
+      return;
+    }
+    payload = await postJson("/api/encoder/calibration/start", {
+      mounting_location: $("[data-encoder-axis-field='mounting_location']")?.value || "joint_output",
+      reference_description: $("#encoderReferenceDescription")?.value?.trim() || "",
+      joint_angle_deg: knownJointAngle,
+      capture_initial: true,
+    });
+  } else if (action === "capture") {
+    if (!sessionId) {
+      state.encoderCalibrationMessage = "start + capture reference 1 first";
+      renderEncoderStatus();
+      return;
+    }
+    let knownJointAngle;
+    try {
+      knownJointAngle = readRequiredNumber(
+        $("#encoderKnownJointAngle"),
+        "Known shoulder angle"
+      );
+    } catch (error) {
+      state.encoderCalibrationMessage = error?.message || String(error);
+      renderEncoderStatus();
+      return;
+    }
+    payload = await postJson("/api/encoder/calibration/sample", {
+      session_id: sessionId,
+      joint_angle_deg: knownJointAngle,
+      label: `reference ${(state.encoderCalibrationSession?.samples?.length || 0) + 1}`,
+    });
+  } else if (action === "validate") {
+    if (!sessionId) {
+      state.encoderCalibrationMessage = "start a calibration session first";
+      renderEncoderStatus();
+      return;
+    }
+    payload = await postJson("/api/encoder/calibration/validate", { session_id: sessionId });
+  } else if (action === "commit") {
+    if (!sessionId || !window.confirm("Commit this reversible shoulder encoder calibration to robot.local.yaml?")) return;
+    payload = await postJson("/api/encoder/calibration/commit", { session_id: sessionId, confirm: true });
+  }
+  if (!payload) return;
+  if (payload.session) state.encoderCalibrationSession = payload.session;
+  if (payload.validation) state.encoderCalibrationValidation = payload.validation;
+  if (payload.ok) {
+    if (action === "start") {
+      state.encoderCalibrationMessage = "reference 1 captured; move to a second known shoulder angle";
+    } else if (action === "capture") {
+      state.encoderCalibrationMessage = "reference captured";
+    } else if (action === "validate") {
+      state.encoderCalibrationMessage = payload.validation?.ok ? "calibration fit is valid" : "calibration fit is not valid yet";
+    } else if (action === "commit") {
+      state.encoderCalibrationMessage = "shoulder encoder calibration saved";
+    } else {
+      state.encoderCalibrationMessage = "";
+    }
+  } else {
+    state.encoderCalibrationMessage = payload.error || "encoder calibration action failed";
+  }
+  if (payload.config) {
+    state.encoderCalibrationSession = null;
+    applyConfig(payload.config);
+  }
+  if (payload.state) renderState(payload.state);
+  renderEncoderStatus();
+}
+
 function buildCalibrationEditors() {
   buildGeometryPresetEditor();
   refreshDerivedModelDraft();
@@ -1602,13 +2635,286 @@ function buildCalibrationEditors() {
 
   if (elements.encoderCalibration) {
     const encoders = state.config.encoders || {};
-    elements.encoderCalibration.innerHTML = (encoders.axes || [])
-      .map((axis, index) => {
-        const reported = state.robotState?.encoder_angles_deg?.[index];
-        const err = state.robotState?.encoder_errors_deg?.[index];
-        return `<div class="log-line"><span>${axis.name || `J${index + 1}`} encoder</span><code>cs ${axis.cs_pin}, zero ${format(axis.zero_offset_deg, 2)}, angle ${reported == null ? "-" : format(reported, 2)}, err ${err == null ? "-" : format(err, 2)}</code></div>`;
-      })
-      .join("");
+    const bus = encoders.bus || {};
+    const verification = encoders.verification || {};
+    const correction = encoders.correction || {};
+    const axis = (encoders.axes || []).find((item) => Number(item.joint) === 2) || {};
+    const shoulderJoint = state.config.joints?.[1] || {};
+    const shoulderMin = Number.isFinite(Number(shoulderJoint.min_deg)) ? Number(shoulderJoint.min_deg) : 0;
+    const shoulderMax = Number.isFinite(Number(shoulderJoint.max_deg)) ? Number(shoulderJoint.max_deg) : 180;
+    const currentShoulder = clamp(currentPlanningShoulderAngle(), shoulderMin, shoulderMax);
+    const shoulderRange = Math.max(0, shoulderMax - shoulderMin);
+    const defaultSweepPreload = Math.min(ENCODER_BACKLASH_PRELOAD_DEG, Math.max(0, shoulderRange / 4));
+    const sweepMaxDefault = shoulderMax;
+    let sweepMinDefault = clamp(shoulderMin + defaultSweepPreload, shoulderMin, shoulderMax);
+    if (sweepMaxDefault - sweepMinDefault > 180) sweepMinDefault = sweepMaxDefault - 180;
+    if (sweepMinDefault >= sweepMaxDefault) sweepMinDefault = shoulderMin;
+    const backlashTravelDefault = Math.min(10, Math.max(2, shoulderRange / 8 || 2));
+    const backlashCenterDefault = clamp(
+      currentShoulder,
+      shoulderMin + backlashTravelDefault,
+      shoulderMax - backlashTravelDefault
+    );
+    const correctionStatus = correction.enabled
+      ? `enabled (${correction.validation_id || "validation record missing"})`
+      : "disabled";
+    elements.encoderCalibration.innerHTML = `
+      <div class="encoder-dashboard">
+      <div class="encoder-top-row">
+        <div id="encoderReadbackStatus" class="encoder-status-grid"></div>
+        <div id="encoderActionStatus" class="encoder-action-status"></div>
+      </div>
+      <p class="field-help encoder-field-help">Normal setup needs readback enablement, the four SPI pins, one known start pose, and the assisted sweep. Timing and correction limits are advanced bench settings.</p>
+      <div class="encoder-simple-card">
+        <div class="encoder-simple-header">
+          <strong>Basic setup</strong>
+          <span>Recommended ESP32-S3 pins: SCK 12, MISO 13, MOSI 14, CS 15. Save and sync while disarmed after changing these.</span>
+        </div>
+        <div class="hardware-grid encoder-config-grid">
+          <label class="toggle-label compact-toggle">
+            <input data-encoder-field="enabled" type="checkbox" ${encoders.enabled ? "checked" : ""} />
+            <span>Enable encoder readback</span>
+          </label>
+          <label class="toggle-label compact-toggle">
+            <input data-encoder-axis-field="enabled" type="checkbox" ${axis.enabled ? "checked" : ""} />
+            <span>Use shoulder AS5048A</span>
+          </label>
+          <label>SPI SCK GPIO
+            <input data-encoder-bus-field="sck_pin" type="number" step="1" value="${bus.sck_pin ?? ENCODER_RECOMMENDED_PINS.sck_pin}" />
+          </label>
+          <label>SPI MISO GPIO
+            <input data-encoder-bus-field="miso_pin" type="number" step="1" value="${bus.miso_pin ?? ENCODER_RECOMMENDED_PINS.miso_pin}" />
+          </label>
+          <label>SPI MOSI GPIO
+            <input data-encoder-bus-field="mosi_pin" type="number" step="1" value="${bus.mosi_pin ?? ENCODER_RECOMMENDED_PINS.mosi_pin}" />
+          </label>
+          <label>Shoulder CS GPIO
+            <input data-encoder-axis-field="cs_pin" type="number" step="1" value="${axis.cs_pin ?? ENCODER_RECOMMENDED_PINS.cs_pin}" />
+          </label>
+          <label>Post-move check
+            <select data-encoder-verification-field="policy">
+              <option value="diagnostic" ${verification.policy === "diagnostic" ? "selected" : ""}>Diagnostic only</option>
+              <option value="warning" ${verification.policy === "warning" ? "selected" : ""}>Warn on mismatch</option>
+              <option value="fault" ${verification.policy === "fault" ? "selected" : ""}>Fault on mismatch</option>
+            </select>
+          </label>
+          <label>Mounting
+            <select data-encoder-axis-field="mounting_location">
+              <option value="joint_output" ${axis.mounting_location === "joint_output" ? "selected" : ""}>Joint output</option>
+              <option value="gearbox_input" ${axis.mounting_location === "gearbox_input" ? "selected" : ""}>Gearbox input (diagnostic only)</option>
+              <option value="motor_shaft" ${axis.mounting_location === "motor_shaft" ? "selected" : ""}>Motor shaft (diagnostic only)</option>
+            </select>
+          </label>
+        </div>
+        <div class="button-row">
+          <button type="button" class="ghost" data-encoder-ui-action="recommended-pins">Use recommended pins</button>
+          <button type="button" class="ghost" data-encoder-ui-action="standard-limits">Restore standard limits</button>
+          <button type="button" class="danger ghost" data-encoder-ui-action="disable-readback">Disable encoder readback</button>
+        </div>
+      </div>
+      <div class="path-summary encoder-calibration-guide encoder-primary-workflow">
+        <strong>Quick shoulder encoder setup</strong>
+        <p>Fast path: put the shoulder on a known mark, enter that angle, disarm, then quick-calibrate. This sets the raw encoder offset. Then arm and run backlash check to measure how much the output moves differently when approached from each direction.</p>
+        <div class="encoder-workflow-grid">
+          <div class="encoder-form-panel">
+            <strong>1. Quick calibrate offset</strong>
+            <label>Known shoulder angle deg
+              <input id="encoderKnownJointAngle" type="number" step="0.001" value="${format(currentPlanningShoulderAngle(), 3)}" />
+            </label>
+            <label>Encoder direction
+              <select id="encoderQuickDirection">
+                <option value="1" ${Number(axis.direction_sign) !== -1 ? "selected" : ""}>Normal: raw increases with shoulder</option>
+                <option value="-1" ${Number(axis.direction_sign) === -1 ? "selected" : ""}>Inverted: raw decreases with shoulder</option>
+              </select>
+            </label>
+            <label>Mounting reference
+              <input id="encoderReferenceDescription" type="text" value="${escapeHtml(axis.reference_description || "")}" placeholder="Fixture, mark, or mechanical datum" />
+            </label>
+            <div class="button-row encoder-button-row">
+              <button type="button" class="ghost" data-encoder-ui-action="use-planning-angle">Use planning angle</button>
+              <button type="button" class="ghost" data-encoder-ui-action="set-known-pose">Set Pose to known angle</button>
+              <button type="button" class="primary" data-encoder-ui-action="quick-calibrate">Quick calibrate</button>
+            </div>
+          </div>
+          <div class="encoder-form-panel">
+            <strong>2. Measure backlash</strong>
+            <p class="field-help">The check approaches the same center angle from below and above, then compares the calibrated output encoder readings.</p>
+            <div class="encoder-range-grid">
+              <label>Center deg
+                <input id="encoderBacklashCenter" type="number" step="0.1" value="${format(backlashCenterDefault, 1)}" />
+              </label>
+              <label>Travel each side deg
+                <input id="encoderBacklashTravel" type="number" min="2" max="30" step="0.5" value="${format(backlashTravelDefault, 1)}" />
+              </label>
+              <label>Repeats
+                <input id="encoderBacklashRepeats" type="number" min="1" max="5" step="1" value="1" />
+              </label>
+              <label>Speed deg/s
+                <input id="encoderBacklashSpeed" type="number" min="0.1" max="8" step="0.1" value="6" />
+              </label>
+              <label>Settle ms
+                <input id="encoderBacklashSettleMs" type="number" min="100" max="5000" step="50" value="350" />
+              </label>
+            </div>
+            <div class="button-row encoder-button-row">
+              <button type="button" class="ghost" data-encoder-ui-action="arm">Arm</button>
+              <button type="button" class="primary" data-encoder-ui-action="run-backlash-check">Run backlash check</button>
+              <button type="button" class="ghost" data-encoder-ui-action="disarm">Disarm</button>
+            </div>
+            ${renderBacklashChart()}
+          </div>
+        </div>
+        <div id="encoderCalibrationSessionStatus" class="path-summary encoder-session-status"></div>
+      </div>
+      <details class="advanced-block encoder-sweep-block">
+        <summary>
+          <span>Optional calibration sweep</span>
+          <small>Use only when quick calibration needs range verification or nonlinear mapping</small>
+        </summary>
+        <div class="advanced-block-body">
+          <p class="field-help">The sweep preloads backlash once, then captures fit samples from one final approach direction. It is for validation/refinement, not the normal required setup.</p>
+          <div class="encoder-range-grid">
+            <label>Min deg
+              <input id="encoderSweepMin" type="number" step="0.1" value="${format(sweepMinDefault, 1)}" />
+            </label>
+            <label>Max deg
+              <input id="encoderSweepMax" type="number" step="0.1" value="${format(sweepMaxDefault, 1)}" />
+            </label>
+            <label>Step deg
+              <input id="encoderSweepStep" type="number" min="1" max="45" step="1" value="15" />
+            </label>
+            <label>Final approach
+              <select id="encoderSweepApproach">
+                <option value="1" selected>From below / increasing</option>
+                <option value="-1">From above / decreasing</option>
+              </select>
+            </label>
+            <label>Preload deg
+              <input id="encoderSweepPreload" type="number" min="0" max="45" step="0.5" value="${format(defaultSweepPreload, 1)}" />
+            </label>
+              <label>Speed deg/s
+                <input id="encoderSweepSpeed" type="number" min="0.1" max="8" step="0.1" value="6" />
+              </label>
+              <label>Settle ms
+                <input id="encoderSweepSettleMs" type="number" min="100" max="5000" step="50" value="350" />
+              </label>
+            </div>
+            <p class="field-help">Default is increasing-angle calibration. Keep the first sampled point at least the preload amount away from the lower shoulder limit, or choose decreasing approach and keep the top end away from the upper limit.</p>
+          <div class="button-row encoder-action-strip">
+            <button type="button" class="ghost" data-encoder-ui-action="arm">Arm</button>
+            <button type="button" class="primary" data-encoder-ui-action="run-sweep">Run assisted sweep</button>
+            <button type="button" class="danger ghost" data-encoder-ui-action="cancel-sweep">Cancel sweep</button>
+            <button type="button" class="ghost" data-encoder-ui-action="disarm">Disarm</button>
+          </div>
+        </div>
+      </details>
+      <div class="path-summary encoder-correction-guide">
+        <strong>Use encoder after moves</strong>
+        <p>Best-value mode for this robot: normal open-loop move, settle, read output encoder, then apply one slow bounded shoulder correction if the error is above the deadband and below the max delta. Fault threshold only controls when mismatch becomes a fault; it does not increase correction range.</p>
+        <div class="button-row encoder-action-strip">
+          <button type="button" class="primary" data-encoder-ui-action="enable-correction">Validate + enable post-move correction</button>
+          <button type="button" class="danger ghost" data-encoder-ui-action="disable-correction">Disable correction</button>
+        </div>
+        <div class="log-line"><span>Correction</span><code>${escapeHtml(correctionStatus)}</code></div>
+        <div class="log-line"><span>Applies to</span><code>manual endpoint joint moves and Go Home after motion settles</code></div>
+        <div class="log-line"><span>Correction trigger</span><code>above ${format(correction.deadband_deg ?? ENCODER_STANDARD_LIMITS.correction_deadband_deg, 2)} deg, up to ${format(correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg, 2)} deg</code></div>
+      </div>
+      <details class="advanced-block encoder-advanced-block">
+        <summary>
+          <span>Advanced encoder settings</span>
+          <small>Timing, health thresholds, fitted calibration values, and correction gate</small>
+        </summary>
+        <div class="advanced-block-body">
+          <div class="hardware-grid encoder-config-grid">
+            <label>SPI clock Hz
+              <input data-encoder-bus-field="clock_hz" type="number" min="1" step="1000" value="${bus.clock_hz ?? ENCODER_STANDARD_LIMITS.clock_hz}" />
+            </label>
+            <label>Sample interval ms
+              <input data-encoder-bus-field="sample_interval_ms" type="number" min="10" step="10" value="${bus.sample_interval_ms ?? ENCODER_STANDARD_LIMITS.sample_interval_ms}" />
+            </label>
+            <label>Freshness timeout ms
+              <input data-encoder-axis-field="freshness_timeout_ms" type="number" min="1" step="10" value="${axis.freshness_timeout_ms ?? ENCODER_STANDARD_LIMITS.freshness_timeout_ms}" />
+            </label>
+            <label>Maximum noise deg
+              <input data-encoder-axis-field="max_noise_deg" type="number" min="0" step="0.01" value="${axis.max_noise_deg ?? ENCODER_STANDARD_LIMITS.max_noise_deg}" />
+            </label>
+            <label>Settle delay ms
+              <input data-encoder-verification-field="settle_delay_ms" type="number" min="0" step="10" value="${verification.settle_delay_ms ?? ENCODER_STANDARD_LIMITS.settle_delay_ms}" />
+            </label>
+            <label>Stable samples
+              <input data-encoder-verification-field="required_stable_samples" type="number" min="1" step="1" value="${verification.required_stable_samples ?? ENCODER_STANDARD_LIMITS.required_stable_samples}" />
+            </label>
+            <label>Warning threshold deg
+              <input data-encoder-verification-field="warning_tolerance_deg" type="number" min="0.01" step="0.1" value="${verification.warning_tolerance_deg ?? ENCODER_STANDARD_LIMITS.warning_tolerance_deg}" />
+            </label>
+            <label>Fault threshold deg (fault only)
+              <input data-encoder-verification-field="fault_tolerance_deg" type="number" min="0.01" step="0.1" value="${verification.fault_tolerance_deg ?? ENCODER_STANDARD_LIMITS.fault_tolerance_deg}" />
+            </label>
+            <label>Hysteresis deg
+              <input data-encoder-verification-field="hysteresis_deg" type="number" min="0" step="0.05" value="${verification.hysteresis_deg ?? ENCODER_STANDARD_LIMITS.hysteresis_deg}" />
+            </label>
+            <label>Reference raw deg
+              <input data-encoder-axis-field="reference_raw_deg" type="number" step="0.001" value="${axis.reference_raw_deg ?? 0}" />
+            </label>
+            <label>Reference shoulder deg
+              <input data-encoder-axis-field="reference_joint_deg" type="number" step="0.001" value="${axis.reference_joint_deg ?? 0}" />
+            </label>
+            <label>Direction
+              <select data-encoder-axis-field="direction_sign">
+                <option value="1" ${Number(axis.direction_sign) !== -1 ? "selected" : ""}>Normal (+)</option>
+                <option value="-1" ${Number(axis.direction_sign) === -1 ? "selected" : ""}>Inverted (-)</option>
+              </select>
+            </label>
+            <label>Sensor turns / joint turn
+              <input data-encoder-axis-field="sensor_turns_per_joint_turn" type="number" min="0.000001" step="0.0001" value="${axis.sensor_turns_per_joint_turn ?? 1}" />
+            </label>
+            <label class="toggle-label compact-toggle">
+              <input data-encoder-verification-field="require_encoder" type="checkbox" ${verification.require_encoder ? "checked" : ""} />
+              <span>Fault if readback is unavailable</span>
+            </label>
+            <label>Correction deadband deg
+              <input data-encoder-correction-field="deadband_deg" type="number" min="0" step="0.05" value="${correction.deadband_deg ?? ENCODER_STANDARD_LIMITS.correction_deadband_deg}" />
+            </label>
+            <label>Correction max delta deg (movement cap)
+              <input data-encoder-correction-field="max_delta_deg" type="number" min="0.01" step="0.05" value="${correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg}" />
+            </label>
+            <label>Correction speed deg/s
+              <input data-encoder-correction-field="speed_deg_s" type="number" min="0.1" step="0.1" value="${correction.speed_deg_s ?? 2}" />
+            </label>
+            <label>Correction attempts
+              <input data-encoder-correction-field="max_attempts" type="number" min="1" step="1" value="${correction.max_attempts ?? 2}" />
+            </label>
+            <label>Correction validation ID
+              <input value="${correction.validation_id || "none"}" readonly />
+            </label>
+          </div>
+          <div class="encoder-callout muted-callout">
+            <strong>Correction is enabled by validation, not by editing raw config.</strong>
+            <span>Use the buttons below after calibration. Correction remains bounded post-move only; it is never continuous closed-loop control.</span>
+          </div>
+        </div>
+      </details>
+      <details class="advanced-block encoder-manual-block">
+        <summary>
+          <span>Manual two-reference calibration</span>
+          <small>Fallback workflow when you do not want the app to move the shoulder automatically</small>
+        </summary>
+        <div class="advanced-block-body">
+          <p class="field-help">Manual capture is disarmed-only. Move the shoulder yourself, enter the real shoulder angle above, then capture each reference.</p>
+          <div class="button-row encoder-action-strip">
+            <button type="button" data-encoder-ui-action="move-shoulder">Move shoulder to angle</button>
+          </div>
+        <div class="button-row">
+          <button type="button" class="primary" data-encoder-action="start">Start + capture reference 1</button>
+          <button type="button" data-encoder-action="capture">Capture reference</button>
+          <button type="button" data-encoder-action="validate">Validate</button>
+          <button type="button" data-encoder-action="commit">Commit calibration</button>
+        </div>
+        </div>
+      </details>
+      </div>
+    `;
+    renderEncoderStatus();
   }
 }
 
@@ -1707,9 +3013,16 @@ function renderHardwareStatus(robotState = state.robotState) {
   const axisText = (robotState.hardware_axis_states || []).map((value, index) => `J${index + 1}:${value}`).join(" ");
   const change = robotState.config_change || {};
   const categories = Array.isArray(change.categories) ? change.categories.join(", ") : "";
+  const capabilities = robotState.controller_capabilities || {};
+  const controllerText = robotState.simulation
+    ? "simulation"
+    : capabilities.raw
+      ? `protocol ${capabilities.protocol || "?"}, encoder config ${capabilities.encoder_config ? "supported" : "unsupported"}`
+      : "not advertised";
   elements.hardwareStatus.innerHTML = `
     <div class="log-line"><span>Coverage</span><code>${robotState.hardware_mode || "simulated"} (${robotState.hardware_enabled_axes || "0000"})</code></div>
     <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
+    <div class="log-line"><span>Controller</span><code>${controllerText}</code></div>
     <div class="log-line"><span>Axes</span><code>${axisText || "-"}</code></div>
     <div class="log-line"><span>Message</span><code>${robotState.config_sync_message || "-"}</code></div>
     <div class="log-line"><span>Last config impact</span><code>${categories || "none"}</code></div>
@@ -1930,7 +3243,7 @@ function taskSettingsPayload() {
       require_robot_coordinates: true,
     },
     ordering: {
-      policy: "nearest_to_safe",
+      policy: "nearest_to_home",
       color_priority: [],
     },
     missing_drop_zone_policy: elements.missingDropzonePolicySelect?.value || "error",
@@ -1986,7 +3299,7 @@ function applyTaskSettingsControls() {
   };
   setValue(elements.executionStrategySelect, defaults.execution_strategy || "closed_loop");
   setValue(elements.cycleConfirmationSelect, defaults.cycle_confirmation || "automatic");
-  setValue(elements.objectSelectionPolicySelect, "nearest_to_safe");
+  setValue(elements.objectSelectionPolicySelect, "nearest_to_home");
   setValue(elements.maxObjectsInput, defaults.max_objects ?? 10);
   setValue(elements.minConfidenceInput, filters.min_confidence ?? 0);
   setValue(elements.colorPriorityInput, "");
@@ -2051,7 +3364,10 @@ function renderSetupChecklist() {
 }
 
 function colorStatusBadge(color, profile, zones) {
-  if (!profile?.drop_zone || !zones[profile.drop_zone]) {
+  if (profile?.drop_zone && !zones[profile.drop_zone]) {
+    return `<span class="missing-badge">Missing/deleted</span>`;
+  }
+  if (!profile?.drop_zone) {
     return `<span class="missing-badge">Needs destination</span>`;
   }
   return `<span class="saved-badge">Ready</span>`;
@@ -2060,12 +3376,24 @@ function colorStatusBadge(color, profile, zones) {
 function zoneOptionsHtml(selected = "") {
   const zones = availableTaskDestinations();
   const options = [`<option value="">Choose Position Library record</option>`];
+  if (selected && !zones[selected]) {
+    options.push(`<option value="${escapeHtml(selected)}" selected>Missing/deleted: ${escapeHtml(selected)}</option>`);
+  }
   Object.keys(zones).sort().forEach((name) => {
     const label = zones[name]?.label || name;
     const sourceSuffix = zones[name]?.source === "position_library" ? "" : " (legacy destination)";
     options.push(`<option value="${escapeHtml(name)}" ${name === selected ? "selected" : ""}>${escapeHtml(label)}${sourceSuffix}</option>`);
   });
   return options.join("");
+}
+
+function taskDestinationSummary(profile, zones) {
+  const destinationId = profile?.drop_zone || "";
+  if (!destinationId) return "no destination assigned";
+  const destination = zones[destinationId];
+  if (!destination) return `missing/deleted: ${destinationId}`;
+  const label = destination.label || destinationId;
+  return label === destinationId ? destinationId : `${label} (${destinationId})`;
 }
 
 function renderColorPresetMapping() {
@@ -2099,6 +3427,7 @@ function renderColorPresetMapping() {
       elements.includeColorsSelect.appendChild(option);
     }
     const detectedCount = state.latestDetections.filter((detection) => detectionColor(detection) === color).length;
+    const destinationSummary = taskDestinationSummary(profile, zones);
     return `
       <div class="color-map-row" data-color-row="${color}">
         <label class="toggle-label compact-toggle">
@@ -2110,7 +3439,7 @@ function renderColorPresetMapping() {
         </select>
         <div class="color-map-title">
           <strong>${detectedCount ? `${detectedCount} detected` : "Configured"}</strong>
-          <small>${profile.drop_zone || "no destination assigned"}</small>
+          <small>${escapeHtml(destinationSummary)}</small>
         </div>
         ${colorStatusBadge(color, profile, zones)}
       </div>
@@ -2445,6 +3774,12 @@ async function refreshDiagnostics(options = {}) {
   }
   const enc = robotState.encoder_angles_deg || [];
   const err = robotState.encoder_errors_deg || [];
+  const shoulderEvidence = robotState.encoder_evidence?.[1] || {};
+  const mismatch = robotState.encoder_mismatch || {};
+  const correction = robotState.correction_state || {};
+  const correctionGate = mismatch.correction_status
+    ? `${mismatch.correction_status}${mismatch.correction_skip_reason ? `: ${mismatch.correction_skip_reason}` : ""}`
+    : "not evaluated";
   const pending = robotState.pending_motion || {};
   const diagnostics = robotState.motion_diagnostics || {};
   const configChange = robotState.config_change || {};
@@ -2478,6 +3813,13 @@ async function refreshDiagnostics(options = {}) {
     <div class="log-line"><span>Encoders</span><code>${robotState.encoder_available || "0000"}</code></div>
     <div class="log-line"><span>Encoder angles</span><code>${enc.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
     <div class="log-line"><span>Encoder errors</span><code>${err.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
+    <div class="log-line"><span>Measured shoulder live</span><code>${escapeHtml(encoderMeasuredText(shoulderEvidence, { precision: 3 }))}</code></div>
+    <div class="log-line"><span>Raw shoulder sensor</span><code>${escapeHtml(encoderRawText(shoulderEvidence, { precision: 3 }))}</code></div>
+    <div class="log-line"><span>Shoulder sample quality</span><code>${escapeHtml(encoderSampleQualityText(shoulderEvidence))}</code></div>
+    <div class="log-line"><span>Shoulder mismatch</span><code>${mismatch.error_deg == null ? mismatch.status || "not checked" : `${mismatch.status || "checked"} / ${format(mismatch.error_deg, 3)} deg`}</code></div>
+    <div class="log-line"><span>Correction gate</span><code>${escapeHtml(correctionGate)}</code></div>
+    <div class="log-line"><span>Correction transaction</span><code>${escapeHtml(correction.state || "idle")}${correction.transaction_id && correction.transaction_id !== "none" ? ` / ${escapeHtml(correction.transaction_id)}` : ""}</code></div>
+    ${renderEncoderLiveChart(robotState)}
     <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
   `;
   if (events) {
@@ -2653,6 +3995,13 @@ function renderTaskSummary(sequence, preview) {
   const warnings = taskPreview.warnings || [];
   const normalized = taskPreview.normalized_settings || {};
   const bindings = taskPreview.bindings || preview?.task_bindings || {};
+  const cameraClearCheck = taskPreview.camera_clear_check || {};
+  const cameraClearPosition = taskPreview.camera_clear_position || "-";
+  const cameraClearStatus = cameraClearCheck.ok === false
+    ? `blocked: ${cameraClearCheck.error || "not plannable"}`
+    : cameraClearCheck.ok
+      ? `checked${cameraClearCheck.trajectory?.duration_s != null ? `, ${format(cameraClearCheck.trajectory.duration_s)} s` : ""}`
+      : "-";
   const calibrationApplied = Array.isArray(preview?.calibration)
     && preview.calibration.some((item) => item.applied);
   const orientation = normalized.orientation_policy === "fixed"
@@ -2666,6 +4015,7 @@ function renderTaskSummary(sequence, preview) {
     <div class="log-line"><span>Strategy</span><code>${taskPreview.strategy || sequence?.strategy || "-"}</code></div>
     <div class="log-line"><span>Between objects</span><code>${normalized.cycle_confirmation === "confirm_each_object" ? "pause for operator" : "automatic"}</code></div>
     <div class="log-line"><span>Objects</span><code>${taskPreview.selected_objects?.length || sequence?.object_count || 0}</code></div>
+    <div class="log-line"><span>Camera clear</span><code>${escapeHtml(cameraClearPosition)} / ${escapeHtml(cameraClearStatus)}</code></div>
     <div class="log-line"><span>TCP Z</span><code>pick ${format(normalized.pickup_z_mm)} / drop ${format(normalized.dropoff_z_mm)} mm</code></div>
     <div class="log-line"><span>Orientation</span><code>${orientation}</code></div>
     <div class="log-line"><span>Detection snapshot</span><code>${bindings.detection_snapshot_id || "-"}</code></div>
@@ -3439,6 +4789,7 @@ function renderTcpCalibration() {
   const workspace = summary.workspace || {};
   const freshness = summary.freshness || {};
   const activation = summary.activation || {};
+  const activationWarnings = activation.warnings || [];
   const coverage = summary.coverage || result?.coverage || {};
   const reference = summary.context?.measurement_reference || state.config?.calibration?.measurement_reference || {};
   const samples = Array.isArray(profile.samples) ? profile.samples : [];
@@ -3500,6 +4851,7 @@ function renderTcpCalibration() {
     <div class="log-line"><span>Diagnostics</span><code>${diagnostics.join(" | ") || "No fitted diagnostics yet."}</code></div>
     <div class="log-line"><span>Coverage</span><code>XY ${format(coverage.xy_span_mm, 1)} mm · Z ${format(coverage.z_span_mm, 1)} mm · Phi ${format(coverage.phi_span_deg, 1)}°</code></div>
     <div class="log-line"><span>Activation gate</span><code>${activation.eligible ? "eligible" : (activation.reasons || ["fit and validate first"]).join("; ")}</code></div>
+    <div class="log-line"><span>Manual warnings</span><code>${activationWarnings.join("; ") || "-"}</code></div>
   `;
 
   if (elements.tcpCalibrationPhysicalMetrics) {
@@ -3752,7 +5104,7 @@ async function saveManualTcpCalibrationOffsets() {
   const payload = await postJson("/api/kinematics-calibration/manual-offsets", {
     reach_offset_mm: reachOffset,
     z_offset_mm: zOffset,
-    enabled: Boolean(elements.tcpCalEnableInput.checked),
+    enabled: true,
   });
   if (!payload.ok) {
     elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Manual offset error</span><code>${escapeHtml(payload.error || "failed")}</code></div>`;
@@ -4015,6 +5367,19 @@ function setIkTargetFromFk(fk) {
   Object.entries(values).forEach(([key, value]) => setIkTargetValue(key, value, false));
 }
 
+function setIkTargetFromRequestedTarget(target = {}) {
+  const values = {
+    x: target.x_mm,
+    y: target.y_mm,
+    z: target.z_mm,
+    phi: target.phi_deg,
+  };
+  Object.entries(values).forEach(([key, value]) => {
+    if (Number.isFinite(Number(value))) setIkTargetValue(key, Number(value), false);
+  });
+  state.ikUserEdited = true;
+}
+
 function ikAutoPhiEnabled() {
   return Boolean(elements.ikAutoPhiToggle?.checked);
 }
@@ -4219,7 +5584,25 @@ function normalizeJointAngles(values) {
   return angles.every(Number.isFinite) ? angles : null;
 }
 
+function taskPreviewFocusStep(preview = state.latestPreview) {
+  if (!preview?.task_bindings) return null;
+  const executionSteps = preview?.trajectory?.execution_steps;
+  if (!Array.isArray(executionSteps)) return null;
+  return (
+    executionSteps.find((step) => String(step?.label || "").trim().toLowerCase() === "pickup") ||
+    executionSteps.find((step) => String(step?.label || "").trim().toLowerCase() === "above pickup") ||
+    null
+  );
+}
+
 function previewEndpointAngles(preview = state.latestPreview) {
+  const taskFocusWaypoints = taskPreviewFocusStep(preview)?.trajectory?.waypoints;
+  const taskFocusEndpoint =
+    Array.isArray(taskFocusWaypoints) && taskFocusWaypoints.length
+      ? taskFocusWaypoints[taskFocusWaypoints.length - 1]
+      : null;
+  const taskFocusAngles = normalizeJointAngles(taskFocusEndpoint);
+  if (taskFocusAngles) return taskFocusAngles;
   const waypoints = preview?.trajectory?.waypoints;
   const lastWaypoint = Array.isArray(waypoints) && waypoints.length ? waypoints[waypoints.length - 1] : null;
   return normalizeJointAngles(lastWaypoint) || normalizeJointAngles(preview?.ik?.selected?.angles_deg);
@@ -4241,7 +5624,7 @@ function syncJointControls(robotState = state.robotState) {
   const targets = jointControlAngles(robotState);
   if (!targets) return;
   const reported = normalizeJointAngles(robotState?.reported_angles_deg) || targets;
-  syncJointInputs(targets, reported);
+  syncJointInputs(targets, reported, robotState);
 }
 
 function releaseJointControlIntent() {
@@ -4258,17 +5641,25 @@ function releaseJointControlIntent() {
   state.liveTargetQueued = false;
 }
 
-function syncJointInputs(targets, reported) {
+function syncJointInputs(targets, reported, robotState = state.robotState) {
   targets.forEach((angle, index) => {
     const slider = elements.jointControls.querySelector(`.joint-slider[data-index="${index}"]`);
     const input = elements.jointControls.querySelector(`.angle-input[data-index="${index}"]`);
     const targetLabel = $(`#target-${index}`);
     const reportedLabel = $(`#reported-${index}`);
+    const measuredLabel = $(`#measured-${index}`);
     if (!slider || !input || !targetLabel || !reportedLabel) return;
     if (document.activeElement !== slider) slider.value = angle;
     if (document.activeElement !== input) input.value = format(angle, 1);
     targetLabel.textContent = `${format(angle, 1)} deg`;
     reportedLabel.textContent = `${format(reported[index], 1)} deg`;
+    if (measuredLabel) {
+      const evidence = robotState?.encoder_evidence?.[index];
+      measuredLabel.textContent = encoderMeasuredText(evidence, { precision: 1, rawFallback: index === 1 });
+      measuredLabel.title = index === 1
+        ? `Latest shoulder encoder readback: ${encoderSampleQualityText(evidence)}`
+        : `Measurement authority: ${encoderEvidenceHealthText(evidence)}`;
+    }
   });
 }
 
@@ -4361,13 +5752,18 @@ function renderTaskExecution(robotState = state.robotState) {
   const candidates = execution.candidate_objects || [];
   const ignored = execution.ignored_objects || [];
   const warnings = execution.warnings || [];
+  const terminalDetail = execution.terminal_reason || execution.phase || "-";
   if (!localStatusIsNewer) {
-    elements.taskStatus.textContent = `${execution.status}: ${execution.phase || "-"}`;
+    elements.taskStatus.textContent =
+      execution.status === "failed"
+        ? `Failed: ${terminalDetail}`
+        : `${execution.status}: ${execution.phase || "-"}`;
     renderWorkflowStepper(execution.status);
   }
   elements.taskRunMonitor.innerHTML = `
+    ${execution.status === "failed" ? `<div class="task-run-failure"><strong>Task failed</strong><span>${escapeHtml(terminalDetail)}</span><small>${step.label ? `Stopped at ${escapeHtml(step.label)}` : "No motion step completed."}</small></div>` : ""}
     <div class="task-run-grid">
-      <div class="run-metric"><span>Status</span><strong>${execution.status}</strong><small>${execution.terminal_reason || execution.phase || "-"}</small></div>
+      <div class="run-metric"><span>Status</span><strong>${escapeHtml(execution.status)}</strong><small>${escapeHtml(terminalDetail)}</small></div>
       <div class="run-metric"><span>Completed</span><strong>${execution.completed_count || 0}</strong><small>remaining ${execution.remaining_count ?? "-"}</small></div>
       <div class="run-metric"><span>Current</span><strong>${current.color || "-"}</strong><small>${current.detection_id || current.drop_zone || "-"}</small></div>
       <div class="run-metric"><span>Step</span><strong>${step.index && step.total ? `${step.index}/${step.total}` : "-"}</strong><small>${step.label || "-"}</small></div>
@@ -4827,10 +6223,11 @@ function renderState(robotState) {
   );
   if (previewIsStale || localIntentIsStale) {
     const staleProgramPreview = state.latestPreview?.mode === "program" && state.latestPreview?.source !== "task";
+    const preserveRequestedIkTarget = state.ikUserEdited;
     invalidatePendingIkPreview();
     releaseJointControlIntent();
     clearViewPreview();
-    state.ikUserEdited = false;
+    state.ikUserEdited = preserveRequestedIkTarget;
     if (staleProgramPreview) {
       state.programPreviewRevision = null;
       state.programLastEditReason = "The robot pose changed after preview";
@@ -4886,6 +6283,7 @@ function renderState(robotState) {
   elements.portStatus.textContent = robotState.serial_port || (robotState.simulation ? "simulation" : "-");
   elements.hardwareArmToggle.checked = Boolean(robotState.hardware_armed);
   renderHardwareStatus(robotState);
+  renderEncoderStatus(robotState);
   renderSetupChecklist();
   const hardwareSuffix = robotState.simulation ? "" : ` - ${robotState.hardware_mode}/${robotState.config_sync_status}`;
   elements.statusPill.textContent = robotState.last_error || `${robotState.motion_state}${robotState.live_motion_enabled ? " - live real" : ""}${hardwareSuffix}`;
@@ -4925,21 +6323,28 @@ function renderPreview(preview) {
 
   candidates.forEach((candidate) => {
     const item = document.createElement("div");
-    item.className = `candidate ${candidate.valid ? "" : "invalid"} ${candidate.branch === ik.selected_branch ? "selected" : ""}`;
+    const continuityOk = candidate.configuration_continuous !== false;
+    const selectable = candidate.valid && continuityOk;
+    const selectedAngles = ik.selected?.angles_deg || [];
+    const isSelected =
+      candidate.angles_deg?.length === selectedAngles.length &&
+      candidate.angles_deg.every((angle, index) => Math.abs(Number(angle) - Number(selectedAngles[index])) < 1e-6);
+    item.className = `candidate ${selectable ? "" : "invalid"} ${isSelected ? "selected" : ""}`;
     const candidatePhi = candidate.target_phi_deg ?? candidate.fk?.tool_phi_deg;
     const phiDetail = candidate.auto_phi
       ? `chosen phi ${format(candidatePhi, 2)} deg`
       : `phi ${format(candidate.phi_error_deg, 3)} deg`;
     item.innerHTML = `
       <div class="candidate-title">
-        <span>${candidate.branch.replace("_", " ")}</span>
-        <span>${candidate.valid ? "valid" : "rejected"}</span>
+        <span>${escapeHtml(candidate.solution_family || candidate.branch.replace("_", " "))}</span>
+        <span>${selectable ? "valid" : continuityOk ? "IK rejected" : "motion blocked"}</span>
       </div>
       <div class="angle-list">
         ${candidate.angles_deg.map((angle, index) => `<div><span>J${index + 1}</span><strong>${format(angle, 2)} deg</strong></div>`).join("")}
       </div>
       <div class="small">FK error ${format(candidate.position_error_mm, 3)} mm, ${phiDetail}</div>
-      <div class="small">${candidate.reasons?.join("; ") || ""}</div>
+      <div class="small">Joint travel ${format(candidate.joint_travel_deg, 1)} deg · base ${format(candidate.base_delta_deg, 1)} deg · tool winding ${format(candidate.tool_winding_delta_deg, 1)} deg</div>
+      <div class="small">${escapeHtml([...(candidate.reasons || []), ...(candidate.continuity_violations || [])].join("; "))}</div>
     `;
     elements.ikCandidateList.appendChild(item);
   });
@@ -4964,7 +6369,16 @@ function renderPreview(preview) {
 
   if (state.previewAngles) state.view.setPreviewAngles(state.previewAngles);
 
-  const target = preview.target?.x_mm !== undefined ? preview.target : trajectory.cartesian_waypoints?.[trajectory.cartesian_waypoints.length - 1];
+  const taskFocusCartesian = taskPreviewFocusStep(preview)?.trajectory?.cartesian_waypoints;
+  const taskFocusTarget =
+    Array.isArray(taskFocusCartesian) && taskFocusCartesian.length
+      ? taskFocusCartesian[taskFocusCartesian.length - 1]
+      : null;
+  const target =
+    taskFocusTarget ||
+    (preview.target?.x_mm !== undefined
+      ? preview.target
+      : trajectory.cartesian_waypoints?.[trajectory.cartesian_waypoints.length - 1]);
   state.view.setTargetPoint(target || null);
   state.view.setPathWaypoints(
     trajectory.waypoints || [],
@@ -4993,8 +6407,9 @@ function renderPreviewFailure(payload) {
   const ik = payload.ik || {};
   (ik.candidates || []).forEach((candidate) => {
     const item = document.createElement("div");
-    item.className = `candidate ${candidate.valid ? "" : "invalid"}`;
-    item.textContent = `${candidate.branch}: ${candidate.reasons?.join("; ") || "not selected"}`;
+    const reasons = [...(candidate.reasons || []), ...(candidate.continuity_violations || [])];
+    item.className = "candidate invalid";
+    item.textContent = `${candidate.solution_family || candidate.branch}: ${reasons.join("; ") || "not selected"}`;
     elements.ikCandidateList.appendChild(item);
   });
   if (!elements.ikCandidateList.children.length) {
@@ -5031,14 +6446,18 @@ async function previewIkPath() {
   elements.executeIkBtn.disabled = true;
 
   try {
+    const requestedTarget = ikTargetPayload();
     const payload = await postJson("/api/path/preview", {
-      target: ikTargetPayload(),
+      target: requestedTarget,
       mode: elements.ikModeSelect.value,
       branch: elements.ikBranchSelect.value,
       settings: pathSettings(),
     });
     if (requestSeq === state.ikPreviewWantedSeq) {
-      if (payload.ok) renderPreview(payload.preview);
+      if (payload.ok) {
+        renderPreview(payload.preview);
+        setIkTargetFromRequestedTarget(requestedTarget);
+      }
       else renderPreviewFailure(payload);
     }
   } finally {
@@ -5094,9 +6513,13 @@ async function executePreview() {
   if (payload.ok) {
     releaseJointControlIntent();
     state.previewId = null;
+    state.latestPreview = null;
     state.previewAngles = null;
+    state.previewBasePoseRevision = null;
     state.taskPreviewId = null;
-    state.ikUserEdited = false;
+    // Keep the requested Cartesian target in the controls. Reported FK may
+    // reflect the calibration-adjusted model command rather than that target.
+    state.ikUserEdited = true;
   } else if (/preview|configuration|model|start pose/i.test(payload.error || "")) {
     clearViewPreview();
     elements.previewStatus.textContent = payload.error || "Preview is stale";
@@ -6629,6 +8052,7 @@ function readCalibrationPayload() {
     },
     geometry: readGeometryPayload(),
     tools: readToolsPayload(),
+    encoders: readEncoderPayload(),
     joints,
     color_profiles: taskColorProfiles(),
     task_destinations: {
@@ -7275,6 +8699,29 @@ function bindActions() {
   });
   elements.geometryPresetEditor?.addEventListener("click", (event) => {
     if (event.target?.id === "applyGeometryPresetBtn") applyGeometryPresetToDhDraft();
+  });
+  elements.encoderCalibration?.addEventListener("input", markEncoderDraftDirty);
+  elements.encoderCalibration?.addEventListener("change", markEncoderDraftDirty);
+  elements.encoderCalibration?.addEventListener("click", (event) => {
+    const uiButton = event.target.closest("[data-encoder-ui-action]");
+    if (uiButton) {
+      event.preventDefault();
+      if (uiButton.disabled) return;
+      uiButton.disabled = true;
+      void handleEncoderUiAction(uiButton.dataset.encoderUiAction).finally(() => {
+        uiButton.disabled = false;
+      });
+      return;
+    }
+    const actionButton = event.target.closest("[data-encoder-action]");
+    if (actionButton) {
+      event.preventDefault();
+      if (actionButton.disabled) return;
+      actionButton.disabled = true;
+      void handleEncoderCalibrationAction(actionButton.dataset.encoderAction).finally(() => {
+        actionButton.disabled = false;
+      });
+    }
   });
   elements.syncHardwareBtn.addEventListener("click", async () => {
     const saved = await saveAllSettings();

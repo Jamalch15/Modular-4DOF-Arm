@@ -105,6 +105,80 @@ def status_line_for(angles):
     )
 
 
+def trajectory_responses_for(trajectory, target, start):
+    points = main.trajectory_upload_points(trajectory)
+    return (
+        [status_line_for(start), status_line_for(start), f"OK command=TRAJ_BEGIN count={len(points)}"]
+        + [f"OK command=TRAJ_POINT index={index}" for index in range(len(points))]
+        + [f"OK command=TRAJ_START count={len(points)} duration={points[-1][0]:.3f}", status_line_for(target)]
+    )
+
+
+def test_encoder_telemetry_is_separate_from_planning_pose(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 12,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    main.state.update_reported_pose(
+        [0.0, 20.0, 20.0, 0.0],
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
+    pose_revision = main.state.pose_revision
+    telemetry_revision = main.state.encoder_telemetry_revision
+
+    main.apply_controller_status(
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=setpose "
+        "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=1365 ea2=30.0 em2=30.0 eage2=20 enoise2=0.05 ef2=OK "
+        "j1=0 j2=20 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+
+    assert main.state.reported_angles_deg == pytest.approx([0.0, 20.0, 20.0, 0.0])
+    assert main.state.estimated_angles_deg == pytest.approx([0.0, 20.0, 20.0, 0.0])
+    assert main.state.measured_angles_deg[1] == pytest.approx(30.0)
+    assert main.state.measurement_valid_mask == "0100"
+    assert main.state.pose_revision == pose_revision
+    assert main.state.encoder_telemetry_revision > telemetry_revision
+
+
+def test_legacy_encoder_status_cannot_establish_whole_pose_authority(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.update_reported_pose(
+        config.home_pose,
+        source="unknown",
+        known_pose=False,
+        force_revision=True,
+    )
+
+    main.apply_controller_status(
+        "STATUS state=idle homed=0 known=1 pose_source=mixed armed=0 "
+        "hw=mixed enabled=1100 enc=0100 e2=30.0 "
+        "j1=0 j2=20 j3=20 j4=0 closed_loop=readback fault=OK"
+    )
+
+    assert main.state.known_pose is False
+    assert main.state.pose_known_mask == "0000"
+    assert main.state.pose_source == "unknown"
+    assert main.state.reported_angles_deg[1] == pytest.approx(20.0)
+
+
 def test_robot_state_pose_revision_changes_only_for_authoritative_transitions():
     state = RobotState(
         joint_names=["j1", "j2", "j3", "j4"],
@@ -211,14 +285,16 @@ def test_go_home_simulation_moves_on_first_request(monkeypatch):
     assert main.state.pose_source == "simulation"
 
 
-def test_go_home_hardware_sends_one_move_command_and_no_home_command(monkeypatch):
+def test_go_home_hardware_sends_timed_trajectory_and_no_home_command(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     monkeypatch.setattr(main, "config", config)
     monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "example-test-config")
     away = moved_pose(config, amount=5.0)
     target_status = status_line_for(config.home_pose)
+    settings = main.home_path_settings(None)
+    trajectory = main.build_joint_trajectory(away, config.home_pose, config.joints, settings)
     fake = FakeSerial(
-        responses=["OK command=MOVEJ hw=mixed", target_status],
+        responses=trajectory_responses_for(trajectory, config.home_pose, away),
         repeated_status=target_status,
     )
     monkeypatch.setattr(main, "serial_client", fake)
@@ -255,9 +331,10 @@ def test_go_home_hardware_sends_one_move_command_and_no_home_command(monkeypatch
     ]
 
     assert response["command"] == "home"
-    assert response["preview"]["motion_contract"]["controller_command"]["command"] == "MOVEJ"
-    assert response["preview"]["motion_contract"]["controller_command"]["uses_planned_timestamps"] is False
-    assert len([line for line in movement_commands if line.startswith("MOVEJ")]) == 1
+    assert response["preview"]["motion_contract"]["controller_command"]["command"] == "TRAJ"
+    assert response["preview"]["motion_contract"]["controller_command"]["uses_planned_timestamps"] is True
+    assert len([line for line in movement_commands if line.startswith("TRAJ START")]) == 1
+    assert not any(line.startswith("MOVEJ") for line in movement_commands)
     assert not any(line.startswith("HOME") for line in movement_commands)
     assert main.state.reported_angles_deg == pytest.approx(config.home_pose)
     assert main.state.homed is False

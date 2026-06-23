@@ -925,6 +925,7 @@ def _activation_assessment(
     thresholds: dict[str, Any],
 ) -> dict[str, Any]:
     reasons: list[str] = []
+    warnings: list[str] = []
     manual_offsets = result.get("source") == "manual_offsets"
     validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
     validation_count = int(validation.get("after_model", {}).get("count") or 0)
@@ -945,11 +946,14 @@ def _activation_assessment(
     reach_bound = float(thresholds.get("maximum_enable_reach_correction_mm", xy_bound))
     z_bound = float(thresholds.get("maximum_enable_z_correction_mm", 20.0))
     if model_type == "radial_reach_z_offset" and abs(reach_offset) > reach_bound:
-        reasons.append(f"radial reach offset exceeds the {reach_bound:.1f} mm automatic-enable limit")
+        message = f"radial reach offset exceeds the {reach_bound:.1f} mm automatic-enable limit"
+        (warnings if manual_offsets else reasons).append(message)
     if model_type != "radial_reach_z_offset" and float(np.linalg.norm(xy_offset)) > xy_bound:
-        reasons.append(f"XY offset exceeds the {xy_bound:.1f} mm automatic-enable limit")
+        message = f"XY offset exceeds the {xy_bound:.1f} mm automatic-enable limit"
+        (warnings if manual_offsets else reasons).append(message)
     if abs(z_offset) > z_bound:
-        reasons.append(f"Z offset exceeds the {z_bound:.1f} mm automatic-enable limit")
+        message = f"Z offset exceeds the {z_bound:.1f} mm automatic-enable limit"
+        (warnings if manual_offsets else reasons).append(message)
     if model_type == "radial_reach_z_offset" and not manual_offsets and not coverage.get("adequate_for_radial_reach"):
         reasons.append("fit sample radius is too close to the base axis for radial reach correction")
     if model_type != "radial_reach_z_offset" and float(np.linalg.norm(xy_matrix - np.identity(2))) > 0.20:
@@ -959,6 +963,7 @@ def _activation_assessment(
     return {
         "eligible": not reasons,
         "reasons": reasons,
+        "warnings": warnings,
         "validation_sample_count": validation_count,
         "minimum_validation_samples": minimum_validation,
         "correction_magnitude": {

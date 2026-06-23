@@ -152,7 +152,7 @@ def test_compact_ik_task_vector_matches_full_forward_kinematics():
 
 
 def test_inverse_kinematics_round_trips_reachable_target():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     original = [15.0, 35.0, 30.0, -20.0]
     target_fk = forward_kinematics(original, config.links)
 
@@ -177,7 +177,7 @@ def test_inverse_kinematics_round_trips_reachable_target():
 
 
 def test_differential_ik_step_moves_tcp_in_requested_direction():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     start = [0.0, 45.0, 25.0, -20.0]
     start_fk = forward_kinematics(start, config.links)
 
@@ -231,7 +231,7 @@ def test_differential_ik_step_blocks_lateral_drift_direction():
 
 
 def test_inverse_kinematics_returns_seed_candidates():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     target = {"x_mm": -80.0, "y_mm": 180.0, "z_mm": 190.0, "phi_deg": 0.0}
 
     result = inverse_kinematics(target, config.links, config.joints, config.home_pose)
@@ -242,7 +242,7 @@ def test_inverse_kinematics_returns_seed_candidates():
 
 
 def test_inverse_kinematics_rejects_unreachable_target():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
 
     result = inverse_kinematics(
         {"x_mm": 2000.0, "y_mm": 0.0, "z_mm": 2000.0, "phi_deg": 0.0},
@@ -369,7 +369,7 @@ def test_inverse_kinematics_auto_phi_refines_valid_limit_analytic_seed():
 
 
 def test_inverse_kinematics_filters_joint_limits():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     target_fk = forward_kinematics([180.0, 60.0, -40.0, 10.0], config.links)
 
     result = inverse_kinematics(
@@ -415,6 +415,66 @@ def test_ik_continuity_scores_actual_commanded_joint_travel_not_wrapped_distance
     assert _candidate_continuity_error(numerically_short, current) == approx(90.0)
     assert _candidate_continuity_error(wrapped_long, current) == approx(270.0)
     assert _candidate_continuity_error(numerically_short, current) < _candidate_continuity_error(wrapped_long, current)
+
+
+def test_auto_ik_prefers_forward_posture_and_keeps_backward_as_fallback():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3, a_mm=0.0)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7, a_mm=160.0)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5, a_mm=142.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_height_mm=157.3,
+        upper_arm_mm=160.0,
+        forearm_mm=142.5,
+        wrist_mm=41.99,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+            home_deg=90.0 if index == 1 else 0.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+    current = [0.0, 90.0, 0.0, 0.0]
+
+    both_postures = inverse_kinematics(
+        {"x_mm": -180.0, "y_mm": 40.0, "z_mm": 80.0, "phi_auto": True},
+        links,
+        joints,
+        current,
+    )
+    fallback_only = inverse_kinematics(
+        {"x_mm": 0.0, "y_mm": 180.0, "z_mm": 80.0, "phi_auto": True},
+        links,
+        joints,
+        current,
+    )
+
+    assert both_postures["ok"]
+    assert {candidate["posture"] for candidate in both_postures["candidates"] if candidate["valid"]} == {
+        "forward",
+        "backward",
+    }
+    assert both_postures["selected"]["posture"] == "forward"
+    assert both_postures["selected"]["radial_reach_mm"] > 0.0
+    assert fallback_only["ok"]
+    assert fallback_only["selected"]["posture"] == "backward"
+    assert fallback_only["selected"]["radial_reach_mm"] < 0.0
 
 
 def test_inverse_kinematics_auto_prefers_continuity_over_tiny_error_difference():
@@ -511,7 +571,7 @@ def test_analytic_seed_handles_non_forward_tcp_offset_components():
 
 
 def test_forward_kinematics_exposes_dh_frames():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
 
     result = forward_kinematics(config.home_pose, config.links)
 

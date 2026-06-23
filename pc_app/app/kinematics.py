@@ -323,13 +323,17 @@ def dh_segment_points(joint_angles_deg: list[float], links: LinkConfig) -> list[
     return segments
 
 
-def _tool_phi_from_angles(joint_angles_deg: list[float], links: LinkConfig) -> float:
+def _tool_phi_unwrapped_from_angles(joint_angles_deg: list[float], links: LinkConfig) -> float:
     rows = _rows(links)
     pitch = 0.0
     for row in rows:
         if row.joint_index > 0:
             pitch += float(joint_angles_deg[row.joint_index]) * row.direction_sign + row.zero_offset_deg
-    return _normalize_deg(pitch)
+    return pitch
+
+
+def _tool_phi_from_angles(joint_angles_deg: list[float], links: LinkConfig) -> float:
+    return _normalize_deg(_tool_phi_unwrapped_from_angles(joint_angles_deg, links))
 
 
 def _tool_tcp_offset_vector(links: LinkConfig) -> np.ndarray:
@@ -694,6 +698,135 @@ def _clamp_to_limits(angles_deg: list[float], joints: list[JointConfig]) -> list
     return [max(joint.min_deg, min(joint.max_deg, angle)) for angle, joint in zip(angles_deg, joints, strict=True)]
 
 
+def _candidate_radial_reach_mm(
+    target: dict[str, float],
+    angles_deg: list[float],
+    links: LinkConfig,
+) -> float | None:
+    rows = _rows(links)
+    if not rows or rows[0].joint_index >= len(angles_deg):
+        return None
+    base_theta = radians(_row_theta(rows[0], angles_deg))
+    # Robot x/y map to DH y/-x. This projection is the same signed planar
+    # radial coordinate used by the analytic two-link solve. Positive is the
+    # normal forward-working posture; negative folds the chain behind the
+    # rotated base.
+    dh_x = -float(target["y_mm"])
+    dh_y = float(target["x_mm"])
+    return dh_x * cos(base_theta) + dh_y * sin(base_theta)
+
+
+def _candidate_posture(candidate: dict[str, Any]) -> str:
+    radial_reach = candidate.get("radial_reach_mm")
+    if radial_reach is None:
+        return "unknown"
+    return "forward" if float(radial_reach) >= -1e-6 else "backward"
+
+
+def _candidate_posture_penalty(candidate: dict[str, Any]) -> int:
+    return 1 if _candidate_posture(candidate) == "backward" else 0
+
+
+def _candidate_posture_fields(
+    target: dict[str, float],
+    angles_deg: list[float],
+    links: LinkConfig,
+) -> dict[str, Any]:
+    radial_reach = _candidate_radial_reach_mm(target, angles_deg, links)
+    return {
+        "radial_reach_mm": radial_reach,
+        "posture": (
+            "unknown"
+            if radial_reach is None
+            else "forward"
+            if radial_reach >= -1e-6
+            else "backward"
+        ),
+    }
+
+
+def _annotate_candidate_continuity(
+    candidate: dict[str, Any],
+    current: list[float],
+    links: LinkConfig,
+    selection_policy: dict[str, Any] | None,
+) -> None:
+    angles = [float(value) for value in candidate.get("angles_deg", [])]
+    if len(angles) != len(current):
+        return
+    deltas = [angle - float(current[index]) for index, angle in enumerate(angles)]
+    weights = list((selection_policy or {}).get("joint_weights") or [2.0, 1.0, 1.0, 1.0])
+    if len(weights) != len(deltas):
+        weights = [1.0 for _ in deltas]
+    candidate_phi_unwrapped = _tool_phi_unwrapped_from_angles(angles, links)
+    current_phi_unwrapped = _tool_phi_unwrapped_from_angles(current, links)
+    posture = _candidate_posture(candidate)
+    elbow_family = str(candidate.get("branch") or "unknown")
+    candidate.update(
+        {
+            "solution_family": f"{posture}:{elbow_family}",
+            "joint_delta_deg": deltas,
+            "joint_travel_deg": sum(abs(delta) for delta in deltas),
+            "weighted_joint_travel": sum(abs(delta) * float(weights[index]) for index, delta in enumerate(deltas)),
+            "max_joint_delta_deg": max((abs(delta) for delta in deltas), default=0.0),
+            "base_delta_deg": abs(deltas[0]) if deltas else 0.0,
+            "tool_phi_unwrapped_deg": candidate_phi_unwrapped,
+            "tool_winding_delta_deg": abs(candidate_phi_unwrapped - current_phi_unwrapped),
+        }
+    )
+
+    violations: list[str] = []
+    policy = selection_policy or {}
+    if policy.get("enabled", False):
+        max_base = float(policy.get("max_base_delta_deg", float("inf")))
+        max_tool_winding = float(policy.get("max_tool_winding_delta_deg", float("inf")))
+        raw_joint_limits = policy.get("max_joint_delta_deg", float("inf"))
+        if isinstance(raw_joint_limits, (list, tuple)):
+            joint_limits = [float(value) for value in raw_joint_limits]
+        else:
+            joint_limits = [float(raw_joint_limits) for _ in deltas]
+        if len(joint_limits) != len(deltas):
+            joint_limits = [float("inf") for _ in deltas]
+        if candidate["base_delta_deg"] > max_base + 1e-9:
+            violations.append(
+                f"base move {candidate['base_delta_deg']:.1f} deg exceeds {max_base:.1f} deg"
+            )
+        if candidate["tool_winding_delta_deg"] > max_tool_winding + 1e-9:
+            violations.append(
+                "tool orientation winding "
+                f"{candidate['tool_winding_delta_deg']:.1f} deg exceeds {max_tool_winding:.1f} deg"
+            )
+        for index, (delta, limit) in enumerate(zip(deltas, joint_limits, strict=True)):
+            if abs(delta) > limit + 1e-9:
+                violations.append(
+                    f"joint {index + 1} move {abs(delta):.1f} deg exceeds {limit:.1f} deg"
+                )
+    candidate["continuity_violations"] = violations
+    candidate["configuration_continuous"] = not violations
+
+
+def _continuity_failure_note(candidates: list[dict[str, Any]]) -> str:
+    rejected = [
+        candidate
+        for candidate in candidates
+        if candidate.get("valid") and candidate.get("continuity_violations")
+    ]
+    if not rejected:
+        return ""
+    best = min(
+        rejected,
+        key=lambda candidate: (
+            len(candidate.get("continuity_violations", [])),
+            float(candidate.get("weighted_joint_travel", float("inf"))),
+        ),
+    )
+    details = "; ".join(best.get("continuity_violations", [])[:3])
+    return (
+        "configuration continuity rejected all IK solutions"
+        + (f"; nearest alternative: {details}" if details else "")
+    )
+
+
 def _solve_from_seed(
     target: dict[str, float],
     links: LinkConfig,
@@ -755,6 +888,8 @@ def _solve_from_seed(
     return {
         "branch": label,
         "angles_deg": angles,
+        **_candidate_posture_fields(target, angles, links),
+        "tool_phi_unwrapped_deg": _tool_phi_unwrapped_from_angles(angles, links),
         "valid": not reasons,
         "reasons": reasons,
         "fk": fk,
@@ -787,6 +922,8 @@ def _candidate_from_angles(
     return {
         "branch": label,
         "angles_deg": angles,
+        **_candidate_posture_fields(target, angles, links),
+        "tool_phi_unwrapped_deg": _tool_phi_unwrapped_from_angles(angles, links),
         "valid": not reasons,
         "reasons": reasons,
         "fk": fk,
@@ -1007,6 +1144,7 @@ def _select_candidate(
     valid_candidates: list[dict[str, Any]],
     current: list[float],
     requested_branch: str,
+    selection_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     notes: list[str] = []
     candidates = valid_candidates
@@ -1014,11 +1152,34 @@ def _select_candidate(
         candidates = [candidate for candidate in candidates if candidate["branch"] == requested_branch]
         if not candidates:
             notes.append(f"requested branch {requested_branch} is not valid")
+    if selection_policy and selection_policy.get("enabled", False):
+        continuous = [candidate for candidate in candidates if candidate.get("configuration_continuous")]
+        if not continuous and candidates:
+            note = _continuity_failure_note(candidates)
+            if note:
+                notes.append(note)
+        candidates = continuous
     if not candidates:
         return None, notes
+    if selection_policy and selection_policy.get("enabled", False):
+        return min(
+            candidates,
+            key=lambda candidate: (
+                (
+                    _candidate_posture_penalty(candidate)
+                    if selection_policy.get("prefer_forward_posture", True)
+                    else 0
+                ),
+                float(candidate.get("weighted_joint_travel", float("inf"))),
+                float(candidate.get("max_joint_delta_deg", float("inf"))),
+                candidate["position_error_mm"],
+                candidate.get("phi_error_deg", 0.0),
+            ),
+        ), notes
     return min(
         candidates,
         key=lambda candidate: (
+            _candidate_posture_penalty(candidate),
             _candidate_continuity_error(candidate, current),
             candidate["position_error_mm"],
             candidate.get("phi_error_deg", 0.0),
@@ -1033,6 +1194,7 @@ def _inverse_kinematics_fixed_phi(
     joints: list[JointConfig],
     current_joints_deg: list[float] | None = None,
     branch: str = "auto",
+    selection_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not all(isfinite(value) for value in pose.values()):
         return {
@@ -1051,9 +1213,21 @@ def _inverse_kinematics_fixed_phi(
         _solve_from_seed(pose, links, joints, seed, label)
         for label, seed in seeds
     ]
+    for candidate in candidates:
+        _annotate_candidate_continuity(
+            candidate,
+            [float(value) for value in current],
+            links,
+            selection_policy,
+        )
     valid_candidates = [candidate for candidate in candidates if candidate["valid"]]
     notes: list[str] = seed_notes.copy()
-    selected, selection_notes = _select_candidate(valid_candidates, [float(value) for value in current], requested_branch)
+    selected, selection_notes = _select_candidate(
+        valid_candidates,
+        [float(value) for value in current],
+        requested_branch,
+        selection_policy,
+    )
     notes.extend(selection_notes)
 
     if selected is None:
@@ -1065,6 +1239,10 @@ def _inverse_kinematics_fixed_phi(
         "candidates": candidates,
         "selected": selected,
         "selected_branch": selected["branch"] if selected else None,
+        "failure_reason": next(
+            (note for note in notes if note.startswith("configuration continuity rejected")),
+            "",
+        ),
         "notes": notes,
     }
 
@@ -1074,14 +1252,31 @@ def _auto_phi_candidate_score(
     current: list[float],
     current_phi_deg: float,
     preferred_phi_deg: float | None = None,
+    selection_policy: dict[str, Any] | None = None,
 ) -> tuple[float, ...]:
     candidate_phi = float(candidate["fk"]["tool_phi_deg"])
     priority = _auto_phi_priority_key(candidate_phi, current_phi_deg, preferred_phi_deg)
     phi_delta = angle_distance_deg(candidate_phi, current_phi_deg)
+    if selection_policy and selection_policy.get("enabled", False):
+        return (
+            priority[0],
+            (
+                _candidate_posture_penalty(candidate)
+                if selection_policy.get("prefer_forward_posture", True)
+                else 0
+            ),
+            float(candidate.get("weighted_joint_travel", float("inf"))),
+            float(candidate.get("max_joint_delta_deg", float("inf"))),
+            priority[1],
+            candidate["position_error_mm"],
+            phi_delta,
+        )
     if preferred_phi_deg is not None and isfinite(preferred_phi_deg):
         preferred_delta = angle_distance_deg(candidate_phi, preferred_phi_deg)
         return (
-            *priority[:2],
+            priority[0],
+            _candidate_posture_penalty(candidate),
+            priority[1],
             preferred_delta,
             _candidate_continuity_error(candidate, current),
             0 if candidate["branch"] == "elbow_down" else 1,
@@ -1089,7 +1284,9 @@ def _auto_phi_candidate_score(
             phi_delta,
         )
     return (
-        *priority[:2],
+        priority[0],
+        _candidate_posture_penalty(candidate),
+        priority[1],
         candidate["position_error_mm"],
         _candidate_continuity_error(candidate, current),
         phi_delta,
@@ -1103,6 +1300,7 @@ def _inverse_kinematics_auto_phi(
     joints: list[JointConfig],
     current_joints_deg: list[float] | None = None,
     branch: str = "auto",
+    selection_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base_pose = {
         "x_mm": float(target.get("x_mm", 0.0)),
@@ -1139,11 +1337,15 @@ def _inverse_kinematics_auto_phi(
     seed_notes: list[str] = []
     searched_phi_values = 0
     best_priority_key: tuple[float, ...] | None = None
+    forward_priority_key: tuple[float, ...] | None = None
 
     for phi in phi_values:
         priority_key = _auto_phi_priority_key(phi, current_phi, preferred_phi)
-        if best_priority_key is not None and priority_key[:2] > best_priority_key[:2]:
-            break
+        if not selection_policy and best_priority_key is not None:
+            if priority_key[0] > best_priority_key[0]:
+                break
+            if forward_priority_key is not None and priority_key[:2] > forward_priority_key[:2]:
+                break
         searched_phi_values += 1
         pose = {
             "x_mm": base_pose["x_mm"],
@@ -1182,6 +1384,12 @@ def _inverse_kinematics_auto_phi(
                 )
             candidate["target_phi_deg"] = phi
             candidate["auto_phi"] = True
+            _annotate_candidate_continuity(
+                candidate,
+                current,
+                links,
+                selection_policy,
+            )
             if candidate["valid"]:
                 valid_candidates.append(candidate)
                 phi_candidates.append(candidate)
@@ -1195,7 +1403,10 @@ def _inverse_kinematics_auto_phi(
                 if candidate["branch"] == requested_branch
             ]
         if selectable_phi_candidates:
-            best_priority_key = priority_key
+            if best_priority_key is None:
+                best_priority_key = priority_key
+            if any(_candidate_posture_penalty(candidate) == 0 for candidate in selectable_phi_candidates):
+                forward_priority_key = priority_key
 
     notes.insert(1, f"searched {searched_phi_values} phi values")
 
@@ -1204,10 +1415,27 @@ def _inverse_kinematics_auto_phi(
         selection_pool = [candidate for candidate in valid_candidates if candidate["branch"] == requested_branch]
         if not selection_pool:
             notes.append(f"requested branch {requested_branch} is not valid")
+    if selection_policy and selection_policy.get("enabled", False):
+        continuous = [
+            candidate
+            for candidate in selection_pool
+            if candidate.get("configuration_continuous")
+        ]
+        if not continuous and selection_pool:
+            note = _continuity_failure_note(selection_pool)
+            if note:
+                notes.append(note)
+        selection_pool = continuous
 
     selected = min(
         selection_pool,
-        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi, preferred_phi),
+        key=lambda candidate: _auto_phi_candidate_score(
+            candidate,
+            current,
+            current_phi,
+            preferred_phi,
+            selection_policy,
+        ),
         default=None,
     )
     if selected is None:
@@ -1216,7 +1444,13 @@ def _inverse_kinematics_auto_phi(
 
     visible_candidates = sorted(
         valid_candidates,
-        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi, preferred_phi),
+        key=lambda candidate: _auto_phi_candidate_score(
+            candidate,
+            current,
+            current_phi,
+            preferred_phi,
+            selection_policy,
+        ),
     )[:12]
     if selected and all(candidate is not selected for candidate in visible_candidates):
         visible_candidates.insert(0, selected)
@@ -1236,6 +1470,10 @@ def _inverse_kinematics_auto_phi(
         "candidates": visible_candidates,
         "selected": selected,
         "selected_branch": selected["branch"] if selected else None,
+        "failure_reason": next(
+            (note for note in notes if note.startswith("configuration continuity rejected")),
+            "",
+        ),
         "notes": notes,
     }
 
@@ -1247,10 +1485,25 @@ def inverse_kinematics(
     current_joints_deg: list[float] | None = None,
     branch: str = "auto",
     tolerance: float = 1e-6,
+    selection_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     del tolerance
     if len(joints) != 4:
         raise ValueError("inverse_kinematics expects four joint configs")
     if _target_requests_auto_phi(target):
-        return _inverse_kinematics_auto_phi(target, links, joints, current_joints_deg, branch)
-    return _inverse_kinematics_fixed_phi(_fixed_phi_pose(target), links, joints, current_joints_deg, branch)
+        return _inverse_kinematics_auto_phi(
+            target,
+            links,
+            joints,
+            current_joints_deg,
+            branch,
+            selection_policy,
+        )
+    return _inverse_kinematics_fixed_phi(
+        _fixed_phi_pose(target),
+        links,
+        joints,
+        current_joints_deg,
+        branch,
+        selection_policy,
+    )

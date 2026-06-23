@@ -1,8 +1,25 @@
 import asyncio
 
+import pytest
+
 import app.main as main
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.kinematics import forward_kinematics
+from app.motion import RateLimitedMotion
 from app.robot_state import MotionState
+
+
+@pytest.fixture(autouse=True)
+def use_committed_example_config(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(
+        main,
+        "limiter",
+        RateLimitedMotion(config, config.home_pose.copy(), config.home_pose.copy()),
+    )
+    yield
+    main.cancel_motion_tasks()
 
 
 class FakeSerial:
@@ -46,10 +63,14 @@ def reset_hardware_state() -> None:
     main.state.hardware_armed = True
     main.state.live_motion_enabled = False
     main.state.known_pose = True
-    main.state.pose_source = "setpose"
+    main.state.update_reported_pose(
+        main.config.home_pose,
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
     main.state.config_sync_status = "synced"
     main.state.motion_state = MotionState.IDLE
-    main.state.reported_angles_deg = main.config.home_pose.copy()
     main.state.target_angles_deg = main.config.home_pose.copy()
     main.state.last_status_line = ""
     main.state.last_controller_response = ""
@@ -63,6 +84,16 @@ def status_line_for(angles, state="idle"):
         f"STATUS state={state} homed=1 known=1 pose_source=setpose armed=1 "
         f"hw=mixed enabled=1100 enc=0000 "
         f"j1={angles[0]} j2={angles[1]} j3={angles[2]} j4={angles[3]} fault=OK"
+    )
+
+
+def trajectory_responses_for(trajectory, target, state="idle", initial_state="idle"):
+    points = main.trajectory_upload_points(trajectory)
+    start = points[0][1]
+    return (
+        [status_line_for(start, initial_state), f"OK command=TRAJ_BEGIN count={len(points)}"]
+        + [f"OK command=TRAJ_POINT index={index}" for index in range(len(points))]
+        + [f"OK command=TRAJ_START count={len(points)} duration={points[-1][0]:.3f}", status_line_for(target, state)]
     )
 
 
@@ -121,6 +152,7 @@ def test_waypoint_path_uses_queued_trajectory_protocol(monkeypatch):
     target[0] += 5.0
     fake = FakeSerial(
         [
+            status_line_for(start),
             "OK command=TRAJ_BEGIN count=2",
             "OK command=TRAJ_POINT index=0",
             "OK command=TRAJ_POINT index=1",
@@ -149,10 +181,12 @@ def test_waypoint_path_uses_queued_trajectory_protocol(monkeypatch):
 
     asyncio.run(main.execute_waypoint_path(preview))
 
-    assert fake.sent[0].startswith("TRAJ BEGIN")
-    assert fake.sent[1].startswith("TRAJ POINT index=0")
-    assert fake.sent[2].startswith("TRAJ POINT index=1")
-    assert fake.sent[3] == "TRAJ START"
+    traj_begin_index = fake.sent.index(next(line for line in fake.sent if line.startswith("TRAJ BEGIN")))
+    assert fake.sent[0] == "STATUS"
+    assert fake.sent[traj_begin_index].startswith("TRAJ BEGIN")
+    assert fake.sent[traj_begin_index + 1].startswith("TRAJ POINT index=0")
+    assert fake.sent[traj_begin_index + 2].startswith("TRAJ POINT index=1")
+    assert fake.sent[traj_begin_index + 3] == "TRAJ START"
     assert not any(line.startswith("MOVEJ") for line in fake.sent)
     assert "STATUS" in fake.sent
     assert main.state.motion_diagnostics["result"] == "reached"
@@ -160,14 +194,11 @@ def test_waypoint_path_uses_queued_trajectory_protocol(monkeypatch):
     assert main.state.motion_diagnostics["motion_contract"]["controller_command"]["uses_planned_timestamps"] is True
 
 
-def test_joint_endpoint_hardware_reports_movej_command_contract(monkeypatch):
+def test_joint_endpoint_hardware_uses_queued_trajectory_contract(monkeypatch):
     reset_hardware_state()
     start = main.config.home_pose.copy()
     target = start.copy()
     target[0] += 1.0
-    fake = FakeSerial(["OK command=MOVEJ hw=mixed"], repeated_status=status_line_for(target))
-    monkeypatch.setattr(main, "serial_client", fake)
-    monkeypatch.setattr(main, "hardware_ready_for_motion", lambda: (True, ""))
     trajectory = main.build_joint_trajectory(
         start,
         target,
@@ -179,6 +210,9 @@ def test_joint_endpoint_hardware_reports_movej_command_contract(monkeypatch):
             "per_joint_accel_deg_s2": [20.0, 20.0, 20.0, 20.0],
         },
     )
+    fake = FakeSerial(trajectory_responses_for(trajectory, target), repeated_status=status_line_for(target))
+    monkeypatch.setattr(main, "serial_client", fake)
+    monkeypatch.setattr(main, "hardware_ready_for_motion", lambda: (True, ""))
     preview = {
         "id": "endpoint-contract",
         "source": "test",
@@ -196,10 +230,16 @@ def test_joint_endpoint_hardware_reports_movej_command_contract(monkeypatch):
     asyncio.run(main.execute_joint_endpoint_move(preview))
 
     contract = main.state.motion_diagnostics["motion_contract"]["controller_command"]
-    assert fake.sent[0].startswith("MOVEJ")
-    assert contract["command"] == "MOVEJ"
-    assert contract["uses_planned_timestamps"] is False
-    assert any("global speed and acceleration" in note for note in contract["notes"])
+    traj_begin_index = fake.sent.index(next(line for line in fake.sent if line.startswith("TRAJ BEGIN")))
+    assert fake.sent[0] == "STATUS"
+    assert fake.sent[traj_begin_index].startswith("TRAJ BEGIN")
+    assert fake.sent[traj_begin_index + 1].startswith("TRAJ POINT index=0")
+    assert any(line == "TRAJ START" for line in fake.sent)
+    assert not any(line.startswith("MOVEJ") for line in fake.sent)
+    assert contract["command"] == "TRAJ"
+    assert contract["uses_planned_timestamps"] is True
+    assert main.state.motion_diagnostics["uploaded_waypoint_count"] == len(main.trajectory_upload_points(trajectory))
+    assert any("planned waypoint timestamps" in note for note in contract["notes"])
 
 
 def test_wait_for_hardware_target_times_out_when_status_never_reaches_idle(monkeypatch):
@@ -216,6 +256,35 @@ def test_wait_for_hardware_target_times_out_when_status_never_reaches_idle(monke
     assert not ok
     assert "timeout" in message
     assert "STATUS" in fake.sent
+
+
+def test_trajectory_upload_rejects_busy_controller_before_traj_begin(monkeypatch):
+    reset_hardware_state()
+    start = main.config.home_pose.copy()
+    target = start.copy()
+    target[0] += 1.0
+    trajectory = main.build_joint_trajectory(
+        start,
+        target,
+        main.config.joints,
+        {"global_speed_deg_s": 10.0, "global_accel_deg_s2": 20.0},
+    )
+    fake = FakeSerial([status_line_for(start, state="moving")])
+    monkeypatch.setattr(main, "serial_client", fake)
+    preview = {
+        "id": "busy-controller",
+        "source": "test",
+        "mode": "joint",
+        "settings": {"global_speed_deg_s": 10.0, "global_accel_deg_s2": 20.0},
+        "trajectory": trajectory,
+    }
+
+    asyncio.run(main.execute_joint_endpoint_move(preview))
+
+    assert fake.sent == ["STATUS"]
+    assert "controller is still moving" in main.state.last_error
+    assert main.state.motion_diagnostics["result"] == "failed"
+    assert not any(line.startswith("TRAJ BEGIN") for line in fake.sent)
 
 
 def test_motion_diagnostics_records_progress_and_actual_tcp_samples():

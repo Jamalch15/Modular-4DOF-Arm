@@ -61,8 +61,8 @@ display problems, and aggressive corrective jumps.
 
 There are also separate but related risks:
 
-- `POST /api/home` currently starts a `MOVEJ` through `set_targets()` and then
-  sends a second `HOME` command to hardware.
+- `POST /api/home` now routes through normal planned trajectory execution and
+  does not send the firmware `HOME` command.
 - Firmware marks `homed=true` when a home target is accepted, not when a
   physical homing procedure or completed move proves the pose.
 - There are no real homing switches in the current documented scope, so
@@ -206,8 +206,8 @@ The active full-arm path is:
 
 The PC remains the planner:
 
-- endpoint joint moves use `MOVEJ`;
-- multi-waypoint paths use `TRAJ`;
+- previewed joint-space moves and multi-waypoint paths use `TRAJ`;
+- `MOVEJ` remains available as a low-level endpoint command;
 - live Cartesian jog uses short synchronized `SERVOJ` segments;
 - the firmware enforces joint range and arming, but most high-level safety and
   planning remain on the PC.
@@ -784,7 +784,7 @@ the current pose.
    - do not allow it to establish an unknown pose;
    - do not set `homed` merely because the command was accepted.
 3. Send one hardware command per operation:
-   - either route Go Home through normal `MOVEJ`/trajectory execution;
+   - route Go Home through normal planned trajectory execution;
    - or make `HOME` the sole controller command with the same diagnostics;
    - do not do both.
 4. Mark completion only after controller idle and target tolerance.

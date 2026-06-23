@@ -3,13 +3,14 @@ from dataclasses import replace
 from pytest import approx
 
 from app.config import EXAMPLE_CONFIG_PATH, load_config
-from app.kinematics import forward_kinematics
+from app.kinematics import forward_kinematics, inverse_kinematics
 from app.motion import (
     RateLimitedMotion,
     build_joint_trajectory,
     build_linear_cartesian_trajectory,
     build_program_trajectory,
     has_reached_target,
+    ik_selection_policy,
 )
 
 
@@ -180,6 +181,30 @@ def test_linear_cartesian_trajectory_generates_waypoints():
     assert trajectory["waypoint_count"] > 2
 
 
+def test_linear_cartesian_trajectory_zero_distance_is_noop():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    start = [0.0, 40.0, 25.0, -15.0]
+    fk = forward_kinematics(start, config.links)
+
+    trajectory = build_linear_cartesian_trajectory(
+        start,
+        {
+            "x_mm": fk["x_mm"],
+            "y_mm": fk["y_mm"],
+            "z_mm": fk["z_mm"],
+            "phi_deg": fk["tool_phi_deg"],
+        },
+        config.links,
+        config.joints,
+        {"cartesian_step_mm": 5.0, "waypoint_rate_hz": 10.0},
+    )
+
+    assert trajectory["ok"]
+    assert trajectory["waypoint_count"] == 1
+    assert trajectory["duration_s"] == 0.0
+    assert trajectory["waypoints"] == [[float(value) for value in start]]
+
+
 def test_linear_cartesian_trajectory_rejects_unreachable_waypoint():
     config = load_config()
     target = {"x_mm": 2000.0, "y_mm": 0.0, "z_mm": 2000.0, "phi_deg": 0.0}
@@ -324,6 +349,267 @@ def test_program_joint_transfer_can_change_automatic_ik_branch():
 
     assert trajectory["ok"], trajectory.get("errors")
     assert len(trajectory["segments"]) == 2
+
+
+def test_pick_lift_and_cross_base_dropoff_rejects_configuration_flip():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3, a_mm=0.0)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7, a_mm=160.0)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5, a_mm=142.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_height_mm=157.3,
+        upper_arm_mm=160.0,
+        forearm_mm=142.5,
+        wrist_mm=41.99,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+            home_deg=90.0 if index == 1 else 0.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+    target = lambda x, y, z: {
+        "x_mm": x,
+        "y_mm": y,
+        "z_mm": z,
+        "phi_auto": True,
+    }
+
+    trajectory = build_program_trajectory(
+        [0.0, 90.0, 0.0, 0.0],
+        [
+            {"type": "cartesian", "mode": "joint", "label": "above pickup", "target": target(-180.0, 40.0, 80.0)},
+            {"type": "cartesian", "mode": "linear", "label": "pickup", "target": target(-180.0, 40.0, 25.0)},
+            {"type": "cartesian", "mode": "linear", "label": "lift", "target": target(-180.0, 40.0, 80.0)},
+            {"type": "cartesian", "mode": "joint", "label": "above dropoff", "target": target(150.0, 40.0, 80.0)},
+        ],
+        links,
+        joints,
+        {"cartesian_step_mm": 10.0, "waypoint_rate_hz": 12.0},
+        "auto",
+    )
+
+    assert trajectory["ok"] is False
+    assert "configuration continuity rejected all IK solutions" in trajectory["errors"][0]
+
+
+def test_pick_lift_and_same_side_dropoff_stays_continuous():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3, a_mm=0.0)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7, a_mm=160.0)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5, a_mm=142.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_height_mm=157.3,
+        upper_arm_mm=160.0,
+        forearm_mm=142.5,
+        wrist_mm=41.99,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+            home_deg=90.0 if index == 1 else 0.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+    target = lambda x, y, z: {
+        "x_mm": x,
+        "y_mm": y,
+        "z_mm": z,
+        "phi_auto": True,
+    }
+
+    trajectory = build_program_trajectory(
+        [0.0, 90.0, 0.0, 0.0],
+        [
+            {"type": "cartesian", "mode": "joint", "label": "above pickup", "target": target(-180.0, 40.0, 80.0)},
+            {"type": "cartesian", "mode": "linear", "label": "pickup", "target": target(-180.0, 40.0, 25.0)},
+            {"type": "cartesian", "mode": "linear", "label": "lift", "target": target(-180.0, 40.0, 80.0)},
+            {"type": "cartesian", "mode": "joint", "label": "above dropoff", "target": target(-150.0, 40.0, 80.0)},
+        ],
+        links,
+        joints,
+        {"cartesian_step_mm": 10.0, "waypoint_rate_hz": 12.0},
+        "auto",
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    transfer = next(
+        step["trajectory"]
+        for step in trajectory["execution_steps"]
+        if step["label"] == "above dropoff"
+    )
+    deltas = [
+        abs(end - start)
+        for start, end in zip(transfer["waypoints"][0], transfer["waypoints"][-1], strict=True)
+    ]
+    assert max(deltas) < 35.0
+
+
+def test_near_base_target_matrix_never_accepts_a_configuration_flip():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3, a_mm=0.0)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7, a_mm=160.0)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5, a_mm=142.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_height_mm=157.3,
+        upper_arm_mm=160.0,
+        forearm_mm=142.5,
+        wrist_mm=41.99,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+            home_deg=90.0 if index == 1 else 0.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+    current = [-97.49, 53.33, -63.18, -90.15]
+    policy = ik_selection_policy({})
+    accepted = 0
+    rejected = 0
+
+    for x_mm in range(-200, 201, 50):
+        for y_mm in (20.0, 40.0, 80.0, 120.0, 180.0):
+            result = inverse_kinematics(
+                {
+                    "x_mm": float(x_mm),
+                    "y_mm": y_mm,
+                    "z_mm": 80.0,
+                    "phi_auto": True,
+                    "preferred_phi_deg": -100.0,
+                },
+                links,
+                joints,
+                current,
+                "auto",
+                selection_policy=policy,
+            )
+            if result["ok"]:
+                accepted += 1
+                selected = result["selected"]
+                assert selected["configuration_continuous"] is True
+                assert selected["continuity_violations"] == []
+                assert selected["base_delta_deg"] <= policy["max_base_delta_deg"]
+                assert selected["tool_winding_delta_deg"] <= policy["max_tool_winding_delta_deg"]
+            else:
+                rejected += 1
+
+    assert accepted > 0
+    assert rejected > 0
+
+    cross_base = inverse_kinematics(
+        {"x_mm": 150.0, "y_mm": 40.0, "z_mm": 80.0, "phi_auto": True},
+        links,
+        joints,
+        current,
+        "auto",
+        selection_policy=policy,
+    )
+    same_side = inverse_kinematics(
+        {"x_mm": -150.0, "y_mm": 40.0, "z_mm": 80.0, "phi_auto": True},
+        links,
+        joints,
+        current,
+        "auto",
+        selection_policy=policy,
+    )
+
+    assert cross_base["ok"] is False
+    assert "configuration continuity rejected" in cross_base["failure_reason"]
+    assert same_side["ok"] is True
+
+
+def test_linear_cross_base_move_fails_instead_of_flipping_orientation_in_place():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3, a_mm=0.0)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7, a_mm=160.0)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5, a_mm=142.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_height_mm=157.3,
+        upper_arm_mm=160.0,
+        forearm_mm=142.5,
+        wrist_mm=41.99,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+            home_deg=90.0 if index == 1 else 0.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+
+    trajectory = build_linear_cartesian_trajectory(
+        [-97.49, 53.33, -63.18, -90.15],
+        {"x_mm": 150.0, "y_mm": 40.0, "z_mm": 80.0, "phi_auto": True},
+        links,
+        joints,
+        {"cartesian_step_mm": 10.0},
+        "auto",
+    )
+
+    assert trajectory["ok"] is False
+    assert "configuration continuity rejected" in trajectory["errors"][0]
 
 
 def test_program_trajectory_rejects_missing_joint_angles():

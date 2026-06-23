@@ -1,9 +1,24 @@
 from fastapi.testclient import TestClient
-from pytest import approx
+from pytest import approx, fixture
 
 import app.main as main
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.kinematics import forward_kinematics
+from app.motion import RateLimitedMotion
 from app.robot_state import MotionState
+
+
+@fixture(autouse=True)
+def use_committed_example_config(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(
+        main,
+        "limiter",
+        RateLimitedMotion(config, config.home_pose.copy(), config.home_pose.copy()),
+    )
+    yield
+    main.cancel_motion_tasks()
 
 
 def test_hardware_motion_requires_known_pose():

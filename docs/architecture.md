@@ -70,8 +70,8 @@ These are current implementation boundaries, not final architecture decisions:
 
 - Preview-only IK target editing changes the ghost arm and planned target. It does not command motion.
 - Live joint jogging sends rate-limited joint targets.
-- Live Cartesian jogging treats the X/Y/Z/Phi faders as velocity controls, solves one bounded local differential-IK step per update, and streams joint velocities with `JOGV`.
-- Planned Cartesian or program execution builds a complete path and uses the timed `TRAJ` protocol.
+- Live Cartesian jogging treats the X/Y/Z/Phi faders as velocity controls, solves one bounded local differential-IK step per update, and streams synchronized short joint-position segments with `SERVOJ`.
+- Planned joint-space, Cartesian, or program execution builds a complete path and uses the timed `TRAJ` protocol.
 
 A rejected Cartesian jog sample is not retained as a hidden endpoint target. The next smaller or reverse sample is solved from the last accepted jog seed, while releasing the control sends `JOG STOP` and clears the stream state.
 

@@ -1,9 +1,7 @@
 #include <Arduino.h>
 #include <math.h>
 
-#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
 #include <SPI.h>
-#endif
 
 // Full-arm ESP32-S3 controller for the PC dashboard protocol.
 // Current assumption: the PC plans trajectories and uploads timed joint points.
@@ -35,30 +33,12 @@ constexpr float kDefaultMin[kJointCount] = {-160.0f, -30.0f, -120.0f, -120.0f};
 constexpr float kDefaultMax[kJointCount] = {160.0f, 115.0f, 120.0f, 120.0f};
 const char* kDefaultNames[kJointCount] = {"base", "shoulder", "elbow", "wrist"};
 
-#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
-#ifndef ARM_ENCODER_SCK_PIN
-#define ARM_ENCODER_SCK_PIN 18
-#endif
-#ifndef ARM_ENCODER_MISO_PIN
-#define ARM_ENCODER_MISO_PIN 19
-#endif
-#ifndef ARM_ENCODER_MOSI_PIN
-#define ARM_ENCODER_MOSI_PIN 23
-#endif
-#ifndef ARM_ENCODER_BASE_CS_PIN
-#define ARM_ENCODER_BASE_CS_PIN 5
-#endif
-#ifndef ARM_ENCODER_SHOULDER_CS_PIN
-#define ARM_ENCODER_SHOULDER_CS_PIN 7
-#endif
 constexpr uint32_t kEncoderSpiClockHz = 1000000;
-constexpr uint16_t kAs5048ReadAngleCommand = 0xFFFF;
+constexpr uint16_t kAs5048AngleAddress = 0x3FFF;
+constexpr uint16_t kAs5048DiagnosticsAddress = 0x3FFD;
 constexpr uint16_t kAs5048ClearErrorCommand = 0x4001;
 constexpr uint16_t kAs5048AngleMask = 0x3FFF;
 constexpr uint16_t kAs5048ErrorFlag = 0x4000;
-constexpr int kEncoderCsPins[kJointCount] = {ARM_ENCODER_BASE_CS_PIN, ARM_ENCODER_SHOULDER_CS_PIN, -1, -1};
-SPISettings encoderSpiSettings(kEncoderSpiClockHz, MSBFIRST, SPI_MODE1);
-#endif
 
 enum class ControllerState {
   Idle,
@@ -137,6 +117,50 @@ struct ToolConfig {
   bool activeHigh = true;
 };
 
+struct EncoderBusConfig {
+  bool enabled = false;
+  int sckPin = 12;
+  int misoPin = 13;
+  int mosiPin = 14;
+  uint32_t clockHz = kEncoderSpiClockHz;
+  uint32_t sampleIntervalMs = 100;
+};
+
+struct EncoderConfig {
+  bool received = false;
+  bool enabled = false;
+  int jointIndex = -1;
+  int csPin = -1;
+  float referenceRawDeg = 0.0f;
+  float referenceJointDeg = 0.0f;
+  int directionSign = 1;
+  float wrapPeriodDeg = 360.0f;
+  float sensorTurnsPerJointTurn = 1.0f;
+  uint32_t freshnessTimeoutMs = 500;
+  float maxNoiseDeg = 0.5f;
+  bool calibrationValidated = false;
+  char mounting[20] = "joint_output";
+  char calibrationId[40] = "none";
+};
+
+struct EncoderPolicy {
+  char mode[24] = "diagnostic";
+  char verificationPolicy[16] = "diagnostic";
+  uint32_t settleDelayMs = 300;
+  int requiredStableSamples = 3;
+  float warningToleranceDeg = 2.0f;
+  float faultToleranceDeg = 5.0f;
+  float hysteresisDeg = 0.25f;
+  bool requireEncoder = false;
+  bool correctionEnabled = false;
+  char validationId[40] = "none";
+  float maxCorrectionDeltaDeg = 1.0f;
+  float correctionJointLimitMarginDeg = 2.0f;
+  float correctionSpeedDegS = 2.0f;
+  float correctionAccelDegS2 = 10.0f;
+  int maxCorrectionAttempts = 2;
+};
+
 struct StepperRuntime {
   long currentSteps = 0;
   long targetSteps = 0;
@@ -157,6 +181,22 @@ struct ToolRuntime {
   int attachedPwmPin = -1;
   int gpioPin = -1;
   bool gpioActiveHigh = true;
+};
+
+struct EncoderRuntime {
+  bool available = false;
+  bool valid = false;
+  uint16_t rawCount = 0;
+  float rawAngleDeg = 0.0f;
+  float measuredJointDeg = 0.0f;
+  float noiseDeg = 0.0f;
+  float previousRawAngleDeg = 0.0f;
+  bool hasPrevious = false;
+  uint16_t diagnostics = 0;
+  uint32_t lastAttemptMs = 0;
+  uint32_t lastValidMs = 0;
+  int consecutiveValidSamples = 0;
+  char flags[48] = "none";
 };
 
 struct TrajectoryPoint {
@@ -188,9 +228,16 @@ JointConfig joints[kJointCount];
 JointConfig draftJoints[kJointCount];
 ToolConfig activeTool;
 ToolConfig draftTool;
+EncoderBusConfig encoderBus;
+EncoderBusConfig draftEncoderBus;
+EncoderConfig encoderConfigs[kJointCount];
+EncoderConfig draftEncoderConfigs[kJointCount];
+EncoderPolicy encoderPolicy;
+EncoderPolicy draftEncoderPolicy;
 StepperRuntime stepperRuntime[kJointCount];
 ServoRuntime servoRuntime[kJointCount];
 ToolRuntime toolRuntime;
+EncoderRuntime encoderRuntime[kJointCount];
 TrajectoryRuntime trajectoryRuntime;
 PositionStreamRuntime positionStreamRuntime;
 float currentJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
@@ -215,15 +262,27 @@ char poseSourceText[24] = "unknown";
 float toolValue = 0.0f;
 bool encoderAvailable[kJointCount] = {false, false, false, false};
 float encoderAnglesDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+float correctionBiasDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+char correctionState[20] = "idle";
+char correctionTransactionId[40] = "none";
+int correctionAttempts = 0;
+bool correctionActive = false;
+int correctionJointIndex = -1;
+float pendingCorrectionBiasDeltaDeg = 0.0f;
+long correctionStartSteps = 0;
+long lastCorrectionEmittedSteps = 0;
+float lastCorrectionRequestedDeltaDeg = 0.0f;
+unsigned long correctionStartUs = 0;
 String commandLine;
 uint32_t lastStatusMs = 0;
+bool encoderSpiStarted = false;
 
 float clampFloat(float value, float minValue, float maxValue) {
   return min(max(value, minValue), maxValue);
 }
 
 bool validPinOrUnused(int pin) {
-  return pin == -1 || (pin >= 0 && pin <= 48);
+  return pin == -1 || ((pin >= 0 && pin <= 21) || (pin >= 26 && pin <= 48));
 }
 
 ActuatorType parseActuator(const String& value) {
@@ -311,11 +370,23 @@ ToolConfig defaultTool() {
   return tool;
 }
 
+EncoderConfig defaultEncoder(int index) {
+  EncoderConfig encoder;
+  encoder.jointIndex = index;
+  encoder.received = false;
+  encoder.enabled = false;
+  encoder.csPin = -1;
+  return encoder;
+}
+
 void resetDraftConfig() {
   for (int i = 0; i < kJointCount; i++) {
     draftJoints[i] = defaultJoint(i);
+    draftEncoderConfigs[i] = defaultEncoder(i);
   }
   draftTool = defaultTool();
+  draftEncoderBus = EncoderBusConfig();
+  draftEncoderPolicy = EncoderPolicy();
 }
 
 void clearFaultText() {
@@ -471,6 +542,128 @@ String validationErrorForTool(const ToolConfig& tool) {
   return "";
 }
 
+String validationErrorForEncoders(
+    const EncoderBusConfig& bus,
+    EncoderConfig configs[kJointCount],
+    const EncoderPolicy& policy,
+    JointConfig jointConfigs[kJointCount],
+    const ToolConfig& tool) {
+  if (!bus.enabled) {
+    if (policy.correctionEnabled) {
+      return "encoder_correction_requires_bus";
+    }
+    return "";
+  }
+  if (!validPinOrUnused(bus.sckPin) || !validPinOrUnused(bus.misoPin) || !validPinOrUnused(bus.mosiPin) ||
+      bus.sckPin < 0 || bus.misoPin < 0 || bus.mosiPin < 0) {
+    return "encoder_bus_invalid_pins";
+  }
+  if (bus.clockHz == 0 || bus.sampleIntervalMs == 0) {
+    return "encoder_bus_invalid_timing";
+  }
+
+  int enabledCount = 0;
+  for (int i = 0; i < kJointCount; i++) {
+    const EncoderConfig& encoder = configs[i];
+    if (!encoder.enabled) {
+      continue;
+    }
+    enabledCount++;
+    if (i != 1 || encoder.jointIndex != 1) {
+      return "only_shoulder_encoder_supported";
+    }
+    if (!validPinOrUnused(encoder.csPin) || encoder.csPin < 0) {
+      return "shoulder_encoder_invalid_cs";
+    }
+    if (encoder.directionSign != -1 && encoder.directionSign != 1) {
+      return "shoulder_encoder_invalid_sign";
+    }
+    if (encoder.wrapPeriodDeg <= 0.0f || encoder.sensorTurnsPerJointTurn <= 0.0f ||
+        encoder.freshnessTimeoutMs == 0 || encoder.maxNoiseDeg < 0.0f) {
+      return "shoulder_encoder_invalid_calibration";
+    }
+    if (encoder.referenceJointDeg < jointConfigs[i].minDeg || encoder.referenceJointDeg > jointConfigs[i].maxDeg) {
+      return "shoulder_encoder_reference_out_of_range";
+    }
+  }
+  if (enabledCount > 1) {
+    return "only_one_shoulder_encoder_supported";
+  }
+  if (policy.warningToleranceDeg <= 0.0f || policy.faultToleranceDeg <= policy.warningToleranceDeg ||
+      policy.requiredStableSamples < 1) {
+    return "encoder_policy_invalid_thresholds";
+  }
+  if (policy.correctionEnabled) {
+    const EncoderConfig& shoulder = configs[1];
+    if (!shoulder.enabled || !shoulder.calibrationValidated || strcmp(shoulder.mounting, "joint_output") != 0 ||
+        jointConfigs[1].actuator != ActuatorType::Stepper || !jointConfigs[1].enabled ||
+        strcmp(policy.validationId, "none") == 0 || policy.maxCorrectionDeltaDeg <= 0.0f ||
+        policy.correctionJointLimitMarginDeg < 0.0f ||
+        policy.correctionSpeedDegS <= 0.0f || policy.correctionAccelDegS2 <= 0.0f ||
+        policy.maxCorrectionAttempts < 1) {
+      return "encoder_correction_prerequisites_missing";
+    }
+  }
+
+  int pins[24] = {};
+  String labels[24];
+  int pinCount = 0;
+  auto claimPin = [&](int pin, const String& label) -> String {
+    if (pin < 0) {
+      return "";
+    }
+    for (int index = 0; index < pinCount; index++) {
+      if (pins[index] == pin) {
+        return "gpio_" + String(pin) + "_conflict_" + labels[index] + "_" + label;
+      }
+    }
+    if (pinCount < 24) {
+      pins[pinCount] = pin;
+      labels[pinCount] = label;
+      pinCount++;
+    }
+    return "";
+  };
+
+  for (int i = 0; i < kJointCount; i++) {
+    if (!jointConfigs[i].enabled) {
+      continue;
+    }
+    String error;
+    if (jointConfigs[i].actuator == ActuatorType::Stepper) {
+      error = claimPin(jointConfigs[i].stepper.stepPin, String(jointConfigs[i].name) + "_step");
+      if (error.length() == 0) {
+        error = claimPin(jointConfigs[i].stepper.dirPin, String(jointConfigs[i].name) + "_dir");
+      }
+      if (error.length() == 0) {
+        error = claimPin(jointConfigs[i].stepper.enablePin, String(jointConfigs[i].name) + "_enable");
+      }
+    } else if (jointConfigs[i].actuator == ActuatorType::Servo) {
+      error = claimPin(jointConfigs[i].servo.pwmPin, String(jointConfigs[i].name) + "_pwm");
+    }
+    if (error.length() > 0) {
+      return error;
+    }
+  }
+  String error = claimPin(bus.sckPin, "encoder_sck");
+  if (error.length() == 0) {
+    error = claimPin(bus.misoPin, "encoder_miso");
+  }
+  if (error.length() == 0) {
+    error = claimPin(bus.mosiPin, "encoder_mosi");
+  }
+  if (error.length() == 0 && configs[1].enabled) {
+    error = claimPin(configs[1].csPin, "shoulder_encoder_cs");
+  }
+  if (error.length() == 0 && tool.type == ToolType::ServoGripper) {
+    error = claimPin(tool.pwmPin, "tool_pwm");
+  }
+  if (error.length() == 0 && tool.type == ToolType::Electromagnet) {
+    error = claimPin(tool.gpioPin, "tool_gpio");
+  }
+  return error;
+}
+
 String classifyConfig(JointConfig config[kJointCount]) {
   for (int i = 0; i < kJointCount; i++) {
     config[i].axisState = AxisState::Simulated;
@@ -521,14 +714,20 @@ String encoderBits() {
   return bits;
 }
 
+String encoderValidBits() {
+  String bits;
+  const uint32_t nowMs = millis();
+  for (int i = 0; i < kJointCount; i++) {
+    const bool fresh =
+        encoderRuntime[i].valid &&
+        encoderRuntime[i].lastValidMs > 0 &&
+        nowMs - encoderRuntime[i].lastValidMs <= encoderConfigs[i].freshnessTimeoutMs;
+    bits += fresh ? "1" : "0";
+  }
+  return bits;
+}
+
 const char* poseSourceName() {
-  const bool encoderPose = encoderAvailable[0] || encoderAvailable[1];
-  if (encoderPose && knownPose) {
-    return "mixed";
-  }
-  if (encoderPose) {
-    return "encoder";
-  }
   return poseSourceText;
 }
 
@@ -539,15 +738,17 @@ void markOpenLoopEstimate() {
 }
 
 bool hasKnownPoseAuthority() {
-  return knownPose || encoderAvailable[0] || encoderAvailable[1];
+  return knownPose;
 }
 
 const char* closedLoopModeName() {
-#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
-  return "readback";
-#else
-  return "off";
-#endif
+  if (!encoderBus.enabled) {
+    return "off";
+  }
+  if (encoderPolicy.correctionEnabled) {
+    return "bounded_correction";
+  }
+  return encoderPolicy.mode;
 }
 
 bool configHasInvalidAxis() {
@@ -566,7 +767,9 @@ float stepperStepsPerDegree(int index) {
 }
 
 long jointDegToSteps(int index, float jointDeg) {
-  const float signedDeg = (jointDeg + joints[index].zeroOffsetDeg) * static_cast<float>(joints[index].directionSign);
+  const float physicalJointDeg = jointDeg + correctionBiasDeg[index];
+  const float signedDeg =
+      (physicalJointDeg + joints[index].zeroOffsetDeg) * static_cast<float>(joints[index].directionSign);
   return lroundf(signedDeg * stepperStepsPerDegree(index));
 }
 
@@ -576,7 +779,8 @@ float stepsToJointDeg(int index, long steps) {
     return currentJointsDeg[index];
   }
   const float signedDeg = static_cast<float>(steps) / scale;
-  return signedDeg / static_cast<float>(joints[index].directionSign) - joints[index].zeroOffsetDeg;
+  return signedDeg / static_cast<float>(joints[index].directionSign) -
+         joints[index].zeroOffsetDeg - correctionBiasDeg[index];
 }
 
 int servoPulseForJoint(int index, float jointDeg) {
@@ -757,8 +961,8 @@ bool poseMappingChanged(const JointConfig& previous, const JointConfig& next) {
   return false;
 }
 
-#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
 uint16_t encoderTransfer16(int csPin, uint16_t value) {
+  SPISettings encoderSpiSettings(encoderBus.clockHz, MSBFIRST, SPI_MODE1);
   SPI.beginTransaction(encoderSpiSettings);
   digitalWrite(csPin, LOW);
   delayMicroseconds(1);
@@ -770,48 +974,158 @@ uint16_t encoderTransfer16(int csPin, uint16_t value) {
   return response;
 }
 
-bool readAs5048AngleDeg(int csPin, float& angleDeg) {
-  encoderTransfer16(csPin, kAs5048ReadAngleCommand);
+uint16_t withEvenParity(uint16_t value) {
+  value &= 0x7FFF;
+  uint16_t bits = value;
+  bool odd = false;
+  while (bits != 0) {
+    odd = !odd;
+    bits &= bits - 1;
+  }
+  return odd ? value | 0x8000 : value;
+}
+
+bool hasEvenParity(uint16_t value) {
+  bool odd = false;
+  while (value != 0) {
+    odd = !odd;
+    value &= value - 1;
+  }
+  return !odd;
+}
+
+uint16_t readCommand(uint16_t address) {
+  return withEvenParity(0x4000 | (address & 0x3FFF));
+}
+
+bool readAs5048Register(int csPin, uint16_t address, uint16_t& data, bool& frameError) {
+  encoderTransfer16(csPin, readCommand(address));
   const uint16_t response = encoderTransfer16(csPin, 0x0000);
-  const bool error = (response & kAs5048ErrorFlag) != 0;
-  if (error) {
+  frameError = (response & kAs5048ErrorFlag) != 0;
+  const bool parityOk = hasEvenParity(response);
+  if (frameError) {
     encoderTransfer16(csPin, kAs5048ClearErrorCommand);
     encoderTransfer16(csPin, 0x0000);
-    return false;
   }
-  const uint16_t raw = response & kAs5048AngleMask;
-  angleDeg = static_cast<float>(raw) * 360.0f / 16384.0f;
-  return true;
+  data = response & kAs5048AngleMask;
+  return parityOk && !frameError;
+}
+
+float wrappedEncoderDelta(float valueDeg, float referenceDeg, float periodDeg) {
+  const float period = max(0.001f, periodDeg);
+  const float half = period * 0.5f;
+  float delta = fmodf(valueDeg - referenceDeg + half, period);
+  if (delta < 0.0f) {
+    delta += period;
+  }
+  return delta - half;
+}
+
+float calibratedEncoderJointDeg(const EncoderConfig& config, float rawAngleDeg) {
+  const float turns = max(0.000001f, config.sensorTurnsPerJointTurn);
+  return config.referenceJointDeg +
+         static_cast<float>(config.directionSign) *
+             wrappedEncoderDelta(rawAngleDeg, config.referenceRawDeg, config.wrapPeriodDeg) / turns;
 }
 
 void configureEncoderPins() {
-  SPI.begin(ARM_ENCODER_SCK_PIN, ARM_ENCODER_MISO_PIN, ARM_ENCODER_MOSI_PIN);
+  if (encoderSpiStarted) {
+    SPI.end();
+    encoderSpiStarted = false;
+  }
   for (int i = 0; i < kJointCount; i++) {
-    if (kEncoderCsPins[i] >= 0) {
-      pinMode(kEncoderCsPins[i], OUTPUT);
-      digitalWrite(kEncoderCsPins[i], HIGH);
+    encoderRuntime[i] = EncoderRuntime();
+    encoderAvailable[i] = false;
+  }
+  if (!encoderBus.enabled) {
+    return;
+  }
+  SPI.begin(encoderBus.sckPin, encoderBus.misoPin, encoderBus.mosiPin);
+  encoderSpiStarted = true;
+  for (int i = 0; i < kJointCount; i++) {
+    if (encoderConfigs[i].enabled && encoderConfigs[i].csPin >= 0) {
+      pinMode(encoderConfigs[i].csPin, OUTPUT);
+      digitalWrite(encoderConfigs[i].csPin, HIGH);
     }
   }
 }
 
 void updateEncoderReadback() {
-  for (int i = 0; i < kJointCount; i++) {
-    if (kEncoderCsPins[i] < 0) {
+  if (!encoderBus.enabled || !encoderSpiStarted) {
+    for (int i = 0; i < kJointCount; i++) {
       encoderAvailable[i] = false;
+      encoderRuntime[i].available = false;
+      encoderRuntime[i].valid = false;
+    }
+    return;
+  }
+  const uint32_t nowMs = millis();
+  for (int i = 0; i < kJointCount; i++) {
+    const EncoderConfig& config = encoderConfigs[i];
+    EncoderRuntime& runtime = encoderRuntime[i];
+    if (!config.enabled || config.csPin < 0) {
+      encoderAvailable[i] = false;
+      runtime.available = false;
+      runtime.valid = false;
       continue;
     }
-    float angleDeg = 0.0f;
-    encoderAvailable[i] = readAs5048AngleDeg(kEncoderCsPins[i], angleDeg);
-    if (encoderAvailable[i]) {
-      encoderAnglesDeg[i] = angleDeg;
+    if (runtime.lastAttemptMs > 0 && nowMs - runtime.lastAttemptMs < encoderBus.sampleIntervalMs) {
+      continue;
     }
+    runtime.lastAttemptMs = nowMs;
+
+    uint16_t raw = 0;
+    uint16_t diagnostics = 0;
+    bool angleFrameError = false;
+    bool diagnosticFrameError = false;
+    const bool angleOk = readAs5048Register(config.csPin, kAs5048AngleAddress, raw, angleFrameError);
+    const bool diagnosticsOk =
+        readAs5048Register(config.csPin, kAs5048DiagnosticsAddress, diagnostics, diagnosticFrameError);
+    runtime.available = angleOk || diagnosticsOk || angleFrameError || diagnosticFrameError;
+    encoderAvailable[i] = runtime.available;
+    runtime.diagnostics = diagnostics;
+
+    const bool ocf = (diagnostics & (1U << 8)) != 0;
+    const bool cof = (diagnostics & (1U << 9)) != 0;
+    const bool magnetLow = (diagnostics & (1U << 10)) != 0;
+    const bool magnetHigh = (diagnostics & (1U << 11)) != 0;
+    runtime.valid = angleOk && diagnosticsOk && ocf && !cof && !magnetLow && !magnetHigh;
+    strlcpy(runtime.flags, "none", sizeof(runtime.flags));
+    if (!angleOk || !diagnosticsOk) {
+      strlcpy(runtime.flags, "spi_or_parity", sizeof(runtime.flags));
+    } else if (!ocf) {
+      strlcpy(runtime.flags, "offset_pending", sizeof(runtime.flags));
+    } else if (cof) {
+      strlcpy(runtime.flags, "cordic_overflow", sizeof(runtime.flags));
+    } else if (magnetLow) {
+      strlcpy(runtime.flags, "magnet_low", sizeof(runtime.flags));
+    } else if (magnetHigh) {
+      strlcpy(runtime.flags, "magnet_high", sizeof(runtime.flags));
+    }
+    if (!runtime.valid) {
+      runtime.consecutiveValidSamples = 0;
+      continue;
+    }
+
+    runtime.consecutiveValidSamples = min(runtime.consecutiveValidSamples + 1, 32767);
+    runtime.rawCount = raw;
+    runtime.rawAngleDeg = static_cast<float>(raw) * 360.0f / 16384.0f;
+    runtime.measuredJointDeg = calibratedEncoderJointDeg(config, runtime.rawAngleDeg);
+    encoderAnglesDeg[i] = runtime.measuredJointDeg;
+    if (controllerState == ControllerState::Moving) {
+      runtime.hasPrevious = false;
+      runtime.noiseDeg = 0.0f;
+    } else if (runtime.hasPrevious) {
+      const float sampleDeltaJointDeg =
+          fabsf(wrappedEncoderDelta(runtime.rawAngleDeg, runtime.previousRawAngleDeg, 360.0f)) /
+          max(0.000001f, config.sensorTurnsPerJointTurn);
+      runtime.noiseDeg = runtime.noiseDeg * 0.8f + sampleDeltaJointDeg * 0.2f;
+    }
+    runtime.previousRawAngleDeg = runtime.rawAngleDeg;
+    runtime.hasPrevious = true;
+    runtime.lastValidMs = nowMs;
   }
 }
-#else
-void configureEncoderPins() {}
-
-void updateEncoderReadback() {}
-#endif
 
 bool validateJointLimits(const float requested[kJointCount]) {
   for (int i = 0; i < kJointCount; i++) {
@@ -821,6 +1135,42 @@ bool validateJointLimits(const float requested[kJointCount]) {
     }
   }
   return true;
+}
+
+void finalizeCorrection(const char* stateText) {
+  if (correctionJointIndex >= 0 && correctionJointIndex < kJointCount) {
+    const float scale = stepperStepsPerDegree(correctionJointIndex);
+    if (scale > 0.0f) {
+      const long emittedSteps = stepperRuntime[correctionJointIndex].currentSteps - correctionStartSteps;
+      lastCorrectionEmittedSteps = emittedSteps;
+      const float physicalDelta =
+          static_cast<float>(emittedSteps) / scale /
+          static_cast<float>(joints[correctionJointIndex].directionSign);
+      correctionBiasDeg[correctionJointIndex] += physicalDelta;
+    }
+    stepperRuntime[correctionJointIndex].targetSteps = stepperRuntime[correctionJointIndex].currentSteps;
+  }
+  correctionActive = false;
+  correctionJointIndex = -1;
+  pendingCorrectionBiasDeltaDeg = 0.0f;
+  correctionStartUs = 0;
+  strlcpy(correctionState, stateText, sizeof(correctionState));
+}
+
+void clearCorrectionBias() {
+  correctionActive = false;
+  correctionJointIndex = -1;
+  pendingCorrectionBiasDeltaDeg = 0.0f;
+  correctionStartSteps = 0;
+  lastCorrectionEmittedSteps = 0;
+  lastCorrectionRequestedDeltaDeg = 0.0f;
+  correctionStartUs = 0;
+  correctionAttempts = 0;
+  for (int i = 0; i < kJointCount; i++) {
+    correctionBiasDeg[i] = 0.0f;
+  }
+  strlcpy(correctionState, "idle", sizeof(correctionState));
+  strlcpy(correctionTransactionId, "none", sizeof(correctionTransactionId));
 }
 
 bool hasHardwareMotionPending() {
@@ -1170,19 +1520,32 @@ void updateJogWatchdog(uint32_t nowMs) {
 }
 
 void printHello() {
-  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=arm_controller protocol=3 config=1");
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1");
 }
 
 void printStatus() {
   updateEncoderReadback();
   const bool statusKnownPose = hasKnownPoseAuthority();
+  const uint32_t nowMs = millis();
+  const int shoulderAgeMs =
+      encoderRuntime[1].lastValidMs > 0 ? static_cast<int>(nowMs - encoderRuntime[1].lastValidMs) : -1;
   ARM_SERIAL.printf(
-      "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
-      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=%s tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
-      stateName(), homed ? 1 : 0, statusKnownPose ? 1 : 0, poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(),
-      enabledBits().c_str(), encoderBits().c_str(), encoderAnglesDeg[0], encoderAnglesDeg[1], currentJointsDeg[0],
-      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), toolTypeName(activeTool.type),
-      toolState, toolValue, faultText);
+      "STATUS state=%s homed=%d known=%d known_mask=%s pose_source=%s armed=%d hw=%s enabled=%s "
+      "enc=%s enc_valid=%s e2=%.3f er2=%u ea2=%.3f em2=%.3f eage2=%d enoise2=%.4f "
+      "evalidn2=%d ef2=%s "
+      "j1=%.3f j2=%.3f j3=%.3f j4=%.3f closed_loop=%s correction=%s correction_id=%s "
+      "correction_delta=%.6f correction_steps=%ld correction_attempts=%d "
+      "cb1=%.4f cb2=%.4f cb3=%.4f cb4=%.4f tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
+      stateName(), homed ? 1 : 0, statusKnownPose ? 1 : 0, statusKnownPose ? "1111" : "0000",
+      poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(), enabledBits().c_str(), encoderBits().c_str(),
+      encoderValidBits().c_str(), encoderRuntime[1].measuredJointDeg, encoderRuntime[1].rawCount,
+      encoderRuntime[1].rawAngleDeg, encoderRuntime[1].measuredJointDeg, shoulderAgeMs,
+      encoderRuntime[1].noiseDeg, encoderRuntime[1].consecutiveValidSamples,
+      encoderRuntime[1].flags, currentJointsDeg[0], currentJointsDeg[1],
+      currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), correctionState,
+      correctionTransactionId, lastCorrectionRequestedDeltaDeg, lastCorrectionEmittedSteps, correctionAttempts,
+      correctionBiasDeg[0], correctionBiasDeg[1], correctionBiasDeg[2], correctionBiasDeg[3],
+      toolTypeName(activeTool.type), toolState, toolValue, faultText);
 }
 
 void printError(const char* code, const String& message) {
@@ -1255,6 +1618,95 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
     return;
   }
 
+  if (upperCommand.startsWith("CONFIG ENCODER_BUS")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    draftEncoderBus.enabled = tokenInt(rawCommand, "enabled", 0) != 0;
+    draftEncoderBus.sckPin = tokenInt(rawCommand, "sck", 12);
+    draftEncoderBus.misoPin = tokenInt(rawCommand, "miso", 13);
+    draftEncoderBus.mosiPin = tokenInt(rawCommand, "mosi", 14);
+    draftEncoderBus.clockHz = static_cast<uint32_t>(max(0, tokenInt(rawCommand, "clock", kEncoderSpiClockHz)));
+    draftEncoderBus.sampleIntervalMs =
+        static_cast<uint32_t>(max(0, tokenInt(rawCommand, "sample_ms", 100)));
+    return;
+  }
+
+  if (upperCommand.startsWith("CONFIG ENCODER_POLICY")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    snprintf(
+        draftEncoderPolicy.mode,
+        sizeof(draftEncoderPolicy.mode),
+        "%s",
+        tokenString(rawCommand, "mode", "diagnostic").c_str());
+    snprintf(
+        draftEncoderPolicy.verificationPolicy,
+        sizeof(draftEncoderPolicy.verificationPolicy),
+        "%s",
+        tokenString(rawCommand, "policy", "diagnostic").c_str());
+    draftEncoderPolicy.settleDelayMs =
+        static_cast<uint32_t>(max(0, tokenInt(rawCommand, "settle_ms", 300)));
+    draftEncoderPolicy.requiredStableSamples = tokenInt(rawCommand, "samples", 3);
+    draftEncoderPolicy.warningToleranceDeg = tokenFloat(rawCommand, "warn", 2.0f);
+    draftEncoderPolicy.faultToleranceDeg = tokenFloat(rawCommand, "fault", 5.0f);
+    draftEncoderPolicy.hysteresisDeg = tokenFloat(rawCommand, "hysteresis", 0.25f);
+    draftEncoderPolicy.requireEncoder = tokenInt(rawCommand, "require", 0) != 0;
+    draftEncoderPolicy.correctionEnabled = tokenInt(rawCommand, "correction", 0) != 0;
+    snprintf(
+        draftEncoderPolicy.validationId,
+        sizeof(draftEncoderPolicy.validationId),
+        "%s",
+        tokenString(rawCommand, "validation_id", "none").c_str());
+    draftEncoderPolicy.maxCorrectionDeltaDeg = tokenFloat(rawCommand, "max_delta", 1.0f);
+    draftEncoderPolicy.correctionJointLimitMarginDeg =
+        tokenFloat(rawCommand, "limit_margin", 2.0f);
+    draftEncoderPolicy.correctionSpeedDegS = tokenFloat(rawCommand, "correction_speed", 2.0f);
+    draftEncoderPolicy.correctionAccelDegS2 = tokenFloat(rawCommand, "correction_accel", 10.0f);
+    draftEncoderPolicy.maxCorrectionAttempts = tokenInt(rawCommand, "attempts", 2);
+    return;
+  }
+
+  if (upperCommand.startsWith("CONFIG ENCODER")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    const int index = tokenInt(rawCommand, "joint", 0) - 1;
+    if (index < 0 || index >= kJointCount) {
+      printError("CONFIG", "invalid_encoder_joint");
+      return;
+    }
+    EncoderConfig encoder = defaultEncoder(index);
+    encoder.received = true;
+    encoder.enabled = tokenInt(rawCommand, "enabled", 0) != 0;
+    encoder.csPin = tokenInt(rawCommand, "cs", -1);
+    encoder.referenceRawDeg = tokenFloat(rawCommand, "reference_raw", 0.0f);
+    encoder.referenceJointDeg = tokenFloat(rawCommand, "reference_joint", 0.0f);
+    encoder.directionSign = tokenInt(rawCommand, "sign", 1) < 0 ? -1 : 1;
+    encoder.wrapPeriodDeg = tokenFloat(rawCommand, "wrap", 360.0f);
+    encoder.sensorTurnsPerJointTurn = tokenFloat(rawCommand, "turns", 1.0f);
+    encoder.freshnessTimeoutMs =
+        static_cast<uint32_t>(max(0, tokenInt(rawCommand, "freshness_ms", 500)));
+    encoder.maxNoiseDeg = tokenFloat(rawCommand, "max_noise", 0.5f);
+    encoder.calibrationValidated = tokenInt(rawCommand, "calibrated", 0) != 0;
+    snprintf(
+        encoder.mounting,
+        sizeof(encoder.mounting),
+        "%s",
+        tokenString(rawCommand, "mounting", "joint_output").c_str());
+    snprintf(
+        encoder.calibrationId,
+        sizeof(encoder.calibrationId),
+        "%s",
+        tokenString(rawCommand, "calibration_id", "none").c_str());
+    draftEncoderConfigs[index] = encoder;
+    return;
+  }
+
   if (upperCommand.startsWith("CONFIG TOOL")) {
     if (!configInProgress) {
       printError("CONFIG", "begin_required");
@@ -1316,6 +1768,12 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       printError("CONFIG", toolError);
       return;
     }
+    const String encoderError =
+        validationErrorForEncoders(draftEncoderBus, draftEncoderConfigs, draftEncoderPolicy, draftJoints, draftTool);
+    if (encoderError.length() > 0) {
+      printError("CONFIG", encoderError);
+      return;
+    }
     bool invalidatesKnownPose = false;
     for (int i = 0; i < kJointCount; i++) {
       invalidatesKnownPose = invalidatesKnownPose || poseMappingChanged(joints[i], draftJoints[i]);
@@ -1325,8 +1783,15 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       joints[i] = draftJoints[i];
     }
     activeTool = draftTool;
+    encoderBus = draftEncoderBus;
+    encoderPolicy = draftEncoderPolicy;
+    for (int i = 0; i < kJointCount; i++) {
+      encoderConfigs[i] = draftEncoderConfigs[i];
+    }
+    clearCorrectionBias();
     configurePins();
     configureToolPins();
+    configureEncoderPins();
     syncRuntimeFromCurrentPose();
     if (invalidatesKnownPose) {
       knownPose = false;
@@ -1370,6 +1835,9 @@ void handleArm(const String& rawCommand) {
     clearFaultText();
   } else {
     armed = false;
+    if (correctionActive) {
+      finalizeCorrection("aborted_disarm");
+    }
     clearTrajectory();
     clearJogMotion(true);
     const unsigned long nowUs = micros();
@@ -1731,6 +2199,7 @@ void handleSetPose(const char* buffer) {
   if (!validateJointLimits(requested)) {
     return;
   }
+  clearCorrectionBias();
   for (int i = 0; i < kJointCount; i++) {
     currentJointsDeg[i] = requested[i];
     targetJointsDeg[i] = requested[i];
@@ -1748,6 +2217,9 @@ void handleSetPose(const char* buffer) {
 }
 
 void handleStop() {
+  if (correctionActive) {
+    finalizeCorrection("aborted_stop");
+  }
   clearTrajectory();
   clearJogMotion(true);
   const unsigned long nowUs = micros();
@@ -1771,6 +2243,9 @@ void handleStop() {
 
 void handleEstop() {
   armed = false;
+  if (correctionActive) {
+    finalizeCorrection("aborted_estop");
+  }
   clearTrajectory();
   clearJogMotion(true);
   const unsigned long nowUs = micros();
@@ -1788,6 +2263,107 @@ void handleEstop() {
   strlcpy(faultText, "ESTOP", sizeof(faultText));
   ARM_SERIAL.println("OK command=ESTOP");
   printStatus();
+}
+
+void handleCorrectJ(const String& rawCommand) {
+  const int jointIndex = tokenInt(rawCommand, "joint", 0) - 1;
+  const float deltaDeg = tokenFloat(rawCommand, "delta", NAN);
+  const float speedDegS = tokenFloat(rawCommand, "speed", 0.0f);
+  const float accelDegS2 = tokenFloat(rawCommand, "accel", 0.0f);
+  const String transactionId = tokenString(rawCommand, "id", "none");
+  if (jointIndex != 1) {
+    printError("CORRECTION", "only_shoulder_supported");
+    return;
+  }
+  if (!armed) {
+    printError("ARM", "not_armed");
+    return;
+  }
+  if (!knownPose) {
+    printError("POSE", "correction_requires_known_pose");
+    return;
+  }
+  if (controllerState != ControllerState::Idle && controllerState != ControllerState::Stopped) {
+    printError("STATE", "correction_requires_idle");
+    return;
+  }
+  if (trajectoryRuntime.active || trajectoryRuntime.receiving || positionStreamRuntime.active || jogActive) {
+    printError("STATE", "correction_requires_no_active_motion");
+    return;
+  }
+  if (!encoderPolicy.correctionEnabled || !encoderBus.enabled || !encoderConfigs[jointIndex].enabled ||
+      !encoderConfigs[jointIndex].calibrationValidated ||
+      strcmp(encoderConfigs[jointIndex].mounting, "joint_output") != 0 ||
+      joints[jointIndex].actuator != ActuatorType::Stepper ||
+      joints[jointIndex].axisState != AxisState::Hardware) {
+    printError("CORRECTION", "correction_not_validated");
+    return;
+  }
+  const uint32_t nowMs = millis();
+  const bool fresh =
+      encoderRuntime[jointIndex].valid &&
+      encoderRuntime[jointIndex].lastValidMs > 0 &&
+      nowMs - encoderRuntime[jointIndex].lastValidMs <= encoderConfigs[jointIndex].freshnessTimeoutMs;
+  if (!fresh || encoderRuntime[jointIndex].noiseDeg > encoderConfigs[jointIndex].maxNoiseDeg) {
+    printError("ENCODER", "shoulder_measurement_not_fresh_stable");
+    return;
+  }
+  if (!isfinite(deltaDeg) || fabsf(deltaDeg) <= 0.0001f ||
+      fabsf(deltaDeg) > encoderPolicy.maxCorrectionDeltaDeg) {
+    printError("CORRECTION", "delta_out_of_range");
+    return;
+  }
+  if (speedDegS <= 0.0f || speedDegS > encoderPolicy.correctionSpeedDegS ||
+      accelDegS2 <= 0.0f || accelDegS2 > encoderPolicy.correctionAccelDegS2) {
+    printError("CORRECTION", "speed_or_accel_out_of_range");
+    return;
+  }
+  if (transactionId.length() == 0 || transactionId == "none") {
+    printError("CORRECTION", "transaction_id_required");
+    return;
+  }
+  if (strcmp(correctionTransactionId, transactionId.c_str()) != 0) {
+    correctionAttempts = 0;
+  }
+  if (correctionAttempts >= encoderPolicy.maxCorrectionAttempts) {
+    printError("CORRECTION", "attempt_limit_reached");
+    return;
+  }
+  const float correctedPhysicalAngle = currentJointsDeg[jointIndex] + correctionBiasDeg[jointIndex] + deltaDeg;
+  const float limitMargin = encoderPolicy.correctionJointLimitMarginDeg;
+  if (correctedPhysicalAngle < joints[jointIndex].minDeg + limitMargin ||
+      correctedPhysicalAngle > joints[jointIndex].maxDeg - limitMargin) {
+    printError("LIMIT", "correction_would_cross_joint_limit");
+    return;
+  }
+
+  const long stepDelta = lroundf(
+      deltaDeg * static_cast<float>(joints[jointIndex].directionSign) * stepperStepsPerDegree(jointIndex));
+  if (stepDelta == 0) {
+    printError("CORRECTION", "delta_below_one_step");
+    return;
+  }
+  correctionActive = true;
+  correctionJointIndex = jointIndex;
+  correctionStartSteps = stepperRuntime[jointIndex].currentSteps;
+  pendingCorrectionBiasDeltaDeg = deltaDeg;
+  lastCorrectionRequestedDeltaDeg = deltaDeg;
+  lastCorrectionEmittedSteps = 0;
+  correctionStartUs = micros();
+  stepperRuntime[jointIndex].targetSteps = correctionStartSteps + stepDelta;
+  correctionAttempts++;
+  lastSpeedDegS = speedDegS;
+  lastAccelDegS2 = accelDegS2;
+  snprintf(correctionTransactionId, sizeof(correctionTransactionId), "%s", transactionId.c_str());
+  strlcpy(correctionState, "executing", sizeof(correctionState));
+  controllerState = ControllerState::Moving;
+  clearFaultText();
+  ARM_SERIAL.printf(
+      "OK command=CORRECTJ joint=2 delta=%.6f steps=%ld attempt=%d id=%s\r\n",
+      deltaDeg,
+      stepDelta,
+      correctionAttempts,
+      correctionTransactionId);
 }
 
 void handleTool(const String& rawCommand, const String& upperCommand) {
@@ -1823,8 +2399,18 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
   printStatus();
 }
 
-unsigned long stepIntervalUs(int index) {
-  const float speed = max(1.0f, min(lastSpeedDegS, joints[index].maxSpeedDegS));
+unsigned long stepIntervalUs(int index, unsigned long nowUs) {
+  float speed = max(1.0f, min(lastSpeedDegS, joints[index].maxSpeedDegS));
+  if (correctionActive && index == correctionJointIndex) {
+    const float scale = max(0.0001f, stepperStepsPerDegree(index));
+    const float elapsedS = static_cast<float>(nowUs - correctionStartUs) / 1000000.0f;
+    const float acceleratingSpeed = max(0.1f, lastAccelDegS2 * elapsedS);
+    const float remainingDeg =
+        fabsf(static_cast<float>(stepperRuntime[index].targetSteps - stepperRuntime[index].currentSteps)) /
+        scale;
+    const float brakingSpeed = sqrtf(max(0.0f, 2.0f * lastAccelDegS2 * remainingDeg));
+    speed = max(0.1f, min(speed, min(acceleratingSpeed, brakingSpeed)));
+  }
   const float stepRate = max(1.0f, speed * stepperStepsPerDegree(index));
   return static_cast<unsigned long>(1000000.0f / stepRate);
 }
@@ -1845,7 +2431,7 @@ void updateSteppers(unsigned long nowUs) {
     if (delta == 0) {
       continue;
     }
-    const unsigned long interval = stepIntervalUs(i);
+    const unsigned long interval = stepIntervalUs(i, nowUs);
     if (nowUs - runtime.lastStepUs < interval) {
       continue;
     }
@@ -1855,9 +2441,15 @@ void updateSteppers(unsigned long nowUs) {
     delayMicroseconds(2);
     digitalWrite(joints[i].stepper.stepPin, LOW);
     runtime.currentSteps += delta > 0 ? 1 : -1;
-    currentJointsDeg[i] = stepsToJointDeg(i, runtime.currentSteps);
+    if (!correctionActive || i != correctionJointIndex) {
+      currentJointsDeg[i] = stepsToJointDeg(i, runtime.currentSteps);
+    }
   }
 
+  if (correctionActive && correctionJointIndex >= 0 &&
+      stepperRuntime[correctionJointIndex].currentSteps == stepperRuntime[correctionJointIndex].targetSteps) {
+    finalizeCorrection("completed");
+  }
   if (controllerState == ControllerState::Moving && !hasHardwareMotionPending()) {
     controllerState = ControllerState::Idle;
     clearFaultText();
@@ -1968,6 +2560,8 @@ void handleCommand(String rawCommand) {
     handleArm(rawCommand);
   } else if (strcasecmp(command, "SETPOSE") == 0) {
     handleSetPose(buffer);
+  } else if (strcasecmp(command, "CORRECTJ") == 0) {
+    handleCorrectJ(rawCommand);
   } else if (strcasecmp(command, "MOVEJ") == 0) {
     handleMoveJ(buffer);
   } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 ||
@@ -2014,6 +2608,7 @@ void setup() {
 
   for (int i = 0; i < kJointCount; i++) {
     joints[i] = defaultJoint(i);
+    encoderConfigs[i] = defaultEncoder(i);
     currentJointsDeg[i] = kDefaultHome[i];
     targetJointsDeg[i] = kDefaultHome[i];
   }
@@ -2047,6 +2642,7 @@ void loop() {
   updatePositionStream(nowUs);
   updateSteppers(nowUs);
   updateServoPwm(nowUs);
+  updateEncoderReadback();
 
   if (nowMs - lastStatusMs >= kStatusIntervalMs) {
     lastStatusMs = nowMs;

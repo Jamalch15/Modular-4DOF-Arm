@@ -22,7 +22,7 @@ from .task_destinations import task_destination_errors
 
 SUPPORTED_STRATEGIES = {"closed_loop", "batch_once"}
 SUPPORTED_CYCLE_CONFIRMATION = {"automatic", "confirm_each_object"}
-SUPPORTED_ORDERING = {"nearest_to_safe", "largest", "left_to_right", "color_priority", "manual", "color"}
+SUPPORTED_ORDERING = {"nearest_to_home", "largest", "left_to_right", "color_priority", "manual", "color"}
 SUPPORTED_ORIENTATION = {"fixed", "auto", "per_color", "prefer_downward"}
 SUPPORTED_MOTION_MODES = {"joint", "linear"}
 SUPPORTED_PLACEMENT = {"fixed", "grid", "zone_grid"}
@@ -257,10 +257,14 @@ def normalize_color_sorting_settings(
         settings.get("tool_action_delay_ms", 150),
         "tool_action_delay_ms",
     )
-    settings["safe_position"] = str(settings.get("safe_position") or legacy.get("safe_position", "safe"))
+    settings["safe_position"] = str(settings.get("safe_position") or legacy.get("safe_position", "home"))
+    if settings["safe_position"] == "safe":
+        settings["safe_position"] = "home"
     settings["camera_clear_position"] = str(
         settings.get("camera_clear_position") or settings["safe_position"]
     )
+    if settings["camera_clear_position"] == "safe":
+        settings["camera_clear_position"] = "home"
     settings["default_drop_zone"] = str(settings.get("default_drop_zone") or legacy.get("default_drop_zone", "dropoff_a"))
 
     filters = settings.setdefault("filters", {})
@@ -272,8 +276,11 @@ def normalize_color_sorting_settings(
     filters["require_robot_coordinates"] = _as_bool(filters.get("require_robot_coordinates"), True)
 
     ordering = settings.setdefault("ordering", {})
+    ordering_policy = ordering.get("policy", "nearest_to_home")
+    if ordering_policy == "nearest_to_safe":
+        ordering_policy = "nearest_to_home"
     ordering["policy"] = _choice(
-        ordering.get("policy", "nearest_to_safe"),
+        ordering_policy,
         SUPPORTED_ORDERING,
         "ordering.policy",
     )
@@ -364,12 +371,12 @@ def named_position_waypoint(config: RobotConfig, name: str, *, mode: str = "join
     return {"type": "cartesian", "mode": mode, "target": _cartesian_target(position)}
 
 
-def _safe_waypoint(config: RobotConfig, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def _home_waypoint(config: RobotConfig, settings: dict[str, Any] | None = None) -> dict[str, Any]:
     resolved = settings or normalize_color_sorting_settings(config, None)
-    name = str(resolved.get("safe_position", "safe"))
+    name = str(resolved.get("safe_position", "home"))
     waypoint = named_position_waypoint(config, name)
     if waypoint is None:
-        raise TaskSettingsError(f"safe position {name} is missing or invalid")
+        raise TaskSettingsError(f"home position {name} is missing or invalid")
     return waypoint
 
 
@@ -509,7 +516,7 @@ def build_pick_and_place_sequence(
     try:
         settings = normalize_color_sorting_settings(config, task_settings)
         profile = object_profile or _object_profile(settings, color or "")
-        safe = _safe_waypoint(config, settings)
+        home = _home_waypoint(config, settings)
         release_tool, capture_tool, final_release_tool = _tool_steps(config)
         _validate_drop_zone_config(config)
     except TaskSettingsError as exc:
@@ -603,8 +610,11 @@ def build_pick_and_place_sequence(
         phase: str,
         *,
         retreat_target: dict[str, Any] | None = None,
+        preserve_tool_orientation: bool = False,
     ) -> dict[str, Any]:
         waypoint = {"type": "cartesian", "mode": mode, "target": target}
+        if preserve_tool_orientation:
+            waypoint["settings"] = {"preserve_tool_orientation": True}
         return {
             "kind": "move",
             "label": label,
@@ -616,26 +626,26 @@ def build_pick_and_place_sequence(
             **{key: value for key, value in object_meta.items() if value is not None},
         }
 
-    safe_start = {
+    home_start = {
         "kind": "move",
-        "label": "safe",
-        "phase": "safe",
-        "waypoint": safe,
-        **waypoint_metadata(safe),
+        "label": "home",
+        "phase": "home",
+        "waypoint": home,
+        **waypoint_metadata(home),
         "safe_retreat_available": True,
-        "recovery_target": {"waypoint": deepcopy(safe), **waypoint_metadata(safe)},
+        "recovery_target": {"waypoint": deepcopy(home), **waypoint_metadata(home)},
         **{k: v for k, v in object_meta.items() if v is not None},
     }
-    safe_finish = {
-        **deepcopy(safe_start),
-        "phase": "return_safe",
+    home_finish = {
+        **deepcopy(home_start),
+        "phase": "return_home",
     }
     release_tool.update(
         {
             "phase": "tool_prepare",
             "hold_transition": "none",
             "safe_retreat_available": True,
-            "recovery_target": {"waypoint": deepcopy(safe), **waypoint_metadata(safe)},
+            "recovery_target": {"waypoint": deepcopy(home), **waypoint_metadata(home)},
         }
     )
     capture_tool.update(
@@ -655,7 +665,6 @@ def build_pick_and_place_sequence(
         }
     )
     steps: list[dict[str, Any]] = [
-        safe_start,
         release_tool,
         move(
             "above pickup",
@@ -685,6 +694,7 @@ def build_pick_and_place_sequence(
             str(modes.get("transfer", "joint")),
             "transfer",
             retreat_target=above_drop,
+            preserve_tool_orientation=True,
         ),
         move(
             "dropoff",
@@ -692,6 +702,7 @@ def build_pick_and_place_sequence(
             str(modes.get("drop_descent", "linear")),
             "drop_descent",
             retreat_target=above_drop,
+            preserve_tool_orientation=True,
         ),
         final_release_tool,
         move(
@@ -701,7 +712,7 @@ def build_pick_and_place_sequence(
             "drop_retreat",
             retreat_target=above_drop,
         ),
-        safe_finish,
+        home_finish,
     ]
     for tool_step in [release_tool, capture_tool, final_release_tool]:
         tool_step.update({key: value for key, value in object_meta.items() if value is not None})
@@ -858,7 +869,11 @@ def filter_sorting_detections(
                 )
             )
             continue
-        zone_name = str(detection.get("drop_zone") or profile.get("drop_zone") or settings.get("default_drop_zone"))
+        # Vision detections can contain a drop_zone copied from the color
+        # profile that was active when the image was captured. Treat that as
+        # stale metadata. The live Plan mapping is the authority; use the
+        # detection-level field only as a last-resort compatibility fallback.
+        zone_name = str(profile.get("drop_zone") or settings.get("default_drop_zone") or detection.get("drop_zone"))
         if zone_name not in zones:
             message = f"missing drop zone {zone_name} for detected color {color}"
             if settings.get("missing_drop_zone_policy") == "error":
@@ -882,14 +897,14 @@ def filter_sorting_detections(
     return {"candidates": candidates, "ignored": ignored, "errors": errors}
 
 
-def _safe_xy(config: RobotConfig, settings: dict[str, Any]) -> tuple[float, float]:
+def _home_xy(config: RobotConfig, settings: dict[str, Any]) -> tuple[float, float]:
     positions = named_positions(config)
-    safe = positions.get(str(settings.get("safe_position", "safe")), {})
-    if str(safe.get("type", "joint")).lower() == "joint":
-        angles = safe.get("angles_deg", config.home_pose)
+    home = positions.get(str(settings.get("safe_position", "home")), {})
+    if str(home.get("type", "joint")).lower() == "joint":
+        angles = home.get("angles_deg", config.home_pose)
         fk = forward_kinematics([_as_float(value) for value in angles], config.links)
         return _as_float(fk.get("x_mm"), 0.0), _as_float(fk.get("y_mm"), 0.0)
-    target = safe.get("target") if isinstance(safe.get("target"), dict) else safe
+    target = home.get("target") if isinstance(home.get("target"), dict) else home
     return _as_float(target.get("x_mm", target.get("x")), 0.0), _as_float(target.get("y_mm", target.get("y")), 0.0)
 
 
@@ -898,7 +913,7 @@ def order_sorting_candidates(
     candidates: list[dict[str, Any]],
     settings: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    policy = settings.get("ordering", {}).get("policy", "nearest_to_safe")
+    policy = settings.get("ordering", {}).get("policy", "nearest_to_home")
     if policy == "manual":
         return sorted(candidates, key=lambda item: item.get("selection_rank", item.get("source_index", 0)))
     if policy == "largest":
@@ -913,11 +928,11 @@ def order_sorting_candidates(
         )
     if policy == "color":
         return sorted(candidates, key=lambda item: (str(item.get("color", "")), item.get("source_index", 0)))
-    safe_x, safe_y = _safe_xy(config, settings)
+    home_x, home_y = _home_xy(config, settings)
     return sorted(
         candidates,
         key=lambda item: (
-            hypot(_as_float(item.get("x_mm"), 0.0) - safe_x, _as_float(item.get("y_mm"), 0.0) - safe_y),
+            hypot(_as_float(item.get("x_mm"), 0.0) - home_x, _as_float(item.get("y_mm"), 0.0) - home_y),
             item.get("source_index", 0),
         ),
     )
@@ -1019,7 +1034,7 @@ def build_color_sorting_plan(
 ) -> dict[str, Any]:
     try:
         settings = normalize_color_sorting_settings(config, task_settings)
-        _safe_waypoint(config, settings)
+        _home_waypoint(config, settings)
         _tool_steps(config)
         _validate_drop_zone_config(config)
     except TaskSettingsError as exc:

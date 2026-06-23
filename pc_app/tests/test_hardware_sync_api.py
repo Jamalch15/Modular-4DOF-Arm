@@ -2,9 +2,26 @@ from dataclasses import replace
 from copy import deepcopy
 
 from fastapi.testclient import TestClient
+from pytest import fixture
 
 import app.main as main
+from app.config import EXAMPLE_CONFIG_PATH, load_config
+from app.motion import RateLimitedMotion
 from app.robot_state import MotionState
+
+
+@fixture(autouse=True)
+def use_committed_example_config(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "hardware-sync-example-config")
+    monkeypatch.setattr(
+        main,
+        "limiter",
+        RateLimitedMotion(config, config.home_pose.copy(), config.home_pose.copy()),
+    )
+    yield
+    main.cancel_motion_tasks()
 
 
 class FakeSerial:
@@ -39,9 +56,16 @@ def reset_runtime_state() -> None:
     main.state.connected = True
     main.state.simulation = False
     main.state.hardware_armed = False
+    main.state.encoder_fault = False
+    main.state.encoder_mismatch = {}
     main.state.live_motion_enabled = False
     main.state.motion_state = MotionState.IDLE
-    main.state.reported_angles_deg = main.config.home_pose.copy()
+    main.state.update_reported_pose(
+        main.config.home_pose,
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
     main.state.target_angles_deg = main.config.home_pose.copy()
     main.state.config_sync_status = "stale"
     main.state.clear_error()
@@ -105,6 +129,58 @@ def test_hardware_sync_reports_synced(monkeypatch):
     assert payload["status"] == "synced"
     assert fake.sent[0] == "CONFIG BEGIN axes=4"
     assert fake.sent[-1] == "CONFIG END"
+
+
+def test_hardware_sync_skips_disabled_encoder_lines_for_legacy_controller(monkeypatch):
+    reset_runtime_state()
+    main.state.controller_capabilities = {
+        "protocol": 3,
+        "config": True,
+        "encoder": False,
+        "encoder_config": False,
+        "raw": "HELLO name=esp32s3-arm firmware=arm_controller protocol=3 config=1",
+    }
+    fake = FakeSerial(["OK command=CONFIG axes=4 hw=hardware enabled=1111"])
+    monkeypatch.setattr(main, "serial_client", fake)
+    client = TestClient(main.app)
+
+    payload = client.post("/api/hardware/sync").json()
+
+    assert payload["ok"] is True
+    assert payload["status"] == "synced"
+    assert not any(line.startswith("CONFIG ENCODER") for line in fake.sent)
+    assert "skipped" in payload["message"]
+
+
+def test_enabled_encoder_bus_requires_protocol_v4_encoder_firmware(monkeypatch):
+    original_config = main.config
+    raw = deepcopy(original_config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["bus"].update({"sck_pin": 12, "miso_pin": 13, "mosi_pin": 14})
+    raw["encoders"]["axes"][0].update({"enabled": True, "cs_pin": 15})
+    patched = type(original_config)(**{**original_config.__dict__, "raw": raw})
+    try:
+        monkeypatch.setattr(main, "config", patched)
+        reset_runtime_state()
+        main.state.controller_capabilities = {
+            "protocol": 3,
+            "config": True,
+            "encoder": False,
+            "encoder_config": False,
+            "raw": "HELLO name=esp32s3-arm firmware=arm_controller protocol=3 config=1",
+        }
+        fake = FakeSerial([])
+        monkeypatch.setattr(main, "serial_client", fake)
+        client = TestClient(main.app)
+
+        payload = client.post("/api/hardware/sync").json()
+
+        assert payload["ok"] is False
+        assert payload["status"] == "unsupported"
+        assert "protocol-v4 encoder config support" in payload["message"]
+        assert fake.sent == []
+    finally:
+        monkeypatch.setattr(main, "config", original_config)
 
 
 def test_hardware_sync_requires_disarmed_hardware(monkeypatch):
@@ -226,6 +302,31 @@ def test_enabled_axis_with_missing_pins_is_invalid(monkeypatch):
         assert payload["evaluation"]["mode"] == "invalid"
     finally:
         monkeypatch.setattr(main, "config", original_config)
+
+
+def test_shoulder_encoder_chip_select_conflict_blocks_sync(monkeypatch):
+    original_config = main.config
+    raw = deepcopy(original_config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"] = [
+        {
+            **raw["encoders"]["axes"][0],
+            "joint": 2,
+            "enabled": True,
+            "cs_pin": original_config.joints[1].hardware.stepper.dir_pin,
+        }
+    ]
+    patched = type(original_config)(**{**original_config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched)
+    reset_runtime_state()
+
+    evaluation = main.evaluate_hardware_config()
+
+    assert evaluation["mode"] == "invalid"
+    assert any(
+        "shoulder encoder CS" in error and "shoulder DIR" in error
+        for error in evaluation["errors"]
+    )
 
 
 def test_config_change_classification_separates_model_mapping_and_io():
