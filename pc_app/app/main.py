@@ -3203,20 +3203,33 @@ def controller_rebase_tolerance_deg() -> float:
     return tolerance
 
 
-def should_hold_pose_tracking_after_correction(delta_deg: float, min_delta_deg: float) -> bool:
+def should_hold_pose_tracking_after_correction(_delta_deg: float, _min_delta_deg: float) -> bool:
     correction = encoder_settings(config).get("correction", {})
     if not isinstance(correction, dict) or not bool(correction.get("enabled")):
         return False
-    if str(state.correction_state.get("state") or "").strip().lower() != "completed":
-        return False
-    try:
-        correction_deadband = max(0.0, float(correction.get("deadband_deg", 0.75)))
-    except (TypeError, ValueError):
-        correction_deadband = 0.75
-    return abs(float(delta_deg)) <= max(float(min_delta_deg), correction_deadband, controller_rebase_tolerance_deg())
+    correction_state = str(state.correction_state.get("state") or "").strip().lower()
+    transaction_id = str(state.correction_state.get("transaction_id") or "").strip().lower()
+    bias = state.correction_state.get("bias_deg")
+    shoulder_bias = 0.0
+    if isinstance(bias, list) and len(bias) > 1 and bias[1] is not None:
+        try:
+            shoulder_bias = float(bias[1])
+        except (TypeError, ValueError):
+            shoulder_bias = 0.0
+    correction_owns_pose = (
+        abs(shoulder_bias) > 1e-6
+        or correction_state in {"executing", "aligning"}
+        or (correction_state == "completed" and transaction_id not in {"", "none"})
+    )
+    return correction_owns_pose
 
 
-def _shoulder_alignment_target_deg() -> float | None:
+def _shoulder_alignment_target_deg(explicit_target_deg: float | None = None) -> float | None:
+    if explicit_target_deg is not None:
+        try:
+            return float(explicit_target_deg)
+        except (TypeError, ValueError):
+            return None
     reference = state.target_angles_deg if len(state.target_angles_deg) > 1 else state.reported_angles_deg
     if len(reference) <= 1:
         return None
@@ -3226,7 +3239,7 @@ def _shoulder_alignment_target_deg() -> float | None:
         return None
 
 
-def shoulder_alignment_motion_blocking_reason() -> str | None:
+def shoulder_alignment_motion_blocking_reason(target_shoulder_deg: float | None = None) -> str | None:
     if state.simulation:
         return None
     settings = encoder_settings(config)
@@ -3257,7 +3270,7 @@ def shoulder_alignment_motion_blocking_reason() -> str | None:
     try:
         measured_deg = float(measured)
         noise_deg = float(noise) if noise is not None else 0.0
-        target_deg = _shoulder_alignment_target_deg()
+        target_deg = _shoulder_alignment_target_deg(target_shoulder_deg)
     except (TypeError, ValueError):
         return None
     if target_deg is None:
@@ -3267,7 +3280,7 @@ def shoulder_alignment_motion_blocking_reason() -> str | None:
         return None
     deadband = float(correction.get("deadband_deg", 0.75))
     warn = float(verification.get("warning_tolerance_deg", verification.get("warn_tolerance_deg", 2.0)))
-    threshold = max(0.1, max(deadband, warn))
+    threshold = max(0.1, deadband if correction_enabled else warn)
     error = measured_deg - target_deg
     if abs(error) <= threshold:
         return None
@@ -3335,9 +3348,10 @@ def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> boo
     if should_hold_pose_tracking_after_correction(delta, min_delta):
         state.encoder_mismatch = {
             **state.encoder_mismatch,
-            "pose_tracking_status": "held_after_correction",
+            "pose_tracking_status": "held_by_correction_bias",
             "pose_tracking_skip_reason": (
-                f"post-correction shoulder residual {delta:+.2f} deg is inside the correction deadband"
+                f"controller correction bias owns the shoulder logical pose; "
+                f"encoder residual is {delta:+.2f} deg"
             ),
             "pose_tracking_measured_deg": measured_deg,
             "pose_tracking_previous_deg": current,
@@ -3551,11 +3565,6 @@ async def verify_shoulder_after_motion(
         estimated_error_deg=estimated_error,
     )
 
-    if abs(error) > fault_tolerance and policy == "fault":
-        message = f"shoulder encoder mismatch {error:.2f} deg exceeds {fault_tolerance:.2f} deg"
-        latch_encoder_mismatch_fault(message, error)
-        return False, message
-
     correction = settings.get("correction", {})
     allowed_sources = {str(value) for value in correction.get("allowed_sources", [])}
     correction_delta = -error
@@ -3634,6 +3643,29 @@ async def verify_shoulder_after_motion(
             deadband_deg=correction_deadband,
             max_delta_deg=correction_limit,
         )
+        recoverable_skip = (
+            allow_correction
+            and bool(correction.get("enabled"))
+            and source in allowed_sources
+            and abs(error) > correction_deadband
+        )
+        if recoverable_skip:
+            recovered, recovery_message = await ensure_shoulder_alignment_before_motion(
+                source,
+                target_shoulder_deg=commanded_reference,
+            )
+            if recovered:
+                return True, "corrected"
+            message = recovery_message or (
+                f"automatic shoulder alignment could not recover {error:.2f} deg mismatch"
+            )
+            if not state.encoder_fault:
+                latch_encoder_mismatch_fault(message, error)
+            return False, message
+        if abs(error) > fault_tolerance and policy == "fault":
+            message = f"shoulder encoder mismatch {error:.2f} deg exceeds {fault_tolerance:.2f} deg"
+            latch_encoder_mismatch_fault(message, error)
+            return False, message
         return True, status
 
     max_attempts = max(1, int(correction.get("max_attempts", 2)))
@@ -3734,8 +3766,18 @@ async def verify_shoulder_after_motion(
         if abs(error) > fault_tolerance:
             break
 
-    message = f"shoulder correction did not converge; final error {error:.2f} deg"
-    latch_encoder_mismatch_fault(message, error)
+    if allow_correction and bool(correction.get("enabled")) and source in allowed_sources:
+        recovered, recovery_message = await ensure_shoulder_alignment_before_motion(
+            source,
+            target_shoulder_deg=commanded_reference,
+        )
+        if recovered:
+            return True, "corrected"
+        message = recovery_message or f"shoulder correction did not converge; final error {error:.2f} deg"
+    else:
+        message = f"shoulder correction did not converge; final error {error:.2f} deg"
+    if not state.encoder_fault:
+        latch_encoder_mismatch_fault(message, error)
     return False, message
 
 
@@ -5431,6 +5473,11 @@ async def start_joint_target_trajectory(
             state.set_error(reason)
             await broadcast_state()
             return {"ok": False, "error": reason, "state": state.to_dict()}
+        aligned, reason = await ensure_shoulder_alignment_before_motion(command_label, settings_payload)
+        if not aligned:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
         reason = hardware_trajectory_start_blocking_reason()
         if reason:
             state.set_error(reason)
@@ -6079,6 +6126,15 @@ async def execute_program_sequence(preview: dict[str, Any]) -> None:
                 finish_motion_diagnostics("failed", state.last_error)
                 await broadcast_state()
                 return
+            aligned, alignment_reason = await ensure_shoulder_alignment_before_motion(
+                "program",
+                execution_step.get("settings") or preview.get("settings", {}),
+            )
+            if not aligned:
+                state.set_error(alignment_reason)
+                finish_motion_diagnostics("failed", alignment_reason)
+                await broadcast_state()
+                return
             step_preview = {
                 **preview,
                 "source": "program",
@@ -6186,6 +6242,14 @@ async def execute_task_sequence(
             if not isinstance(waypoint, dict):
                 state.set_error(f"task step {label} is missing a waypoint")
                 failed_reason = state.last_error
+                break
+            aligned, alignment_reason = await ensure_shoulder_alignment_before_motion(
+                "task",
+                settings,
+            )
+            if not aligned:
+                state.set_error(alignment_reason)
+                failed_reason = alignment_reason
                 break
             preview_result = build_preview(
                 mode="program",
@@ -6451,6 +6515,15 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
     terminal_reason = ""
     try:
         while completed < int(task_settings.get("max_objects", 1)):
+            aligned, alignment_reason = await ensure_shoulder_alignment_before_motion(
+                "task",
+                path_settings,
+            )
+            if not aligned:
+                state.set_error(alignment_reason)
+                finish_task_execution("failed", alignment_reason)
+                await broadcast_state()
+                return
             gate_reason = task_motion_gate_reason()
             if gate_reason:
                 state.set_error(gate_reason)
@@ -6574,6 +6647,15 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                 await broadcast_state()
                 return
 
+            aligned, alignment_reason = await ensure_shoulder_alignment_before_motion(
+                "task",
+                path_settings,
+            )
+            if not aligned:
+                state.set_error(alignment_reason)
+                finish_task_execution("failed", alignment_reason)
+                await broadcast_state()
+                return
             gate_reason = task_motion_gate_reason()
             if gate_reason:
                 state.set_error(gate_reason)
@@ -8684,9 +8766,15 @@ async def set_encoder_correction_policy(request: EncoderCorrectionPolicyRequest)
     }
 
 
-@app.post("/api/encoder/shoulder/align")
-async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None = None) -> dict[str, Any]:
-    """Explicit idle shoulder-only alignment using the bounded correction path."""
+async def align_shoulder_to_planning_internal(
+    request: EncoderShoulderAlignRequest | None = None,
+    *,
+    allow_active_execution: bool = False,
+    motion_source: str = "encoder_shoulder_align",
+    automatic: bool = False,
+    target_shoulder_deg: float | None = None,
+) -> dict[str, Any]:
+    """Run bounded shoulder-only alignment against the current logical target."""
     settings, shoulder, reason = _encoder_runtime_ready()
     if reason:
         state.set_error(reason)
@@ -8708,6 +8796,14 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         state.set_error("clear the encoder fault and Set Pose before shoulder encoder alignment")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if automatic and not state.known_pose:
+        state.set_error("automatic shoulder alignment requires a known planning pose")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if automatic and not state.hardware_armed:
+        state.set_error("automatic shoulder alignment requires armed hardware")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     alignj_supported = bool(state.controller_capabilities.get("alignj"))
     if not alignj_supported:
         if not state.known_pose:
@@ -8727,11 +8823,21 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         )
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+    if (
+        state.live_motion_enabled
+        or cartesian_jog_runtime.get("active")
+        or (task_active() and not allow_active_execution)
+    ):
         state.set_error("stop live motion, tasks, and Cartesian jog before shoulder encoder alignment")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+    current_task = asyncio.current_task()
+    active_tasks = [
+        task
+        for task in [path_task, live_task, task_task]
+        if task is not None and not task.done() and task is not current_task
+    ]
+    if active_tasks:
         state.set_error("wait for active motion or task execution to finish")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
@@ -8739,6 +8845,8 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
     target = [float(value) for value in state.target_angles_deg]
     if len(target) < len(config.joints):
         target = [float(value) for value in state.reported_angles_deg]
+    if target_shoulder_deg is not None and len(target) > 1:
+        target[1] = float(target_shoulder_deg)
     state.last_command = "ALIGN_SHOULDER_TO_PLANNING"
     correction = settings.get("correction", {}) if isinstance(settings.get("correction"), dict) else {}
     if not bool(correction.get("enabled")):
@@ -8747,8 +8855,8 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         await broadcast_state()
         return {"ok": False, "error": reason, "state": state.to_dict()}
     allowed_sources = {str(value) for value in correction.get("allowed_sources", [])}
-    if "encoder_shoulder_align" not in allowed_sources:
-        reason = "encoder_shoulder_align is not allowed by the correction source policy"
+    if motion_source not in allowed_sources:
+        reason = f"{motion_source} is not allowed by the correction source policy"
         state.set_error(reason)
         await broadcast_state()
         return {"ok": False, "error": reason, "state": state.to_dict()}
@@ -8769,7 +8877,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
     align_speed_limits, align_accel_limits = _joint_limits_from_settings(align_path_settings)
     first_speed = float(align_speed_limits[1]) if len(align_speed_limits) > 1 else config.joints[1].max_speed_deg_s
     first_accel = float(align_accel_limits[1]) if len(align_accel_limits) > 1 else config.joints[1].max_accel_deg_s2
-    if not alignj_supported:
+    if automatic or not alignj_supported:
         first_speed = min(first_speed, correction_speed)
         first_accel = min(first_accel, correction_accel)
     limit_margin = max(0.0, float(correction.get("joint_limit_margin_deg", 2.0)))
@@ -8786,7 +8894,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         state.encoder_mismatch = {
             **state.encoder_mismatch,
             "status": "aligned",
-            "source": "encoder_shoulder_align",
+            "source": motion_source,
             "commanded_deg": target_shoulder,
             "measured_deg": measured,
             "error_deg": initial_error,
@@ -8813,7 +8921,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         state.encoder_mismatch = {
             **state.encoder_mismatch,
             "status": "align_blocked",
-            "source": "encoder_shoulder_align",
+            "source": motion_source,
             "commanded_deg": target_shoulder,
             "measured_deg": measured,
             "error_deg": initial_error,
@@ -8830,11 +8938,11 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
     total_requested = 0.0
     chunk_records: list[dict[str, Any]] = []
     error = initial_error
-    max_chunks = max(2, min(30, int(abs(initial_error) / chunk_limit) + 4))
+    max_chunks = max(2, min(120, int(abs(initial_error) / chunk_limit) + 6))
     for chunk_index in range(1, max_chunks + 1):
         if abs(error) <= correction_deadband:
             break
-        if chunk_index == 1:
+        if chunk_index == 1 and not automatic:
             delta = max(-total_limit, min(total_limit, -error))
         else:
             delta = max(-chunk_limit, min(chunk_limit, -error))
@@ -8843,7 +8951,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
             state.encoder_mismatch = {
                 **state.encoder_mismatch,
                 "status": "align_blocked",
-                "source": "encoder_shoulder_align",
+                "source": motion_source,
                 "commanded_deg": target_shoulder,
                 "measured_deg": measured,
                 "error_deg": error,
@@ -8867,7 +8975,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
             state.encoder_mismatch = {
                 **state.encoder_mismatch,
                 "status": "align_blocked",
-                "source": "encoder_shoulder_align",
+                "source": motion_source,
                 "commanded_deg": target_shoulder,
                 "measured_deg": measured,
                 "error_deg": error,
@@ -8898,14 +9006,14 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
             "speed_deg_s": command_speed,
             "accel_deg_s2": command_accel,
             "timeout_s": correction_timeout_s,
-            "source": "encoder_shoulder_align",
+            "source": motion_source,
             "command": command_kind,
         }
         state.last_command = command
         state.encoder_mismatch = {
             **state.encoder_mismatch,
             "status": "aligning",
-            "source": "encoder_shoulder_align",
+            "source": motion_source,
             "commanded_deg": target_shoulder,
             "measured_deg": measured,
             "error_deg": error,
@@ -8951,7 +9059,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
                     "speed_deg_s": command_speed,
                     "accel_deg_s2": command_accel,
                     "timeout_s": correction_timeout_s,
-                    "source": "encoder_shoulder_align",
+                    "source": motion_source,
                     "command": command_kind,
                     "fallback_reason": fallback_reason,
                 }
@@ -9036,7 +9144,7 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
     state.encoder_mismatch = {
         **state.encoder_mismatch,
         "status": "aligned",
-        "source": "encoder_shoulder_align",
+        "source": motion_source,
         "commanded_deg": target_shoulder,
         "measured_deg": measured,
         "error_deg": error,
@@ -9051,6 +9159,8 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
     log_event(
         "encoder",
         "shoulder alignment requested",
+        motion_source=motion_source,
+        automatic=automatic,
         target_shoulder_deg=target[1] if len(target) > 1 else None,
         final_error_deg=error,
         chunks=len(chunk_records),
@@ -9063,6 +9173,82 @@ async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None
         "mismatch": state.encoder_mismatch,
         "state": state.to_dict(),
     }
+
+
+async def ensure_shoulder_alignment_before_motion(
+    motion_source: str,
+    settings_payload: PathSettingsRequest | dict[str, Any] | None = None,
+    *,
+    target_shoulder_deg: float | None = None,
+) -> tuple[bool, str]:
+    reason = shoulder_alignment_motion_blocking_reason(target_shoulder_deg)
+    if not reason:
+        return True, ""
+
+    settings = encoder_settings(config)
+    correction = settings.get("correction", {}) if isinstance(settings.get("correction"), dict) else {}
+    allowed_sources = {str(value) for value in correction.get("allowed_sources", [])}
+    if not bool(correction.get("enabled")) or motion_source not in allowed_sources:
+        return False, reason
+
+    execution = dict(state.task_execution or {})
+    run_id = str(execution.get("run_id") or "")
+    previous_status = execution.get("status")
+    previous_phase = execution.get("phase")
+    previous_step = deepcopy(execution.get("current_step"))
+    if run_id and task_active():
+        update_task_execution(
+            status="executing",
+            phase="automatic_encoder_alignment",
+            current_step={
+                "label": "automatic shoulder alignment",
+                "kind": "encoder_alignment",
+                "motion_source": motion_source,
+            },
+        )
+        await broadcast_state()
+
+    request = EncoderShoulderAlignRequest(settings=settings_payload)
+    result = await align_shoulder_to_planning_internal(
+        request,
+        allow_active_execution=True,
+        motion_source=motion_source,
+        automatic=True,
+        target_shoulder_deg=target_shoulder_deg,
+    )
+
+    if (
+        run_id
+        and (state.task_execution or {}).get("run_id") == run_id
+        and (state.task_execution or {}).get("status") in ACTIVE_TASK_STATUSES
+    ):
+        update_task_execution(
+            status=previous_status,
+            phase=previous_phase,
+            current_step=previous_step,
+        )
+        await broadcast_state()
+
+    if not result.get("ok"):
+        message = str(result.get("error") or reason)
+        return False, f"automatic shoulder alignment failed: {message}"
+
+    remaining_reason = shoulder_alignment_motion_blocking_reason(target_shoulder_deg)
+    if remaining_reason:
+        return False, f"automatic shoulder alignment did not clear the motion gate: {remaining_reason}"
+    log_event(
+        "encoder",
+        "automatic shoulder alignment completed",
+        motion_source=motion_source,
+        mismatch=deepcopy(state.encoder_mismatch),
+    )
+    return True, "automatic shoulder alignment completed"
+
+
+@app.post("/api/encoder/shoulder/align")
+async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None = None) -> dict[str, Any]:
+    """Explicit operator-requested shoulder alignment."""
+    return await align_shoulder_to_planning_internal(request)
 
 
 @app.get("/api/kinematics/dh")
@@ -9954,6 +10140,14 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
             state.set_error(reason)
             await broadcast_state()
             return {"ok": False, "error": reason, "state": state.to_dict()}
+        aligned, reason = await ensure_shoulder_alignment_before_motion(
+            "program" if preview.get("mode") == "program" else str(preview.get("source", "path")),
+            preview.get("settings", {}),
+        )
+        if not aligned:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
         reason = hardware_trajectory_start_blocking_reason()
         if reason:
             state.set_error(reason)
@@ -10374,6 +10568,14 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
         )
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    aligned, alignment_reason = await ensure_shoulder_alignment_before_motion(
+        "task",
+        preview.get("settings", {}),
+    )
+    if not aligned:
+        state.set_error(alignment_reason)
+        await broadcast_state()
+        return {"ok": False, "error": alignment_reason, "state": state.to_dict()}
     gate_reason = task_motion_gate_reason()
     if gate_reason:
         state.set_error(gate_reason)

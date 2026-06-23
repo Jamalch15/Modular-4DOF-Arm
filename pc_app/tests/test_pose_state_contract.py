@@ -438,7 +438,7 @@ def test_small_encoder_tracked_delta_inside_correction_deadband_does_not_force_r
     assert main.controller_pose_rebase_blocking_reason() is None
 
 
-def test_completed_correction_residual_does_not_force_controller_rebase(monkeypatch):
+def test_completed_correction_bias_does_not_rewrite_planning_target_or_force_rebase(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     raw = deepcopy(config.raw)
     raw["encoders"]["enabled"] = True
@@ -497,17 +497,18 @@ def test_completed_correction_residual_does_not_force_controller_rebase(monkeypa
     main.apply_controller_status(
         "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
         "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
-        "em2=90.410 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
+        "em2=92.000 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
         "j1=0 j2=90.000 j3=20 j4=0 closed_loop=diagnostic "
-        "correction=completed correction_id=tx-1 correction_delta=-1.700000 "
-        "correction_steps=-100 correction_attempts=1 cb1=0 cb2=-1.7000 cb3=0 cb4=0 fault=OK"
+        "correction=completed correction_id=tx-1 correction_delta=2.000000 "
+        "correction_steps=100 correction_attempts=1 cb1=0 cb2=2.0000 cb3=0 cb4=0 fault=OK"
     )
 
     assert main.state.reported_angles_deg[1] == pytest.approx(90.0)
+    assert main.state.target_angles_deg[1] == pytest.approx(90.0)
     assert main.state.pose_source == "open_loop_estimate"
     assert main.state.correction_state["state"] == "completed"
-    assert main.state.correction_state["bias_deg"][1] == pytest.approx(-1.7)
-    assert main.state.encoder_mismatch["pose_tracking_status"] == "held_after_correction"
+    assert main.state.correction_state["bias_deg"][1] == pytest.approx(2.0)
+    assert main.state.encoder_mismatch["pose_tracking_status"] == "held_by_correction_bias"
     assert main.state.encoder_mismatch["controller_pose_rebase_required"] is False
 
 

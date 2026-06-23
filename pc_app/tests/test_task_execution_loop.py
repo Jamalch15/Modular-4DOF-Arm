@@ -763,6 +763,49 @@ def test_successful_batch_sequence_updates_completed_and_remaining_counts(monkey
     assert main.state.task_execution["remaining_count"] == 0
 
 
+def test_task_sequence_checks_automatic_encoder_alignment_before_each_move(monkeypatch):
+    preview = configure_task_runtime(monkeypatch, {"execution_strategy": "batch_once", "max_objects": 1})
+    sequence = {
+        "steps": [
+            {
+                "kind": "move",
+                "label": "above pickup",
+                "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0.0, 35.0, 15.0, 0.0]},
+            },
+            {
+                "kind": "move",
+                "label": "pickup",
+                "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0.0, 40.0, 10.0, 0.0]},
+            },
+        ]
+    }
+    alignment_calls: list[str] = []
+
+    async def fake_broadcast():
+        return None
+
+    async def fake_alignment(source, _settings=None, **_kwargs):
+        alignment_calls.append(source)
+        return True, "aligned"
+
+    def fake_build_preview(**_kwargs):
+        return {"ok": True, "preview": {"trajectory": {"mode": "program"}}}
+
+    async def successful_execute(_preview):
+        main.state.motion_state = MotionState.IDLE
+        main.state.motion_execution_state = "reached"
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "ensure_shoulder_alignment_before_motion", fake_alignment)
+    monkeypatch.setattr(main, "build_preview", fake_build_preview)
+    monkeypatch.setattr(main, "execute_waypoint_path", successful_execute)
+
+    result = asyncio.run(main.execute_task_sequence(sequence, preview["settings"], preview["branch"]))
+
+    assert result["ok"] is True
+    assert alignment_calls == ["task", "task"]
+
+
 def test_task_sequence_dispatches_program_substeps_instead_of_whole_program_upload(monkeypatch):
     preview = configure_task_runtime(monkeypatch, {"execution_strategy": "batch_once", "max_objects": 1})
     requested_settings = {

@@ -749,7 +749,7 @@ def test_post_move_verification_uses_commanded_target_not_open_loop_estimate(mon
     assert main.state.encoder_mismatch["estimated_error_deg"] == pytest.approx(12.5)
 
 
-def test_post_move_correction_reports_when_error_exceeds_max_delta(monkeypatch):
+def test_post_move_correction_escalates_error_above_chunk_limit_to_automatic_alignment(monkeypatch):
     raw = deepcopy(main.config.raw)
     raw["encoders"]["enabled"] = True
     raw["encoders"]["axes"][0].update(
@@ -784,8 +784,15 @@ def test_post_move_correction_reports_when_error_exceeds_max_delta(monkeypatch):
     async def no_sleep(_seconds):
         return None
 
+    recovery_calls: list[tuple[str, float | None]] = []
+
+    async def recover(source, _settings=None, *, target_shoulder_deg=None):
+        recovery_calls.append((source, target_shoulder_deg))
+        return True, "automatic shoulder alignment completed"
+
     monkeypatch.setattr(main, "_stable_shoulder_measurement", stable)
     monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(main, "ensure_shoulder_alignment_before_motion", recover)
     main.state.hardware_armed = True
     main.state.motion_state = MotionState.IDLE
     main.state.hardware_axis_states = ["hardware"] * len(config.joints)
@@ -804,7 +811,8 @@ def test_post_move_correction_reports_when_error_exceeds_max_delta(monkeypatch):
     )
 
     assert ok is True
-    assert message == "warning"
+    assert message == "corrected"
+    assert recovery_calls == [("set_all_joint_targets", pytest.approx(90.0))]
     assert main.state.encoder_mismatch["error_deg"] == pytest.approx(1.7)
     assert main.state.encoder_mismatch["correction_status"] == "skipped"
     assert "exceeds correction max delta 1.00 deg" in main.state.encoder_mismatch["correction_skip_reason"]
@@ -1024,6 +1032,84 @@ def test_manual_shoulder_align_runs_bounded_correction_to_current_target(monkeyp
     assert "CORRECTJ joint=2 delta=-4.000000" in sent[0]
     assert response["mismatch"]["status"] == "aligned"
     assert response["mismatch"]["error_deg"] == pytest.approx(0.2)
+
+
+def test_automatic_task_alignment_uses_slow_bounded_chunks_without_manual_gate(monkeypatch):
+    raw = deepcopy(main.config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+            "mounting_location": "joint_output",
+        }
+    )
+    raw["encoders"]["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": "validated",
+            "deadband_deg": 0.75,
+            "max_delta_deg": 1.0,
+            "align_max_delta_deg": 10.0,
+            "speed_deg_s": 2.0,
+            "accel_deg_s2": 10.0,
+            "allowed_sources": ["task"],
+        }
+    )
+    config = type(main.config)(**{**main.config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "serial_client", FakeSerial([]))
+    measurements = iter([92.0, 91.0, 90.2])
+    sent: list[str] = []
+
+    async def stable(_required_samples):
+        return next(measurements), "stable"
+
+    async def no_sleep(_seconds):
+        return None
+
+    def send_alignj(command):
+        sent.append(command)
+        return "OK command=ALIGNJ joint=2 delta=-1.000000 steps=-50 id=test hold=0"
+
+    monkeypatch.setattr(main, "_stable_shoulder_measurement", stable)
+    monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(main, "send_alignj_and_read_response", send_alignj)
+    monkeypatch.setattr(main, "refresh_serial_status", lambda: None)
+    main.state.config_sync_status = "synced"
+    main.state.controller_capabilities = {"protocol": 4, "encoder_config": True, "alignj": True}
+    main.state.hardware_armed = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.hardware_axis_states = ["hardware"] * len(config.joints)
+    main.state.task_execution = {"status": "executing", "run_id": "task-run"}
+    main.state.update_reported_pose(
+        [0.0, 90.0, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 90.0, 20.0, 0.0]
+
+    response = asyncio.run(
+        main.align_shoulder_to_planning_internal(
+            main.EncoderShoulderAlignRequest(
+                settings={"global_speed_deg_s": 30.0, "global_accel_deg_s2": 80.0}
+            ),
+            allow_active_execution=True,
+            motion_source="task",
+            automatic=True,
+        )
+    )
+
+    assert response["ok"] is True
+    assert [line.split(" delta=")[1].split(" ")[0] for line in sent] == [
+        "-1.000000",
+        "-1.000000",
+    ]
+    assert all("speed=2.000000 accel=10.000000" in line for line in sent)
+    assert response["mismatch"]["source"] == "task"
+    assert response["mismatch"]["status"] == "aligned"
 
 
 def test_manual_shoulder_align_uses_one_large_first_move_then_rechecks(monkeypatch):
