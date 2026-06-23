@@ -1849,6 +1849,9 @@ void handleArm(const String& rawCommand) {
         writeServoPwm(i, true);
       }
     }
+    if (controllerState == ControllerState::Stopped) {
+      controllerState = ControllerState::Idle;
+    }
     clearFaultText();
   } else {
     armed = false;

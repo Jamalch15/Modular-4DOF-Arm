@@ -1407,6 +1407,57 @@ def test_closed_loop_task_execute_recovers_from_previous_stopped_state(monkeypat
     assert main.state.last_error == ""
 
 
+def test_closed_loop_camera_clear_recovers_stopped_state_refreshed_after_task_start(monkeypatch):
+    executed: list[dict] = []
+    preview = configure_task_runtime(
+        monkeypatch,
+        {"execution_strategy": "closed_loop", "max_objects": 1},
+    )
+    counters = install_closed_loop_stubs(
+        monkeypatch,
+        [[detection("red", detection_id="r1")]],
+        executed,
+    )
+    observed_camera_clear_states: list[MotionState] = []
+
+    def stale_post_arm_gate():
+        main.state.motion_state = MotionState.STOPPED
+        return None
+
+    async def observe_camera_clear(name, settings, branch, label):
+        counters["camera_clear_moves"] += 1
+        observed_camera_clear_states.append(main.state.motion_state)
+        return {"ok": True}
+
+    monkeypatch.setattr(main, "task_motion_gate_reason", stale_post_arm_gate)
+    monkeypatch.setattr(main, "move_task_named_position", observe_camera_clear)
+
+    asyncio.run(main.execute_closed_loop_sorting(preview))
+
+    assert observed_camera_clear_states == [MotionState.IDLE]
+    assert counters["captures"] == 1
+    assert len(executed) == 1
+    assert main.state.task_execution["status"] == "completed"
+
+
+def test_fresh_task_stopped_recovery_does_not_clear_stop_after_progress(monkeypatch):
+    configure_task_runtime(
+        monkeypatch,
+        {"execution_strategy": "closed_loop", "max_objects": 2},
+    )
+    main.state.task_execution["completed_count"] = 1
+    main.state.task_execution["last_completed_step"] = {
+        "label": "release",
+        "completed_at": 1.0,
+    }
+    main.state.motion_state = MotionState.STOPPED
+
+    resumed = main.resume_fresh_task_motion_from_stopped()
+
+    assert resumed is False
+    assert main.state.motion_state == MotionState.STOPPED
+
+
 def test_task_execute_rejects_preview_after_destination_mapping_changes(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     monkeypatch.setattr(main, "config", config)

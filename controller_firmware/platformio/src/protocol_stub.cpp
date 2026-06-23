@@ -313,7 +313,9 @@ void handleArm(const char* buffer) {
     return;
   }
   armed = requested != 0;
-  if (!armed && controllerState != ControllerState::Estop) {
+  if (armed && controllerState == ControllerState::Stopped) {
+    controllerState = ControllerState::Idle;
+  } else if (!armed && controllerState != ControllerState::Estop) {
     clearTrajectory();
     clearJogMotion(true);
     controllerState = ControllerState::Stopped;

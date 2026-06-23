@@ -2453,6 +2453,21 @@ def task_motion_gate_reason() -> str | None:
     return None
 
 
+def resume_fresh_task_motion_from_stopped() -> bool:
+    execution = state.task_execution or {}
+    if state.motion_state != MotionState.STOPPED:
+        return False
+    if int(execution.get("completed_count", 0) or 0) != 0 or execution.get("last_completed_step"):
+        return False
+    state.motion_state = MotionState.IDLE
+    log_event(
+        "task",
+        "fresh task motion resumed from controller stopped state",
+        run_id=execution.get("run_id"),
+    )
+    return True
+
+
 def disable_live_motion(command: str | None = None) -> None:
     state.live_motion_enabled = False
     reset_cartesian_jog_runtime()
@@ -6442,6 +6457,8 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                 finish_task_execution("failed", gate_reason)
                 await broadcast_state()
                 return
+            if completed == 0:
+                resume_fresh_task_motion_from_stopped()
 
             update_task_execution(
                 status="running",
