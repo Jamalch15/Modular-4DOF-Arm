@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha1
 from math import isfinite
 from typing import Any
 
@@ -238,6 +239,21 @@ def _safe_token(value: Any, fallback: str = "none") -> str:
     return text.replace(" ", "_")
 
 
+def _short_firmware_id_token(value: Any, fallback: str = "none") -> str:
+    text = _safe_token(value)
+    if text == "none":
+        return fallback
+    # The controller only needs a compact identity/validation marker. Keep full
+    # UUIDs in the PC config, not in bounded serial command lines.
+    return f"v{sha1(text.encode('ascii', errors='ignore')).hexdigest()[:10]}"
+
+
+def _short_validation_token(value: Any, *, enabled: bool) -> str:
+    if not enabled:
+        return "none"
+    return _short_firmware_id_token(value)
+
+
 def _safe_int(value: Any, fallback: int) -> int:
     try:
         if isinstance(value, bool):
@@ -290,10 +306,11 @@ def _encoder_config_lines(encoders: dict[str, Any] | None) -> list[str]:
             f"freshness_ms={_safe_int(axis.get('freshness_timeout_ms', 500), 500)} "
             f"max_noise={_safe_float(axis.get('max_noise_deg', 0.5), 0.5):.6f} "
             f"calibrated={1 if bool(axis.get('calibration_validated')) else 0} "
-            f"calibration_id={_safe_token(axis.get('calibration_id'))}"
+            f"calibration_id={_short_firmware_id_token(axis.get('calibration_id'))}"
         )
     verification = encoders.get("verification") if isinstance(encoders.get("verification"), dict) else {}
     correction = encoders.get("correction") if isinstance(encoders.get("correction"), dict) else {}
+    correction_enabled = bool(correction.get("enabled"))
     auto_max_delta = _safe_float(correction.get("max_delta_deg", 1.0), 1.0)
     align_max_delta = _safe_float(correction.get("align_max_delta_deg", auto_max_delta), auto_max_delta)
     firmware_max_delta = max(auto_max_delta, align_max_delta)
@@ -307,8 +324,8 @@ def _encoder_config_lines(encoders: dict[str, Any] | None) -> list[str]:
         f"fault={_safe_float(verification.get('fault_tolerance_deg', 5.0), 5.0):.6f} "
         f"hysteresis={_safe_float(verification.get('hysteresis_deg', 0.25), 0.25):.6f} "
         f"require={1 if bool(verification.get('require_encoder')) else 0} "
-        f"correction={1 if bool(correction.get('enabled')) else 0} "
-        f"validation_id={_safe_token(correction.get('validation_id'))} "
+        f"correction={1 if correction_enabled else 0} "
+        f"validation_id={_short_validation_token(correction.get('validation_id'), enabled=correction_enabled)} "
         f"max_delta={firmware_max_delta:.6f} "
         f"limit_margin={_safe_float(correction.get('joint_limit_margin_deg', 2.0), 2.0):.6f} "
         f"correction_speed={_safe_float(correction.get('speed_deg_s', 2.0), 2.0):.6f} "

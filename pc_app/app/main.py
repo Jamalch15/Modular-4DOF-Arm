@@ -5035,6 +5035,17 @@ def _encoder_runtime_requested(settings: dict[str, Any]) -> bool:
     return bool(settings.get("enabled"))
 
 
+def _encoder_runtime_should_be_active(settings: dict[str, Any] | None = None) -> bool:
+    return _controller_supports_encoder_config() and _encoder_runtime_requested(settings or encoder_settings(config))
+
+
+def _encoder_runtime_off_message() -> str:
+    return (
+        "controller reports encoder runtime off even though shoulder encoder readback is enabled; "
+        "disarm and sync controller configuration"
+    )
+
+
 def _encoder_unsupported_message(settings: dict[str, Any]) -> str:
     capabilities = state.controller_capabilities or {}
     protocol = capabilities.get("protocol")
@@ -5087,12 +5098,45 @@ def sync_hardware_config() -> dict[str, Any]:
         for line in format_config_lines(config.joints, tools_settings(config), encoders_for_sync):
             serial_client.send_line(line)
         response = read_serial_until_any(("OK command=CONFIG", "ERR"), timeout_s=2.0)
-    except SerialClientError as exc:
+    except (SerialClientError, ValueError) as exc:
         state.config_sync_status = "failed"
         state.config_sync_message = str(exc)
         return {"ok": False, "status": state.config_sync_status, "evaluation": evaluation, "message": state.config_sync_message}
 
     if response.startswith("OK command=CONFIG"):
+        if _encoder_runtime_should_be_active(encoders):
+            try:
+                serial_client.clear_input()
+                serial_client.send_line(format_status())
+                status_line = serial_client.read_until_prefix("STATUS", timeout_s=1.0)
+                apply_controller_status(status_line)
+            except Exception as exc:
+                state.config_sync_status = "failed"
+                state.config_sync_message = f"could not verify encoder runtime after config sync: {exc}"
+                return {
+                    "ok": False,
+                    "status": state.config_sync_status,
+                    "evaluation": evaluation,
+                    "response": response,
+                    "message": state.config_sync_message,
+                }
+            if state.closed_loop_mode == "off":
+                state.config_sync_status = "failed"
+                state.config_sync_message = _encoder_runtime_off_message()
+                state.encoder_mismatch = {
+                    **state.encoder_mismatch,
+                    "status": "encoder_config_inactive",
+                    "message": state.config_sync_message,
+                    "checked_at": time(),
+                }
+                log_event("controller", "encoder runtime inactive after config sync", status_line=status_line)
+                return {
+                    "ok": False,
+                    "status": state.config_sync_status,
+                    "evaluation": evaluation,
+                    "response": response,
+                    "message": state.config_sync_message,
+                }
         state.config_sync_status = "synced"
         if state.config_change.get("pose_revalidation_required") and not state.known_pose:
             state.config_sync_message = (
@@ -6913,6 +6957,21 @@ def apply_controller_status(status_line: str) -> None:
         "attempts": status.correction_attempts,
         "bias_deg": status.correction_bias_deg or [None] * len(config.joints),
     }
+    if (
+        state.config_sync_status == "synced"
+        and _encoder_runtime_should_be_active()
+        and status.closed_loop_mode == "off"
+    ):
+        message = _encoder_runtime_off_message()
+        state.config_sync_status = "stale"
+        state.config_sync_message = message
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "encoder_config_inactive",
+            "message": message,
+            "checked_at": time(),
+        }
+        log_event("controller", "encoder runtime became inactive", status_line=status_line)
     pose_tracked_from_encoder = apply_shoulder_encoder_pose_tracking(status.state)
     if (
         not pose_tracked_from_encoder

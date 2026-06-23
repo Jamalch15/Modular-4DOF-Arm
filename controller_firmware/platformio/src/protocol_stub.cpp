@@ -21,6 +21,7 @@
 namespace {
 constexpr unsigned long kSerialWaitMs = 3000;
 constexpr uint32_t kStatusIntervalMs = 1000;
+constexpr int kMaxLineLength = 512;
 constexpr int kMaxTrajectoryPoints = 240;
 constexpr uint32_t kJogWatchdogMs = 350;
 constexpr float kHomePose[4] = {0.0f, 20.0f, 20.0f, 0.0f};
@@ -604,7 +605,7 @@ void handleCommand(String rawCommand) {
     return;
   }
 
-  char buffer[160] = {};
+  char buffer[kMaxLineLength] = {};
   rawCommand.toCharArray(buffer, sizeof(buffer));
 
   char command[24] = {};
@@ -652,7 +653,7 @@ void readSerialCommands() {
     if (incoming == '\n' || incoming == '\r') {
       handleCommand(commandLine);
       commandLine = "";
-    } else if (commandLine.length() < 159) {
+    } else if (commandLine.length() < kMaxLineLength - 1) {
       commandLine += incoming;
     }
   }

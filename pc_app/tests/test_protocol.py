@@ -157,6 +157,39 @@ def test_format_hardware_config_lines_from_config():
     assert any("CONFIG ENCODER_POLICY" in line and "max_delta=60.000000" in line for line in lines)
 
 
+def test_enabled_encoder_policy_line_fits_controller_command_buffer():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    encoders = encoder_settings(config)
+    long_validation_id = "shoulder-correction-" + ("a" * 96)
+    encoders["enabled"] = True
+    encoders["mode"] = "bounded_correction"
+    encoders["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 15,
+            "calibration_validated": True,
+            "calibration_id": "calibration-" + ("b" * 64),
+        }
+    )
+    encoders["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": long_validation_id,
+            "align_max_delta_deg": 60.0,
+        }
+    )
+
+    lines = format_config_lines(config.joints, tools_settings(config), encoders)
+    policy_line = next(line for line in lines if line.startswith("CONFIG ENCODER_POLICY "))
+    encoder_line = next(line for line in lines if line.startswith("CONFIG ENCODER joint=2 "))
+
+    assert max(len(line) for line in lines) < 320
+    assert long_validation_id not in policy_line
+    assert encoders["axes"][0]["calibration_id"] not in encoder_line
+    assert "calibration_id=v" in encoder_line
+    assert "validation_id=v" in policy_line
+
+
 def test_disabled_encoder_config_formatting_tolerates_stale_local_values():
     config = load_config(EXAMPLE_CONFIG_PATH)
     encoders = encoder_settings(config)

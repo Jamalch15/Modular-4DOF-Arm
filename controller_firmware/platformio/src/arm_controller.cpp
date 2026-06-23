@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned long kSerialWaitMs = 3000;
 constexpr uint32_t kStatusIntervalMs = 1000;
 constexpr int kJointCount = 4;
-constexpr int kMaxLineLength = 320;
+constexpr int kMaxLineLength = 512;
 constexpr int kMaxTrajectoryPoints = 240;
 constexpr uint32_t kJogWatchdogMs = 350;
 constexpr int kServoPwmResolutionBits = 14;
