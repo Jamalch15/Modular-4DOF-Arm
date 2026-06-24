@@ -81,12 +81,11 @@ Detailed subsystem notes:
 ## Quick Start
 
 The dashboard can run in simulation mode without the ESP32-S3 connected.
+If the virtual environment already exists, start the UI with:
 
 ```powershell
 cd pc_app
-python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -96,7 +95,20 @@ Open:
 http://127.0.0.1:8000
 ```
 
-For later runs, activate the virtual environment and start `uvicorn` again.
+Keep that PowerShell window open while using the dashboard. Stop the server
+with `Ctrl+C`.
+
+For first-time setup, create the virtual environment and install dependencies
+before starting `uvicorn`:
+
+```powershell
+cd pc_app
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
 The tracked `pc_app/config/robot.example.yaml` is the simulation-safe fallback.
 Machine-specific calibration and hardware settings are saved in
 `pc_app/config/robot.local.yaml` when present.
