@@ -379,7 +379,7 @@ Test coverage is strong for backend math and APIs but weak for:
 
 These inputs should override the old roadmap order.
 
-### What `docs/remaining_implementation_plan.md` already covers
+### What `docs/planning/remaining_implementation_plan.md` already covers
 
 The older roadmap provides useful subsystem inventory and records many first
 passes:
@@ -468,7 +468,7 @@ After review:
   current command-correction algorithm until it is revised;
 - `pc_app/README.md` should remain the operator/run guide and be updated as
   packages land;
-- `docs/remaining_implementation_plan.md` should be retained as historical
+- `docs/planning/remaining_implementation_plan.md` should be retained as historical
   subsystem context, with a short pointer to this plan;
 - `comments.md` should remain raw operator input, not an architecture spec.
 
@@ -1908,7 +1908,7 @@ Only the following remain genuinely unresolved after repository inspection.
 
 ```text
 Implement only the first batch from
-docs/revised_implementation_plan_from_comments.md:
+docs/planning/revised_implementation_plan_from_comments.md:
 WP-01 plus the minimum WP-02 Home changes.
 
 Add backend pose revisions and preview start-pose fingerprints, reject stale

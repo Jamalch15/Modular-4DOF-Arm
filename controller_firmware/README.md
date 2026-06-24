@@ -1,10 +1,17 @@
-# Controller Firmware Notes
+# ARES-4 Controller Firmware
 
-This folder documents the current ESP32-S3 firmware direction.
+This folder contains the ESP32-S3 PlatformIO firmware used by the ARES-4 robot
+arm prototype, plus smaller hardware-test sketches used during bring-up. For
+the full repository overview, see [../README.md](../README.md).
 
-The existing PlatformIO firmware in `platformio/src/main.cpp` is preserved as a useful hardware test tool for one stepper and one servo.
+The existing firmware in `platformio/src/main.cpp` is preserved as a useful
+single-axis stepper/servo hardware test.
 
-A newer open-loop full-arm controller now lives in `platformio/src/arm_controller.cpp`. It accepts dashboard hardware config, drives only enabled valid axes, and simulates disabled axes in its reported pose. This is still exploratory firmware, not final closed-loop robot control.
+The main open-loop full-arm controller lives in
+`platformio/src/arm_controller.cpp`. It accepts dashboard hardware config,
+drives only enabled valid axes, simulates disabled axes in its reported pose,
+and reports status back to the PC app. It is prototype firmware, not a final
+closed-loop robot controller.
 
 Before writing final motor-control firmware, collect the missing hardware details:
 

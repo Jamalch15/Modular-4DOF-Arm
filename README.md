@@ -1,171 +1,183 @@
-# Modular 4DOF Arm
+# ARES-4 Modular 4DOF Robot Arm
 
-## Status
+ARES-4 is a mechatronics prototype for object handling with a modular 4DOF
+robot arm. The system combines a browser-based PC control app, an ESP32-S3
+controller layer, interchangeable end-effector support, vision-assisted task
+workflows, and the supporting mechanical and electronics design files.
 
-This repository is at an early concept stage.
+The repository is intended to accompany the final report as the source-code
+and design-file reference. It keeps the runnable software, firmware, test
+suite, configuration template, and engineering notes in one place without
+committing draft report PDFs or course handouts.
 
-The ideas described here are intentionally vague, incomplete, and subject to change. Nothing in this document set should be treated as a final architecture, final feature list, or final hardware/software split. The purpose of these docs is to capture the current direction of the project so development can start from a shared mental model.
+## Project Overview
 
-## Early Project Overview
+The arm is built as a compact serial manipulator for small-object handling.
+The current prototype uses two stepper-driven inner joints, two servo-driven
+outer joints, and a quick-swap tool interface for end effectors such as a
+gripper or electromagnet.
 
-The project is a modular 4DOF robot arm for a mechatronics project.
+The software is split into two main layers:
 
-At a high level, the software side is expected to cover:
+- PC side: local GUI, robot model, forward/inverse kinematics, trajectory
+  generation, task sequencing, camera processing, calibration, logging, and
+  serial communication.
+- Controller side: ESP32-S3 firmware for hardware-facing actuator commands,
+  tool control, safety state, configuration sync, and status reporting.
 
-- Robot motion logic such as inverse kinematics, motion sequencing, and path planning
-- Vision processing, likely including YOLO or related detection pipelines
-- Task-specific application logic for different robot tasks
-- Communication between a host computer and an embedded controller
-- A GUI for operating, tuning, calibrating, and testing the robot
-
-## Current Working Idea
-
-The current idea is to split computation between:
-
-- PC side
-- Embedded controller side
-
-The rough expectation is:
-
-- The PC handles heavy computation such as vision, task reasoning, and possibly IK/path planning
-- The embedded controller handles low-level actuator control and hardware-facing behavior
-
-This is only a working assumption. It may change once timing, reliability, and integration constraints are better understood.
-
-## Robot Concept
-
-The robot arm is currently expected to include:
-
-- Two open-loop stepper-driven joints
-- Two hobby-servo-driven joints
-- One interchangeable end effector depending on task
-
-Possible end effectors may include:
-
-- Gripper
-- Electromagnet
-- Other task-specific tooling
-
-The exact actuator arrangement, joint roles, coordinate conventions, and tool control interfaces are not final.
-
-## Task-Oriented Direction
-
-The robot is expected to perform multiple tasks. The current idea is that each task may have:
-
-- Its own perception setup
-- Its own task logic
-- Its own object classes or detection targets
-- Shared robot motion and control infrastructure underneath
-
-Examples of future task types could include:
-
-- Pick and place
-- Sorting
-- Object-specific handling
-- Vision-guided interaction with a workspace
-
-It is not yet decided whether each task should be a separate program, a plugin/module, or a configuration-driven mode inside one larger application.
-
-## Documentation Map
-
-- [AGENTS.md](AGENTS.md): guidance for coding agents working in this repository
-- [pc_app/README.md](pc_app/README.md): local PC operator dashboard
-- [controller_firmware/README.md](controller_firmware/README.md): ESP32-S3 firmware notes and PlatformIO commands
-- `electronics/`: KiCad electronics design files
-- [docs/architecture.md](docs/architecture.md): rough system architecture ideas
-- [docs/component_master_plan.md](docs/component_master_plan.md): broad component planning guide
-- [docs/accelerated_exam_demo_plan.md](docs/accelerated_exam_demo_plan.md): faster exam-focused demo roadmap
-- [docs/physical_calibration_truth.md](docs/physical_calibration_truth.md): working DH, joint convention, TCP, and calibration-chain contract
-- [docs/shoulder_encoder_integration.md](docs/shoulder_encoder_integration.md): calibrated shoulder evidence, faulting, and bounded correction contract
-- [docs/calibration_system_pass_2026-06-21.md](docs/calibration_system_pass_2026-06-21.md): calibration architecture diagnosis, implemented workflow, and required physical measurements
-- [docs/tasks/README.md](docs/tasks/README.md): early notes on task structure
-- [docs/open_questions.md](docs/open_questions.md): unresolved decisions and design questions
-
-## Run The Local Dashboard
-
-The dashboard runs locally through the Python FastAPI server. From PowerShell:
-
-```powershell
-cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
-.\.venv\Scripts\Activate.ps1
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Keep that PowerShell window open, then visit:
+The normal demo flow is:
 
 ```text
-http://127.0.0.1:8000
+camera or operator input
+-> robot-frame target
+-> task sequence
+-> IK and trajectory preview
+-> operator approval
+-> ESP32-S3 motion/tool commands
+-> status feedback to the GUI
 ```
 
-If this is the first run, create the virtual environment and install the
-dependencies first:
+## Current Features
+
+- Local FastAPI/WebSocket backend with a browser dashboard.
+- 3D robot viewport with current pose, preview pose, target marker, path line,
+  and projected workspace camera layer.
+- Manual joint controls, Cartesian target preview, live jog modes, and
+  reusable program builder.
+- Pick-and-place and color-sorting task workflows with preview before
+  execution.
+- Standard DH-based forward kinematics and numerical Jacobian inverse
+  kinematics.
+- Configurable robot geometry, joint limits, tool offsets, motion limits,
+  hardware IO, camera calibration, and task destinations.
+- ESP32-S3 PlatformIO firmware targets for single-axis tests, no-motor protocol
+  testing, and the open-loop full-arm controller.
+- Shoulder AS5048A encoder readback support for calibrated evidence,
+  diagnostics, and optional bounded correction workflows.
+- Python test suite covering configuration, kinematics, motion, safety,
+  protocol, vision/task integration, calibration, and program behavior.
+
+## Repository Layout
+
+```text
+pc_app/                 PC dashboard, backend, tests, tools, and config template
+controller_firmware/    ESP32-S3 PlatformIO firmware and serial protocol notes
+docs/                   Architecture, calibration, vision, and planning notes
+electronics/            KiCad schematics, PCB files, footprints, and symbols
+Mechanical/             Mechanical calculation files
+.github/workflows/      GitHub Actions test workflow for the PC app
+```
+
+Detailed subsystem notes:
+
+- [pc_app/README.md](pc_app/README.md): dashboard setup, GUI guide,
+  configuration, calibration, and protocol details.
+- [controller_firmware/README.md](controller_firmware/README.md): PlatformIO
+  environments, firmware roles, upload notes, and controller behavior.
+- [docs/README.md](docs/README.md): documentation map for architecture,
+  calibration, vision, task, and historical planning notes.
+- [AGENTS.md](AGENTS.md): repository guidance for coding agents.
+
+## Quick Start
+
+The dashboard can run in simulation mode without the ESP32-S3 connected.
 
 ```powershell
-cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
+cd pc_app
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Simulation mode is the working default, so an ESP32 does not need to be
-connected just to open and inspect the dashboard.
+Open:
 
-## Stop, Restart, Or Reset Localhost
-
-To stop localhost normally, select the PowerShell window running Uvicorn and
-press `Ctrl+C`.
-
-To restart it, stop the server and run:
-
-```powershell
-cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
-.\.venv\Scripts\Activate.ps1
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```text
+http://127.0.0.1:8000
 ```
 
-If port 8000 is stuck after a crash, find and stop the process using it:
+For later runs, activate the virtual environment and start `uvicorn` again.
+The tracked `pc_app/config/robot.example.yaml` is the simulation-safe fallback.
+Machine-specific calibration and hardware settings are saved in
+`pc_app/config/robot.local.yaml` when present.
+
+## Testing
+
+Run the PC app test suite from `pc_app`:
 
 ```powershell
-$processId = (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess
-Stop-Process -Id $processId
+cd pc_app
+python -m pytest
 ```
 
-Then start Uvicorn again. If the browser still shows an old page, use
-`Ctrl+F5` to perform a hard refresh.
+GitHub Actions runs the same suite on Ubuntu from a clean checkout. Tests that
+depend on the committed reference robot configuration should use the example
+config explicitly, because local machines may also have an ignored
+`robot.local.yaml`.
 
-To reset the app's saved machine-specific settings, stop the server and rename
-the local config:
+## Firmware Build
+
+PlatformIO is used for the ESP32-S3 firmware.
 
 ```powershell
-cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
-Move-Item .\config\robot.local.yaml .\config\robot.local.backup.yaml
+cd controller_firmware\platformio
+pio run -e esp32-s3-arm-controller
 ```
 
-Start the server again. The app will fall back to the tracked,
-simulation-safe `config/robot.example.yaml`. This resets saved calibration,
-hardware IO, tool, camera, and other local settings; keep the backup if those
-values may be needed later.
+Useful upload targets are documented in
+[controller_firmware/README.md](controller_firmware/README.md). The main
+prototype controller is `platformio/src/arm_controller.cpp`; `main.cpp` remains
+as a single-axis hardware test sketch.
 
-More startup and troubleshooting details are in
-[pc_app/README.md](pc_app/README.md).
+## Configuration And Calibration
 
-## GitHub And Local Files
+The PC app keeps the robot model in YAML configuration:
 
-The intended GitHub repository name is `modular-4dof-arm`.
+- `pc_app/config/robot.example.yaml` is tracked and should stay generic.
+- `pc_app/config/robot.local.yaml` is ignored and stores machine-specific
+  geometry, calibration, IO pins, camera settings, and task setup.
+- `pc_app/config/programs.local.json` is ignored and stores local user-created
+  motion programs.
 
-Tracked configuration should stay generic. Machine-specific calibration and
-hardware values belong in `pc_app/config/robot.local.yaml`, which is ignored by
-Git. The tracked `pc_app/config/robot.example.yaml` remains the template and
-simulation-safe fallback.
+Calibration-related notes are collected in [docs/README.md](docs/README.md).
+The most relevant implementation references are the kinematics calibration,
+workspace vision calibration, and shoulder encoder documents.
 
-## Intended Use Of These Docs
+## Safety Notes
 
-These docs are here to:
+This is a prototype robot system. Preview planned motion in the dashboard
+before executing it on physical hardware, keep joint limits conservative, and
+keep the workspace clear while armed. Real hardware movement requires a known
+pose, synced hardware configuration, an armed controller, and a valid motion
+request. `STOP` and `ESTOP` paths are implemented in the app/controller flow,
+but they do not replace normal lab safety practices.
 
-- Capture current intent before details are forgotten
-- Give future contributors and agents a shared starting point
-- Make assumptions explicit
-- Leave room for the design to evolve without pretending decisions are final
+The current control approach is mostly open-loop during motion. Encoder
+readback is used as calibrated evidence for the shoulder joint and optional
+post-move checks; it is not a complete closed-loop Cartesian control system.
 
-If a future implementation conflicts with these notes, the implementation or updated design discussion should take priority over outdated assumptions in these early docs.
+## Local Files And Generated Output
+
+The repo intentionally ignores local and generated files such as:
+
+- Python virtual environments, caches, and test output.
+- PlatformIO build output under `.pio/`.
+- Local robot/app calibration files.
+- KiCad lock files, backup folders, and history folders.
+- Localhost server logs.
+
+Before submitting or pushing, check:
+
+```powershell
+git status --short
+```
+
+Only source, documentation, design files, and intentional configuration
+templates should be committed.
+
+## AI Usage
+
+AI tools were used as support for drafting, organization, code review, and
+implementation assistance during development. The design choices, validation,
+testing, and submitted project work remain the responsibility of the project
+authors.

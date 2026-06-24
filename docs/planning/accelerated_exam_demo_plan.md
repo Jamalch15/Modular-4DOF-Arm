@@ -6,7 +6,7 @@ This document is a fast, presentation-focused development plan for the robot arm
 
 It intentionally focuses on the parts that are visible from the outside during an exam or demo. The goal is not to build every possible subsystem. The goal is to build the most convincing prototype: a robot that looks coordinated, vision-guided, calibrated, safe, and understandable.
 
-The older broader component plan is kept in `docs/component_master_plan.md`.
+The older broader component plan is kept in `component_master_plan.md`.
 
 ## Exam Goal
 

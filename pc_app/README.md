@@ -1,6 +1,12 @@
-# Modular 4DOF Arm PC Control App
+# ARES-4 PC Control App
 
-This is a local control dashboard for the provisional 4DOF robot arm architecture.
+This folder contains the PC-side dashboard and planning backend for the ARES-4
+robot arm prototype. It runs locally in a browser and handles the operator
+interface, robot model, kinematics, trajectory preview, task sequencing,
+calibration workflows, vision integration, and serial communication with the
+ESP32-S3 controller.
+
+For the full repository overview, see [../README.md](../README.md).
 
 The operator-facing Cartesian TCP calibration workflow is documented in
 [../docs/kinematics_calibration.md](../docs/kinematics_calibration.md). Shoulder
