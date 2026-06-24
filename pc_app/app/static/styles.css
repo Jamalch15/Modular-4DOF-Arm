@@ -368,6 +368,18 @@ code {
   background: rgba(13, 19, 29, 0.65);
 }
 
+.detection-tuning-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.detection-tuning-row .field-help {
+  margin: 0 0 7px;
+}
+
 .task-detection-table table {
   width: 100%;
   min-width: 720px;

@@ -76,6 +76,7 @@ const state = {
   latestDetections: [],
   taskDetectionsCapturedAt: null,
   taskDetectionSnapshotId: null,
+  taskDetectionMinAreaPx: null,
   activeTaskStep: "setup",
   taskProgressStep: "setup",
   taskColorProfilesDraft: null,
@@ -387,6 +388,7 @@ const elements = {
   taskRunMonitor: $("#taskRunMonitor"),
   viewCameraBtn: $("#viewCameraBtn"),
   detectVisionBtn: $("#detectVisionBtn"),
+  detectionMinAreaInput: $("#detectionMinAreaInput"),
   cameraPopup: $("#cameraPopup"),
   cameraPopupHandle: $("#cameraPopupHandle"),
   cameraPopupStatus: $("#cameraPopupStatus"),
@@ -4334,6 +4336,52 @@ function cameraLiveIntervalMs() {
   return clamp(Number(state.config?.camera?.detection?.live_interval_ms || 450), 150, 5000);
 }
 
+function configuredDetectionMinAreaPx(camera = state.config?.camera || {}) {
+  const value = Number(camera?.detection?.min_object_area_px);
+  return Number.isFinite(value) ? Math.max(1, value) : 400;
+}
+
+function currentDetectionMinAreaPx() {
+  const value = Number(state.taskDetectionMinAreaPx);
+  return Number.isFinite(value) ? Math.max(1, value) : configuredDetectionMinAreaPx();
+}
+
+function syncDetectionTuningControls() {
+  if (!elements.detectionMinAreaInput) return;
+  const value = currentDetectionMinAreaPx();
+  elements.detectionMinAreaInput.value = format(value, 0);
+  elements.detectionMinAreaInput.title = `Saved default: ${format(configuredDetectionMinAreaPx(), 0)} px`;
+}
+
+function readDetectionMinAreaInput() {
+  const raw = String(elements.detectionMinAreaInput?.value ?? "").trim();
+  if (!raw) return configuredDetectionMinAreaPx();
+  const value = Number(raw);
+  return Number.isFinite(value) ? clamp(value, 1, 1000000) : configuredDetectionMinAreaPx();
+}
+
+function updateDetectionMinAreaFromInput() {
+  const next = readDetectionMinAreaInput();
+  const previous = currentDetectionMinAreaPx();
+  state.taskDetectionMinAreaPx = next;
+  syncDetectionTuningControls();
+  if (Math.round(next) !== Math.round(previous)) {
+    invalidateTaskDetections("Detection size filter changed - refresh detections");
+    if (state.cameraLive) scheduleCameraFrame(0);
+  }
+}
+
+function visionDetectionTuningRequest() {
+  return { min_object_area_px: currentDetectionMinAreaPx() };
+}
+
+function applyDetectionTuningPayload(tuning = {}) {
+  const value = Number(tuning.min_object_area_px);
+  if (!Number.isFinite(value)) return;
+  state.taskDetectionMinAreaPx = Math.max(1, value);
+  syncDetectionTuningControls();
+}
+
 function scheduleCameraFrame(delayMs = cameraLiveIntervalMs()) {
   window.clearTimeout(state.cameraTimer);
   state.cameraTimer = null;
@@ -4419,10 +4467,7 @@ async function detectVision() {
   if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = "Detecting...";
   elements.visionSummary.innerHTML = `<div class="log-line"><span>Status</span><code>Detecting...</code></div>`;
   try {
-    const payload = await fetch(
-      `/api/vision/frame?t=${Date.now()}`,
-      { cache: "no-store" }
-    ).then((response) => response.json());
+    const payload = await postJson("/api/vision/frame", visionDetectionTuningRequest());
     elements.visionSummary.innerHTML = "";
     if (!payload.ok) {
       elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
@@ -4430,6 +4475,7 @@ async function detectVision() {
       if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = payload.error || "Detection failed";
       return;
     }
+    applyDetectionTuningPayload(payload.detection_tuning);
     state.latestDetections = payload.detections || [];
     state.taskDetectionsCapturedAt = payload.captured_at || Date.now() / 1000;
     state.taskDetectionSnapshotId = payload.detection_snapshot_id || null;
@@ -4460,6 +4506,10 @@ async function detectVision() {
     calibrationLine.className = "log-line";
     calibrationLine.innerHTML = `<span>Calibration</span><code>${workspace.message || workspace.error || payload.calibration_source || "unavailable"}</code>`;
     elements.visionSummary.appendChild(calibrationLine);
+    const tuningLine = document.createElement("div");
+    tuningLine.className = "log-line";
+    tuningLine.innerHTML = `<span>Object area</span><code>minimum ${format(currentDetectionMinAreaPx(), 0)} px</code>`;
+    elements.visionSummary.appendChild(tuningLine);
     if (workspace.workspace_polygon_source) {
       const workspaceLine = document.createElement("div");
       workspaceLine.className = "log-line";
@@ -6241,6 +6291,7 @@ function updateDisabledState() {
   elements.resetJointPreviewBtn.disabled = !state.draftAngles && !state.commandedAngles;
   elements.homeBtn.disabled = !enabled;
   if (elements.alignShoulderBtn) {
+    const robotState = state.robotState || {};
     const encoderEvidence = state.robotState?.encoder_evidence?.[1] || {};
     const measured = Number(encoderEvidence.measured_angle_deg);
     const target = Number(state.robotState?.target_angles_deg?.[1]);
@@ -6253,12 +6304,17 @@ function updateDisabledState() {
     );
     const alignError = Number.isFinite(measured) && Number.isFinite(target) ? measured - target : null;
     const needsAlign = Boolean(encoderEvidence.fresh) && alignError != null && Math.abs(alignError) > alignThreshold;
-    elements.alignShoulderBtn.disabled = !enabled
-      || Boolean(state.robotState?.simulation)
-      || !["idle", "stopped"].includes(state.robotState?.motion_state)
+    const alignIdleStateReady = ["idle", "stopped"].includes(state.robotState?.motion_state);
+    const encoderFaultOverrideReady = Boolean(robotState.encoder_fault) && robotState.motion_state === "fault";
+    const alignMotionReady = alignIdleStateReady || encoderFaultOverrideReady;
+    elements.alignShoulderBtn.disabled = !robotState.connected
+      || Boolean(robotState.simulation)
+      || !alignMotionReady
       || (encoderEvidence.measured_angle_deg == null && encoderEvidence.raw_angle_deg == null);
     elements.alignShoulderBtn.classList.toggle("attention", needsAlign);
-    elements.alignShoulderBtn.title = needsAlign
+    elements.alignShoulderBtn.title = encoderFaultOverrideReady
+      ? "Clear the encoder fault and run shoulder alignment"
+      : needsAlign
       ? `Shoulder is ${format(alignError, 2)} deg from the planning target. Press Align before normal hardware moves.`
       : "Move shoulder toward the current planning/target angle using encoder alignment";
   }
@@ -8398,6 +8454,9 @@ function applyConfig(config, options = {}) {
   state.dhDraftRows = null;
   state.taskColorProfilesDraft = clonePlain(config.color_profiles || {});
   state.taskDestinationsDraft = savedTaskDestinations();
+  if (state.taskDetectionMinAreaPx == null || replacingConfig) {
+    state.taskDetectionMinAreaPx = configuredDetectionMinAreaPx(config.camera || {});
+  }
   state.positionLibraryDraft = savedPositionLibraryRecords();
   state.positionLibraryErrors = {};
   state.unsavedColorProfiles.clear();
@@ -8446,6 +8505,7 @@ function applyConfig(config, options = {}) {
   state.view.setConfig(state.config);
   syncJointControls();
   renderCameraIntrinsics(state.config.camera);
+  syncDetectionTuningControls();
   if (!state.config.camera?.enabled) {
     if (state.cameraLive) setCameraLive(false);
     window.clearTimeout(state.workspaceProjectionTimer);
@@ -9218,6 +9278,7 @@ function bindActions() {
     setCameraPopupVisible(true);
     detectVision();
   });
+  elements.detectionMinAreaInput?.addEventListener("change", updateDetectionMinAreaFromInput);
   elements.detectVisionBtn.addEventListener("click", detectVision);
   elements.cameraPopupRefreshBtn?.addEventListener("click", detectVision);
   elements.closeCameraPopupBtn?.addEventListener("click", () => setCameraPopupVisible(false));

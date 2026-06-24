@@ -1250,6 +1250,82 @@ def test_startup_shoulder_align_uses_alignj_fast_first_move_then_slow_cleanup(mo
     assert response["mismatch"]["correction_chunks"][1]["speed_deg_s"] == pytest.approx(2.0)
 
 
+def test_manual_shoulder_align_overrides_latched_encoder_fault_with_alignj(monkeypatch):
+    raw = deepcopy(main.config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+            "mounting_location": "joint_output",
+        }
+    )
+    raw["encoders"]["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": "validated",
+            "deadband_deg": 0.75,
+            "max_delta_deg": 8.0,
+            "align_max_delta_deg": 30.0,
+            "allowed_sources": ["encoder_shoulder_align"],
+        }
+    )
+    config = type(main.config)(**{**main.config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "serial_client", FakeSerial([]))
+    measurements = iter([94.0, 90.2])
+    sent: list[str] = []
+
+    async def stable(_required_samples):
+        return next(measurements), "stable"
+
+    async def no_sleep(_seconds):
+        return None
+
+    def send_alignj(command):
+        sent.append(command)
+        return "OK command=ALIGNJ joint=2 delta=-4.000000 steps=-200 id=test hold=1"
+
+    monkeypatch.setattr(main, "_stable_shoulder_measurement", stable)
+    monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(main, "send_alignj_and_read_response", send_alignj)
+    monkeypatch.setattr(main, "refresh_serial_status", lambda: None)
+    main.state.config_sync_status = "synced"
+    main.state.controller_capabilities = {"protocol": 4, "encoder_config": True, "alignj": True}
+    main.state.hardware_armed = False
+    main.state.motion_state = MotionState.FAULT
+    main.state.hardware_axis_states = ["hardware"] * len(config.joints)
+    main.state.update_reported_pose(
+        [0.0, 90.0, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_mask="1011",
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 90.0, 20.0, 0.0]
+    main.state.encoder_fault = True
+    main.state.encoder_mismatch = {
+        "status": "fault",
+        "message": "previous shoulder encoder mismatch",
+        "requires_setpose": True,
+    }
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/encoder/shoulder/align",
+        json={"settings": {"global_speed_deg_s": 20.0, "global_accel_deg_s2": 12.0}},
+    ).json()
+
+    assert response["ok"]
+    assert main.state.encoder_fault is False
+    assert response["state"]["motion_state"] == "stopped"
+    assert response["mismatch"]["status"] == "aligned"
+    assert response["mismatch"]["requires_setpose"] is False
+    assert response["mismatch"]["encoder_fault_cleared_by_align"] is True
+    assert [line.split(" ")[0] for line in sent] == ["ALIGNJ"]
+    assert "delta=-4.000000" in sent[0]
+
+
 def test_startup_shoulder_align_requires_alignj_when_pose_unknown(monkeypatch):
     raw = deepcopy(main.config.raw)
     raw["encoders"]["enabled"] = True

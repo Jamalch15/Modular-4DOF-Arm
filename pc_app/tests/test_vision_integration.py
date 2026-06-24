@@ -10,7 +10,7 @@ from pytest import approx
 from app import main
 from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import camera_settings, color_profiles
-from app.vision import VisionPipeline, workspace_aruco_settings
+from app.vision import VisionPipeline, encode_image_b64, workspace_aruco_settings
 from app.workspace_calibration import detect_fiducials, saved_homography
 
 
@@ -137,6 +137,43 @@ def test_workspace_color_uses_custom_profile_label_before_hardcoded_hue_name():
     detection = result["detections"][0]
     assert detection["label"] == "fixture_orange"
     assert detection["task_eligible"]
+
+
+def test_vision_detect_min_area_override_allows_smaller_profile_objects(monkeypatch):
+    camera = working_camera()
+    camera["detection"] = {
+        **camera["detection"],
+        "show_unconfigured_colors": False,
+        "min_object_area_px": 400,
+    }
+    image = np.full((480, 640, 3), 80, dtype=np.uint8)
+    cv2.circle(image, (260, 220), 6, (0, 0, 255), -1)
+    image_b64 = encode_image_b64(image, ".png")
+    profiles = color_profiles(load_config(EXAMPLE_CONFIG_PATH))
+    assert profiles["red"]["min_area_px"] > 40
+
+    monkeypatch.setattr(main, "config", load_config(EXAMPLE_CONFIG_PATH))
+    monkeypatch.setattr(main, "runtime_vision_detection_overrides", {})
+    monkeypatch.setattr(main.state, "simulation", False)
+    monkeypatch.setattr(main, "camera_settings", lambda _config: camera)
+    monkeypatch.setattr(main, "color_profiles", lambda _config: profiles)
+    client = TestClient(main.app)
+
+    default_payload = client.post(
+        "/api/vision/detect",
+        json={"image_b64": image_b64, "profile_names": ["red"]},
+    ).json()
+    smaller_payload = client.post(
+        "/api/vision/detect",
+        json={"image_b64": image_b64, "profile_names": ["red"], "min_object_area_px": 40},
+    ).json()
+
+    assert default_payload["ok"]
+    assert default_payload["detections"] == []
+    assert smaller_payload["ok"]
+    assert smaller_payload["detection_tuning"]["min_object_area_px"] == 40
+    assert len(smaller_payload["detections"]) == 1
+    assert smaller_payload["detections"][0]["label"] == "red"
 
 
 def test_workspace_margin_expands_color_detection_mask():

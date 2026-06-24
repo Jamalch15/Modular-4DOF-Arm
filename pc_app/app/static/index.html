@@ -157,6 +157,15 @@
                     <button id="viewCameraBtn" class="primary" type="button">View Camera</button>
                     <button id="detectVisionBtn" type="button">Refresh Detections</button>
                   </div>
+                  <div class="detection-tuning-row">
+                    <label>Minimum object area
+                      <span class="input-with-unit">
+                        <input id="detectionMinAreaInput" type="number" min="1" step="1" />
+                        <span>px</span>
+                      </span>
+                    </label>
+                    <p class="field-help">Lower this to detect smaller colored objects.</p>
+                  </div>
                   <div id="visionSummary" class="path-summary"></div>
                   <div id="detectionList" class="task-detection-table"></div>
                 </section>

@@ -291,6 +291,7 @@ task_selection_choices: dict[str, str] = {}
 task_confirmation_events: dict[str, asyncio.Event] = {}
 simulation_vision_queue: list[dict[str, Any]] = []
 latest_vision_snapshot: dict[str, Any] = {}
+runtime_vision_detection_overrides: dict[str, Any] = {}
 encoder_calibration_sessions: dict[str, dict[str, Any]] = {}
 encoder_calibration_sweep_task: asyncio.Task[None] | None = None
 cartesian_jog_task: asyncio.Task[None] | None = None
@@ -495,6 +496,67 @@ def register_vision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "detection_fingerprint": snapshot["fingerprint"],
         "detection_task_fingerprint": snapshot["task_fingerprint"],
     }
+
+
+def _request_field_was_set(request: BaseModel, field_name: str) -> bool:
+    fields = getattr(request, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(request, "__fields_set__", set())
+    return field_name in fields
+
+
+def _coerce_min_object_area_px(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        area = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(area):
+        return None
+    return max(1.0, area)
+
+
+def update_runtime_vision_detection_overrides(min_object_area_px: Any) -> float | None:
+    area = _coerce_min_object_area_px(min_object_area_px)
+    if area is None:
+        runtime_vision_detection_overrides.pop("min_object_area_px", None)
+        return None
+    runtime_vision_detection_overrides["min_object_area_px"] = area
+    return area
+
+
+def runtime_vision_min_object_area_px(request: BaseModel | None = None) -> float | None:
+    if request is not None and _request_field_was_set(request, "min_object_area_px"):
+        return update_runtime_vision_detection_overrides(getattr(request, "min_object_area_px", None))
+    return _coerce_min_object_area_px(runtime_vision_detection_overrides.get("min_object_area_px"))
+
+
+def detection_tuning_payload(min_object_area_px: float | None, camera: dict[str, Any]) -> dict[str, Any]:
+    detection = camera.get("detection") if isinstance(camera.get("detection"), dict) else {}
+    configured = _coerce_min_object_area_px(detection.get("min_object_area_px"))
+    return {"min_object_area_px": min_object_area_px if min_object_area_px is not None else configured}
+
+
+def camera_for_vision_detection(min_object_area_px: float | None = None) -> dict[str, Any]:
+    camera = deepcopy(camera_settings(config))
+    area = _coerce_min_object_area_px(min_object_area_px)
+    if area is not None:
+        detection = camera.get("detection") if isinstance(camera.get("detection"), dict) else {}
+        detection["min_object_area_px"] = area
+        camera["detection"] = detection
+    return camera
+
+
+def profiles_for_vision_detection(min_object_area_px: float | None = None) -> dict[str, dict[str, Any]]:
+    profiles = deepcopy(color_profiles(config))
+    area = _coerce_min_object_area_px(min_object_area_px)
+    if area is None:
+        return profiles
+    for profile in profiles.values():
+        if isinstance(profile, dict):
+            profile["min_area_px"] = area
+    return profiles
 
 
 def task_contract_fingerprint(
@@ -1226,6 +1288,11 @@ class VisionSettingsRequest(BaseModel):
 class VisionDetectRequest(BaseModel):
     image_b64: str | None = None
     profile_names: list[str] | None = None
+    min_object_area_px: float | None = None
+
+
+class VisionFrameRequest(BaseModel):
+    min_object_area_px: float | None = None
 
 
 class VisionProjectRequest(BaseModel):
@@ -6503,9 +6570,11 @@ def simulation_vision_payload(*, consume: bool) -> dict[str, Any]:
 async def closed_loop_capture() -> dict[str, Any]:
     if state.simulation:
         return simulation_vision_payload(consume=True)
-    camera = camera_settings(config)
+    min_object_area_px = runtime_vision_min_object_area_px()
+    camera = camera_for_vision_detection(min_object_area_px)
     image = await asyncio.to_thread(capture_camera_frame, camera)
-    result = vision_pipeline.process(image, camera, color_profiles(config))
+    profiles = profiles_for_vision_detection(min_object_area_px)
+    result = vision_pipeline.process(image, camera, profiles)
     return {
         "ok": True,
         "captured_at": time(),
@@ -6513,6 +6582,7 @@ async def closed_loop_capture() -> dict[str, Any]:
         "workspace": result["workspace"],
         "provider": result["provider"],
         "calibration_source": result["calibration_source"],
+        "detection_tuning": detection_tuning_payload(min_object_area_px, camera),
     }
 
 
@@ -6842,6 +6912,7 @@ def reload_runtime_config(
     task_previews.clear()
     simulation_vision_queue.clear()
     latest_vision_snapshot.clear()
+    runtime_vision_detection_overrides.clear()
     state.config_change = {
         **config_change,
         "applied_at": time(),
@@ -8009,16 +8080,17 @@ async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[s
 
 @app.post("/api/vision/detect")
 async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
-    profiles = color_profiles(config)
+    min_object_area_px = runtime_vision_min_object_area_px(request)
+    profiles = profiles_for_vision_detection(min_object_area_px)
     try:
+        camera = camera_for_vision_detection(min_object_area_px)
         if request.image_b64:
             image = decode_image_b64(request.image_b64)
         else:
-            camera = camera_settings(config)
             image = await asyncio.to_thread(capture_camera_frame, camera)
         result = vision_pipeline.process(
             image,
-            camera_settings(config),
+            camera,
             profiles,
             request.profile_names,
         )
@@ -8041,20 +8113,36 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
         "workspace": result["workspace"],
         "provider": result["provider"],
         "calibration_source": result["calibration_source"],
+        "detection_tuning": detection_tuning_payload(min_object_area_px, camera),
     })
 
 
 @app.get("/api/vision/frame")
 async def get_vision_frame() -> dict[str, Any]:
+    return await capture_vision_frame_with_tuning(None)
+
+
+@app.post("/api/vision/frame")
+async def post_vision_frame(request: VisionFrameRequest) -> dict[str, Any]:
+    return await capture_vision_frame_with_tuning(request)
+
+
+async def capture_vision_frame_with_tuning(request: VisionFrameRequest | None) -> dict[str, Any]:
+    min_object_area_px = runtime_vision_min_object_area_px(request)
     try:
         if state.simulation:
-            return register_vision_snapshot(simulation_vision_payload(consume=False))
-        camera = camera_settings(config)
+            payload = register_vision_snapshot(simulation_vision_payload(consume=False))
+            payload["detection_tuning"] = detection_tuning_payload(
+                min_object_area_px,
+                camera_for_vision_detection(min_object_area_px),
+            )
+            return payload
+        camera = camera_for_vision_detection(min_object_area_px)
         image = await asyncio.to_thread(capture_camera_frame, camera)
         result = vision_pipeline.process(
             image,
             camera,
-            color_profiles(config),
+            profiles_for_vision_detection(min_object_area_px),
         )
         return register_vision_snapshot({
             "ok": True,
@@ -8065,6 +8153,7 @@ async def get_vision_frame() -> dict[str, Any]:
             "workspace": result["workspace"],
             "provider": result["provider"],
             "calibration_source": result["calibration_source"],
+            "detection_tuning": detection_tuning_payload(min_object_area_px, camera),
         })
     except Exception as exc:
         return {"ok": False, "error": str(exc), "detections": []}
@@ -8851,10 +8940,29 @@ async def align_shoulder_to_planning_internal(
         state.set_error("connect the controller before shoulder encoder alignment")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if state.encoder_fault:
+    alignj_supported = bool(state.controller_capabilities.get("alignj"))
+    manual_encoder_fault_override = bool(state.encoder_fault and not automatic and alignj_supported)
+    if state.encoder_fault and not manual_encoder_fault_override:
         state.set_error("clear the encoder fault and Set Pose before shoulder encoder alignment")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if manual_encoder_fault_override:
+        state.encoder_fault = False
+        if state.motion_state == MotionState.FAULT:
+            state.motion_state = MotionState.STOPPED
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "alignment_override_requested",
+            "requires_setpose": False,
+            "encoder_fault_cleared_by_align": True,
+            "fault_cleared_at": time(),
+        }
+        state.last_error = ""
+        log_event(
+            "encoder",
+            "manual shoulder alignment cleared latched encoder fault",
+            motion_source=motion_source,
+        )
     if automatic and not state.known_pose:
         state.set_error("automatic shoulder alignment requires a known planning pose")
         await broadcast_state()
@@ -8863,7 +8971,6 @@ async def align_shoulder_to_planning_internal(
         state.set_error("automatic shoulder alignment requires armed hardware")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    alignj_supported = bool(state.controller_capabilities.get("alignj"))
     if not alignj_supported:
         if not state.known_pose:
             state.set_error(
@@ -8957,6 +9064,7 @@ async def align_shoulder_to_planning_internal(
             "commanded_deg": target_shoulder,
             "measured_deg": measured,
             "error_deg": initial_error,
+            "requires_setpose": False,
             "correction_status": "not_needed",
             "correction_skip_reason": (
                 f"shoulder error {abs(initial_error):.2f} deg is within correction deadband "
@@ -9207,6 +9315,7 @@ async def align_shoulder_to_planning_internal(
         "commanded_deg": target_shoulder,
         "measured_deg": measured,
         "error_deg": error,
+        "requires_setpose": False,
         "correction_status": "completed",
         "correction_skip_reason": "",
         "correction_chunks": chunk_records,
