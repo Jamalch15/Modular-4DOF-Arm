@@ -29,6 +29,11 @@ best starting point for the repository as a whole.
 - [vision_integration.md](vision_integration.md): workspace homography,
   color-object detection, and detector-neutral vision contract.
 
+## Media
+
+- [1080p robot demo video](media/robot-demo-1080p.mp4): compressed MP4 demo
+  footage referenced from the top-level README.
+
 ## Planning History
 
 These notes are retained as project history and context. They are useful for

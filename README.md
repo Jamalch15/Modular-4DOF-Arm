@@ -37,6 +37,11 @@ camera or operator input
 -> status feedback to the GUI
 ```
 
+## Demo Video
+
+- [1080p robot demo video](docs/media/robot-demo-1080p.mp4): compressed MP4
+  demo footage suitable for GitHub and README viewing.
+
 ## Current Features
 
 - Local FastAPI/WebSocket backend with a browser dashboard.
